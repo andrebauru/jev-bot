@@ -1,0 +1,156 @@
+"""Fumaça da interface offscreen: abas recebem pacotes e permanecem íntegras."""
+
+import tempfile
+from pathlib import Path
+from unittest.mock import patch
+import unittest
+
+from PySide6.QtWidgets import QLineEdit
+
+from jev_bot import configuracao
+
+
+class TestGui(unittest.TestCase):
+    """Fumaça da interface offscreen: abas recebem sinais e permanecem íntegras."""
+
+    @classmethod
+    def setUpClass(cls):
+        import os
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+
+    def test_aba_operacao_recebe_pipeline(self):
+        from jev_bot.gui.aba_operacao import AbaOperacao
+        abas = AbaOperacao(acoes={k: (lambda: None) for k in
+                                  ("iniciar", "pausar", "retomar", "emergencia",
+                                   "liberar_risco", "aplicar_limites", "cancelar_ciclo")})
+        abas.receber_metricas({"estado": "ANALISANDO", "detalhe": "ciclo", "pausado": False,
+                               "parado_risco": False, "motivo_risco": "", "moeda": "JPY",
+                               "equity": 10100.0, "saldo": 10050.0, "realizado": 50.0,
+                               "aberto": 50.0, "exposicao": 100.0, "exposicao_fracao": .01,
+                               "drawdown": .01, "drawdown_max": .03, "posicoes": 1,
+                               "monitorados": 3, "operaveis": 2,
+                               "limites": {"risk_per_trade": .02, "max_total_risk": .15,
+                                           "max_drawdown": .1},
+                               "conta": {"balance": 1, "equity": 1, "profit": 1, "currency": "JPY"}})
+        self.assertEqual(abas.chip_estado.text(), "ANALISANDO")
+        abas.receber_lote("calc", [{"id": "c1", "simbolo": "BTCUSD",
+                                    "instante": "2026-01-01T00:00:00+00:00",
+                                    "etapa": "calculado", "mensagem": "ok",
+                                    "amostra": {"candles": 100, "dias": 1.0},
+                                    "padroes_testados": 2, "resultado": "r", "erro": None}])
+        abas.receber_lote("calc", [{"id": "c1", "simbolo": "BTCUSD",
+                                    "instante": "2026-01-01T00:00:00+00:00",
+                                    "etapa": "janela", "mensagem": "Baixando histórico M1 (30 dias)",
+                                    "amostra": {"candles": 21600, "solicitados": 43200},
+                                    "padroes_testados": None, "resultado": None, "erro": None}])
+        self.assertIn("21600/43200", abas.progresso_download.text())
+        abas.receber_lote("deepseek", [{"id": "c1", "simbolo": "BTCUSD",
+                                        "instante": "2026-01-01T00:00:00+00:00",
+                                        "padrao": "a1b2", "status_consulta": "hipótese recebida",
+                                        "hipotese": "quedas_consecutivas(n=3) → BUY",
+                                        "validacao": "validado: ok",
+                                        "resultado": "eventos 40, taxa 60% | OOS 12, taxa 58%"}])
+        abas.receber_lote("decisao", [{"id": "c1", "simbolo": "BTCUSD",
+                                       "instante": "2026-01-01T00:00:00+00:00",
+                                       "oportunidade": "quedas", "decisao": "SIM (BUY)",
+                                       "justificativa": "j", "risco": "gate EXECUTE",
+                                       "execucao": "paper aberto"}])
+        self.assertEqual(abas.lista_calc.topLevelItemCount(), 2)
+        self.assertEqual(abas.lista_deepseek.topLevelItemCount(), 1)
+        self.assertEqual(abas.lista_decisao.topLevelItemCount(), 1)
+        self.assertEqual(abas.lista_decisao.topLevelItem(0).text(4), "SIM (BUY)")
+        trade = {"symbol": "BTCUSD", "action": "BUY", "entry": 100.0, "volume": .01,
+                 "price_now": 100.5, "exit": None, "profit": 5.0, "risk_amount": 10.0,
+                 "opened_at": "2026-01-01T00:00:00+00:00", "closed_at": None,
+                 "status": "OPEN", "mode": "paper", "reason": ""}
+        abas.receber_trades([trade])
+        self.assertEqual(abas.tabela.rowCount(), 1)
+        self.assertEqual(abas.tabela.item(0, 11).text(), "OPEN")
+
+    def test_aba_resumo_series_e_filtros(self):
+        from jev_bot.gui.aba_resumo import AbaResumo
+        aba = AbaResumo()
+        trades = [{"symbol": "BTCUSD", "status": "CLOSED", "profit": 10.0,
+                   "closed_at": "2026-01-01T01:00:00+00:00"},
+                  {"symbol": "ETHUSD", "status": "CLOSED", "profit": -5.0,
+                   "closed_at": "2026-01-01T02:00:00+00:00"}]
+        aba.receber_trades(trades)
+        aba.receber_metricas({"moeda": "USD", "saldo": 10005.0, "realizado": 5.0,
+                              "equity": 10010.0, "growth": .001, "daily_return": .001,
+                              "drawdown": 0, "drawdown_max": 0, "win_rate": .5,
+                              "fechados": 2, "wins": 1, "losses": 1, "aberto": 5.0,
+                              "exposicao": 0, "margem": 0, "posicoes": 0})
+        self.assertEqual(aba.combo_ativo.count(), 3)  # Todos + 2 ativos
+        self.assertGreater(aba.grafico_equity.serie.count(), 1)
+        self.assertGreater(aba.grafico_dd.serie.count(), 1)
+        self.assertEqual(aba.valores["realizado"].text(), "5,00 USD")
+        aba.combo_ativo.setCurrentIndex(1)
+        self.assertGreater(aba.grafico_equity.serie.count(), 0)
+
+    def test_grafico_copia_como_imagem_no_clipboard(self):
+        """COPIAR COMO IMAGEM coloca o gráfico visível na área de transferência."""
+        import os
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtGui import QGuiApplication
+        from jev_bot.gui.graficos import GraficoView
+        grafico = GraficoView("teste")
+        grafico.definir_pontos([(1_700_000_000_000, 100.0), (1_700_000_060_000, 101.0)])
+        QGuiApplication.clipboard().clear()
+        pixmap = grafico.grab()
+        QGuiApplication.clipboard().setPixmap(pixmap)
+        copia = QGuiApplication.clipboard().pixmap()
+        self.assertFalse(copia.isNull())
+        self.assertEqual(copia.size(), pixmap.size())
+
+    def test_aba_config_mascara_e_modo_paper(self):
+        from jev_bot.gui.aba_config import AbaConfiguracao
+        with tempfile.TemporaryDirectory() as pasta, \
+                patch.object(configuracao, "CAMINHO_ENV", Path(pasta) / ".env"), \
+                patch.dict("os.environ", {}, clear=True):
+            aba = AbaConfiguracao()
+            self.assertEqual(aba.campo_chave.echoMode(), QLineEdit.EchoMode.Password)
+            self.assertEqual(aba.campo_senha.echoMode(), QLineEdit.EchoMode.Password)
+            self.assertTrue(aba.radio_paper.isChecked())
+            self.assertFalse(aba.radio_real.isEnabled())
+            aba.campo_modelo.setText("deepseek/deepseek-chat")
+            aba._salvar_openrouter()
+            self.assertIn("Modelo salvo", aba.status_or.text())
+            arquivo = Path(pasta) / ".env"
+            arquivo.write_text("OPENROUTER_API_KEY=chave-existente\n", encoding="utf-8")
+            configuracao.carregar_ambiente()
+            aba.campo_modelo.setText("deepseek/deepseek-chat")
+            aba._salvar_openrouter()
+            self.assertIn("OPENROUTER_API_KEY", arquivo.read_text(encoding="utf-8"))
+
+    def test_janela_monta_abas_e_trabalhador(self):
+        from jev_bot.gui.janela import JanelaPrincipal
+        janela = JanelaPrincipal(banco=":memoria:")
+        self.assertEqual(janela.abas.count(), 3)
+        self.assertFalse(janela.motor.isRunning())
+        janela._receber_pacote({"metricas": {"estado": "PRONTO", "detalhe": "", "jev_ok": True,
+                                             "deepseek_ok": True, "orcamento": {},
+                                             "monitorados": 1, "operaveis": 1}})
+        self.assertEqual(janela.label_jev.text(), "JEv: ok")
+        janela.orquestrador.parar()
+
+    def test_salvar_variaveis_preserva_e_substitui(self):
+        with tempfile.TemporaryDirectory() as pasta:
+            arquivo = Path(pasta) / ".env"
+            arquivo.write_text("A=1\nMT5_TERMINAL_PATH='C:\\antigo\\terminal64.exe'\n# comentário\n", encoding="utf-8")
+            with patch.object(configuracao, "CAMINHO_ENV", arquivo), \
+                    patch.dict("os.environ", {"X_TESTE": "y"}, clear=True):
+                configuracao.salvar_variaveis({"MT5_TERMINAL_PATH": r"C:\novo\terminal64.exe",
+                                               "NOVA": "2"})
+                texto = arquivo.read_text(encoding="utf-8")
+                self.assertIn("A=1", texto)
+                self.assertIn("# comentário", texto)
+                self.assertIn(r"C:\novo\terminal64.exe", texto)
+                self.assertIn("NOVA=2", texto)
+                configuracao.salvar_variaveis({"NOVA": None})
+                self.assertNotIn("NOVA", arquivo.read_text(encoding="utf-8"))
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

@@ -1,0 +1,123 @@
+"""Janela principal PySide6: três abas, worker MT5 e encerramento seguro."""
+
+from __future__ import annotations
+
+import sys
+
+from PySide6.QtCore import Qt, QThread
+from PySide6.QtWidgets import (QApplication, QLabel, QMainWindow, QMessageBox,
+                               QStatusBar, QTabWidget)
+
+from .aba_config import AbaConfiguracao
+from .aba_operacao import AbaOperacao
+from .aba_resumo import AbaResumo
+from .motor import MotorTrabalhador
+from . import tema
+
+
+class JanelaPrincipal(QMainWindow):
+    """Monta as abas e interliga os pacotes do motor."""
+
+    def __init__(self, terminal=None, offset_horas=None, banco=None):
+        super().__init__()
+        self.setWindowTitle("JEv Bot — paper trading com descoberta de padrões")
+        self.resize(1280, 800)
+        self.setMinimumSize(960, 600)
+        self.setWindowState(self.windowState() | Qt.WindowMaximized)
+
+        self.motor = MotorTrabalhador(terminal=terminal, offset_horas=offset_horas, banco=banco)
+        self.orquestrador = self.motor.orquestrador
+
+        self.abas = QTabWidget()
+        self.aba_operacao = AbaOperacao(acoes={
+            "iniciar": self.orquestrador.iniciar,
+            "pausar": self.orquestrador.pausar,
+            "retomar": self.orquestrador.retomar,
+            "emergencia": self.orquestrador.emergencia,
+            "liberar_risco": self.orquestrador.liberar_risco,
+            "aplicar_limites": self.orquestrador.aplicar_limites,
+            "cancelar_ciclo": self.orquestrador.cancelar_ciclo,
+        })
+        self.aba_resumo = AbaResumo()
+        self.aba_config = AbaConfiguracao(config_alterada=self.orquestrador.recarregar_config,
+                                          pedir_catalogo=self.orquestrador.pedir_catalogo,
+                                          selecao_salva=self.orquestrador.recarregar_selecao)
+        self.abas.addTab(self.aba_operacao, "Operação e fluxo")
+        self.abas.addTab(self.aba_resumo, "Resumo e gráficos")
+        self.abas.addTab(self.aba_config, "Configurações")
+        self.setCentralWidget(self.abas)
+
+        barra = QStatusBar()
+        self.label_jev = QLabel("JEv: verificando")
+        self.label_deepseek = QLabel("DeepSeek: verificando")
+        self.label_orcamento = QLabel("")
+        barra.addWidget(self.label_jev)
+        barra.addWidget(self.label_deepseek)
+        barra.addWidget(self.label_orcamento)
+        barra.addPermanentWidget(QLabel("modo PAPER TRADING — sem ordens reais"))
+        self.setStatusBar(barra)
+
+        self.motor.sinal_pacote.connect(self._receber_pacote)
+        self.motor.finished.connect(self._motor_terminou)
+
+    def showEvent(self, evento):
+        super().showEvent(evento)
+        if not self.motor.isRunning():
+            self.motor.start(QThread.HighPriority)
+
+    def closeEvent(self, evento):
+        """Encerra o motor com aviso; a carteira é salva pela thread do motor."""
+        resposta = QMessageBox.question(
+            self, "Encerrar JEv Bot",
+            "Encerrar o robô? Posições paper continuam registradas e pausadas no db.json.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if resposta != QMessageBox.Yes:
+            evento.ignore()
+            return
+        self.orquestrador.parar()
+        if not self.motor.wait(15000):
+            QMessageBox.warning(self, "Encerramento", "O motor não encerrou em 15s; "
+                                "a carteira será salva quando a thread terminar.")
+        super().closeEvent(evento)
+
+    def _receber_pacote(self, pacote):
+        """Roteia o pacote coalescido: listas por canal e registros únicos."""
+        for canal in ("calc", "deepseek", "decisao", "log"):
+            registros = pacote.get(canal)
+            if registros:
+                self.aba_operacao.receber_lote(canal, registros)
+        if "metricas" in pacote:
+            m = pacote["metricas"]
+            self.aba_operacao.receber_metricas(m)
+            self.aba_resumo.receber_metricas(m)
+            self.label_jev.setText(f"JEv: {'ok' if m.get('jev_ok') else 'não configurado'}")
+            self.label_deepseek.setText(f"DeepSeek: {'ok' if m.get('deepseek_ok') else 'não configurado'}")
+            orcamento = m.get("orcamento") or {}
+            if orcamento:
+                self.label_orcamento.setText(
+                    f" | tokens DeepSeek hoje {orcamento.get('tokens_dia', 0)}/{orcamento.get('tokens_limite', 0)}"
+                    f" | chamadas/h {orcamento.get('chamadas_hora', 0)}/{orcamento.get('chamadas_limite', 0)}"
+                    f" | mercados: {m.get('monitorados', 0)} monitorados, {m.get('operaveis', 0)} p/ operar")
+        if "estado" in pacote:
+            self.aba_operacao.receber_estado(pacote["estado"])
+        if "trades" in pacote:
+            self._receber_trades(pacote["trades"])
+        if "catalogo" in pacote:
+            self.aba_config.receber_catalogo(pacote["catalogo"])
+
+    def _receber_trades(self, trades):
+        self.aba_operacao.receber_trades(trades[-200:])
+        self.aba_resumo.receber_trades(trades)
+
+    def _motor_terminou(self):
+        if self.orquestrador.erro:
+            QMessageBox.critical(self, "Motor encerrado", f"Falha do motor:\n{self.orquestrador.erro}")
+
+
+def executar(terminal=None, offset_horas=None, banco=None):
+    """Abre a aplicação; retorna o código de saída do Qt."""
+    app = QApplication.instance() or QApplication(sys.argv)
+    app.setStyleSheet(tema.FOLHA)
+    janela = JanelaPrincipal(terminal=terminal, offset_horas=offset_horas, banco=banco)
+    janela.show()
+    return app.exec()

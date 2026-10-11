@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+data/
+.env
+db.json
+db.json.tmp
+db.json.lock
+db.json.pause
+db.tmp
+logs/

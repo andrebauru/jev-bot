@@ -4,15 +4,22 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "jev-bot"
-version = "0.1.0"
-description = "JEV-powered market decision bot for stocks, crypto and memes. paper by default.: state in, a typed BUY/SELL/HOLD/AVOID out, paper by default"
+version = "0.2.0"
+description = "Real MT5 market data, external JEV decisions and persistent risk-managed paper execution"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
-dependencies = []
+dependencies = [
+    "MetaTrader5>=5.0,<6; sys_platform == 'win32'",
+    "python-dotenv>=1,<2",
+    "PySide6>=6.6,<7; sys_platform == 'win32'",
+]
+
+[project.optional-dependencies]
+seguranca = ["keyring>=24"]
 
 [project.scripts]
 jev-bot = "jev_bot.cli:main"
 
 [tool.setuptools]
-packages = ["jev_bot", "jev_bot.execution"]
+packages = ["jev_bot", "jev_bot.execution", "jev_bot.gui"]

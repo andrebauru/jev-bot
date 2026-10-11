@@ -1,0 +1,992 @@
+"""Orquestrador: cadência 1/15min e pipeline Python → DeepSeek → JEv → risco → paper.
+
+Sem posições, o ciclo de análise roda a cada 1 minuto, sincronizado ao
+fechamento do candle M1 (+2s de margem). Com posições abertas, o ciclo
+passa a 15 minutos; monitoramento de preços, posições e risco continua em
+tempo real. Ciclos nunca se sobrepõem: se o anterior ainda estiver em
+andamento, o próximo é adiado com registro. Ao atingir limite de
+exposição ou drawdown, novas análises e entradas param imediatamente
+(estado PARADO POR RISCO) e só voltam com liberação manual; o
+monitoramento de posições e a emergência nunca param.
+
+Desempenho: o download do histórico é paginado em lotes curtos com
+cancelamento cooperativo e progresso; a janela completa é descartada
+após estatísticas/validação, mantendo apenas uma cauda recente por
+ativo (memória limitada). As publicações para a interface são
+coalescidas em pacotes por flush — a thread da GUI recebe dezenas de
+mensagens por ciclo, não milhares.
+
+Seleção de mercados: apenas símbolos marcados para Monitorar têm
+histórico baixado e análise agendada; somente os marcados para Operar
+chegam ao fluxo de aprovação JEv. Posições abertas continuam
+supervisionadas mesmo se o símbolo for desmarcado. A IA não altera
+limites; o gate de risco é determinístico.
+"""
+
+from __future__ import annotations
+
+from dataclasses import asdict
+from datetime import datetime, timezone
+from pathlib import Path
+import queue
+import threading
+import time
+
+from . import deepseek, jev, logs, mercados, padroes, risk
+from .markets import FonteMT5
+from .motor_matematico import estatisticas, janela_descoberta, resumo_compacto
+from .painel import BANCO_PADRAO, carregar_carteira
+
+JANELA_TTL_S = 1800          # janela M1 de 30 dias é refrescada a cada 30min por ativo
+JANELAS_POR_CICLO = 4        # atualizações de janela por ciclo (round-robin)
+DEEPSEEK_TTL_S = 3600        # análise DeepSeek por ativo no máximo a cada hora
+DEEPSEEK_POR_CICLO = 2       # novas consultas por ciclo
+TENTATIVA_JEV_S = 60         # recuo após falha JEv
+TENTATIVA_DEEPSEEK_S = 120   # recuo global após falha DeepSeek
+MARGEM_CANDLE_S = 2          # segundos após o fechamento do M1
+CAUDA_CANDLES = 720          # cauda guardada por ativo (~12h; cobre regras de 240min)
+MAX_AVALIADOS = 2000         # memoria de deduplicação por candle
+LOTE_DOWNLOAD = 4320         # candles por chamada ao terminal (3 dias)
+
+
+def _agora_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def limite_hora_seguro():
+    """Teto de chamadas DeepSeek por hora; padrão se o ambiente estiver inválido."""
+    from . import configuracao as cfg
+    try:
+        return cfg.limite_chamadas_hora()
+    except RuntimeError:
+        return 20
+
+
+def tokens_dia_seguro():
+    from . import configuracao as cfg
+    try:
+        return cfg.tokens_por_dia()
+    except RuntimeError:
+        return 300_000
+
+
+class Coalescedor:
+    """Agrupa publicações: listas com teto por canal e registros únicos.
+
+    A thread do motor envia aqui; a interface recebe um pacote por flush.
+    Com catálogo grande, isso reduz milhares de mensagens por ciclo a
+    dezenas, mantendo a janela fluida.
+    """
+    TETOS = {"calc": 60, "deepseek": 60, "decisao": 60, "log": 60}
+    UNICOS = ("metricas", "estado", "catalogo", "trades")
+
+    def __init__(self):
+        self.lotes = {}
+
+    def enviar(self, canal, registro):
+        if canal in self.UNICOS:
+            self.lotes[canal] = registro
+            return
+        lote = self.lotes.setdefault(canal, [])
+        lote.append(registro)
+        teto = self.TETOS.get(canal, 60)
+        if len(lote) > teto:
+            del lote[:-teto]
+
+    def descarregar(self):
+        if not self.lotes:
+            return None
+        pacote = self.lotes
+        self.lotes = {}
+        return pacote
+
+
+class Orquestrador:
+    """Possui fonte MT5, carteira, repositório e a cadência do pipeline."""
+
+    def __init__(self, terminal=None, offset_horas=None, banco=None, pasta_dados=None,
+                 relogio=time.time, intervalo_com_posicoes=900, caminho_selecao=None):
+        raiz = Path(__file__).resolve().parent.parent
+        self.terminal = terminal
+        self.offset_horas = offset_horas
+        self.banco = Path(banco or BANCO_PADRAO)
+        self.carga_carteira = carregar_carteira
+        self.pasta_dados = Path(pasta_dados or (raiz / "data" / "padroes"))
+        self.caminho_selecao = Path(caminho_selecao or mercados.caminho_padrao())
+        self.relogio = relogio
+        self.intervalo_com_posicoes = intervalo_com_posicoes
+        self.coalescedor = Coalescedor()
+        self.publicar = self.coalescedor.enviar
+        self.entrega = lambda pacote: None
+        self.logger = logs.configurar()
+        self.encerrar = threading.Event()
+        self.evento_pausa = threading.Event()
+        self.evento_emergencia = threading.Event()
+        self.evento_ciclo_cancelado = threading.Event()
+        self.acoes = queue.Queue()
+        self.fonte = None
+        self.book = None
+        self.repositorio = None
+        self.orcamento = None
+        self.selecao = mercados.carregar(self.caminho_selecao)
+        self.ciclo = 0
+        self.ciclo_ativo = False
+        self.estado = "CONECTANDO"
+        self.detalhe = "Aguardando conexão MT5"
+        self.pausado = True
+        self.parado_risco = False
+        self.emergencia_ativa = False
+        self.motivo_risco = ""
+        self.erro = None
+        self.dados_ativo = {}      # simbolo -> {"instante", "stats", "tail", "custo_pct"}
+        self.ordem_janelas = []    # round-robin de atualização
+        self.ultimo_deepseek = {}
+        self.avaliados = {}        # (simbolo, padrao_id) -> candle_time já avaliado
+        self.em_analise = set()    # defesa contra análise duplicada do mesmo ativo
+        self.proxima_tentativa_jev = 0
+        self.proxima_tentativa_ds = 0
+        self.ultimo_monitor = 0
+        self.ultimo_persist = 0
+        self.trades_conhecidos = 0
+        self.jev_configurado = False
+        self.deepseek_configurado = False
+        self.ultimo_aviso_orcamento = 0
+        self.ultimo_aviso_slot = 0
+        self.contagem_scan = {}    # resumo agregado do scanner para a GUI
+        self._progresso_publicado = None
+        self.consultas_ds_ciclo = 0
+
+    # ------------------------------------------------------------------ API
+    def iniciar(self):
+        """INICIAR: enfileira habilitação de ciclo e entradas paper."""
+        self.acoes.put(("iniciar", None))
+
+    def pausar(self):
+        """PAUSAR: para análises e entradas; monitoramento continua."""
+        self.evento_pausa.set()
+        self.acoes.put(("pausar", None))
+
+    def retomar(self):
+        """RETOMAR: volta ao ciclo normal, equivalente ao INICIAR."""
+        self.acoes.put(("retomar", None))
+
+    def emergencia(self):
+        """EMERGÊNCIA — FECHAR TUDO: bloqueia entradas e fecha posições paper."""
+        self.evento_emergencia.set()
+        self.acoes.put(("emergencia", None))
+
+    def liberar_risco(self):
+        """Liberação manual explícita após revisão do bloqueio de risco."""
+        self.acoes.put(("liberar_risco", None))
+
+    def cancelar_ciclo(self):
+        """CANCELAR CICLO: aborta o ciclo atual com segurança no próximo lote."""
+        self.evento_ciclo_cancelado.set()
+
+    def aplicar_limites(self, risco_trade, risco_total, drawdown):
+        """APLICAR: limites validados e persistidos no motor de risco."""
+        self.acoes.put(("limites", {"risk_per_trade": risco_trade,
+                                    "max_total_risk": risco_total,
+                                    "max_drawdown": drawdown}))
+
+    def recarregar_config(self):
+        """Reavalia configuração OpenRouter/DeepSeek após edição na UI."""
+        self.acoes.put(("config", None))
+
+    def recarregar_selecao(self):
+        """Relê a seleção de mercados após salvar na UI, registrando diferenças."""
+        self.acoes.put(("selecao", None))
+
+    def recarregar_selecao_arquivo(self):
+        """Relê imediatamente (mesma thread); usado por testes e comandos."""
+        self._registrar_selecao()
+
+    def pedir_catalogo(self):
+        """Solicita o catálogo real ao motor (thread do MT5) ou o cache offline."""
+        self.acoes.put(("catalogo", None))
+
+    def parar(self):
+        """Encerra a thread do motor; a carteira é salva ao final."""
+        self.encerrar.set()
+        self.acoes.put(("sair", None))
+
+    def _estado_set(self, estado, detalhe=""):
+        self.estado, self.detalhe = estado, detalhe
+        self.publicar("estado", {"estado": estado, "detalhe": detalhe, "quando": _agora_iso()})
+
+    def descarregar(self):
+        """Envia à interface um único pacote com tudo acumulado desde o último flush."""
+        if self.contagem_scan and \
+                self.contagem_scan.get("verificando") != self._progresso_publicado:
+            self._progresso_publicado = self.contagem_scan.get("verificando")
+            self.coalescedor.enviar("calc", {
+                "id": "scan", "simbolo": "", "instante": _agora_iso(), "etapa": "progresso",
+                "mensagem": (f"{self.contagem_scan.get('verificando', 0)} verificados | "
+                             f"{self.contagem_scan.get('ignorado', 0)} inativos | "
+                             f"{self.contagem_scan.get('dados', 0)} com dados | "
+                             f"atual: {self.contagem_scan.get('ultimo', '-')}"),
+                "amostra": None, "padroes_testados": None, "resultado": None, "erro": None})
+        pacote = self.coalescedor.descarregar()
+        if pacote:
+            self.entrega(pacote)
+
+    def _cancelado_ciclo(self):
+        """Cancelamento cooperativo: encerramento, emergência ou ciclo cancelado."""
+        return self.encerrar.is_set() or self.evento_emergencia.is_set() \
+            or self.evento_ciclo_cancelado.is_set()
+
+    # ------------------------------------------------------------- ciclo principal
+    def executar(self):
+        """Conecta, carrega a carteira e mantém o loop até encerrar."""
+        self.logger.info("inicialização do motor", banco=str(self.banco))
+        try:
+            with FonteMT5(self.terminal, self.offset_horas) as fonte:
+                self.fonte = fonte
+                fonte.cancelado = self.encerrar.is_set
+                fonte.evento = self._evento_fonte
+                self.book = self.carga_carteira(self.banco, fonte.moeda)
+                self.book.active = False  # entradas só com INICIAR explícito
+                self.repositorio = padroes.RepositorioPadroes(self.pasta_dados, self.relogio)
+                self.orcamento = deepseek.Orcamento(self.pasta_dados, limite_hora_seguro(),
+                                                    tokens_dia_seguro(), self.relogio)
+                self._persistir()
+                self._verificar_config()
+                self._registrar_selecao()
+                self._estado_set("PRONTO", "Conectado; pressione INICIAR para começar")
+                self.publicar("trades", list(reversed(self.book.trades[-500:])))
+                self.descarregar()
+                while not self.encerrar.is_set():
+                    self._processar_acoes()
+                    self._monitorar()
+                    self.descarregar()
+                    if self.encerrar.is_set() or self.pausado or self.parado_risco or self.emergencia_ativa:
+                        self.encerrar.wait(0.5)
+                        continue
+                    if self._aguardar_slot():
+                        continue
+                    if self.pausado or self.parado_risco or self.emergencia_ativa:
+                        continue
+                    self._ciclo()
+        except (RuntimeError, OSError, ValueError, TypeError, AttributeError) as exc:
+            self.erro = str(exc) or "Falha controlada no MT5 ou banco local."
+            self.logger.erro("falha fatal do motor", detalhe=self.erro)
+            self.publicar("log", {"instante": _agora_iso(), "nivel": "erro", "mensagem": self.erro})
+            self._estado_set("ERRO", self.erro)
+        finally:
+            if self.book is not None:
+                self.book.active = False
+                try:
+                    self._persistir()
+                except OSError:
+                    self._estado_set("ERRO", "Falha ao salvar db.json no encerramento.")
+            self.descarregar()
+            if self.erro is None:
+                self._estado_set("ENCERRADO", "Motor encerrado; carteira paper pausada e salva")
+            self.logger.info("encerramento do motor concluído")
+
+    def _evento_fonte(self, etapa, simbolo, mensagem):
+        """Agrega o progresso do scanner em contagens; um único registro por flush.
+
+        Publicar um evento por símbolo satura a fila da interface (o
+        congelamento original); aqui a GUI recebe um resumo consolidado.
+        Erros de scan seguem como registros individuais.
+        """
+        self.contagem_scan[etapa] = self.contagem_scan.get(etapa, 0) + 1
+        self.contagem_scan["ultimo"] = f"{simbolo}: {mensagem}" if simbolo else mensagem
+        if etapa == "erro" and simbolo:
+            self.publicar("calc", {"id": "scan-erro", "simbolo": simbolo, "instante": _agora_iso(),
+                                   "etapa": "erro", "mensagem": mensagem, "amostra": None,
+                                   "padroes_testados": None, "resultado": None, "erro": mensagem})
+
+    def _proximo_alvo(self, agora):
+        """Horário do próximo ciclo: fechamento do M1+2s, ou +15min com posições."""
+        if self.book is not None and self.book.fills:
+            return agora + self.intervalo_com_posicoes, "posições abertas: ciclo em 15min"
+        return (int(agora // 60) + 1) * 60 + MARGEM_CANDLE_S, "sem posições: ciclo no fechamento do M1"
+
+    def _aguardar_slot(self):
+        """Espera o próximo horário de ciclo; True indica slot cancelado."""
+        alvo, base = self._proximo_alvo(self.relogio())
+        agora = self.relogio()
+        while not self.encerrar.is_set():
+            self._processar_acoes()
+            self._monitorar()
+            self.descarregar()
+            if self.pausado or self.parado_risco or self.emergencia_ativa:
+                return True
+            restante = alvo - self.relogio()
+            if restante <= 0:
+                return False
+            if agora - self.ultimo_aviso_slot >= 5:
+                self.ultimo_aviso_slot = agora
+                self.publicar("estado", {"estado": "AGUARDANDO",
+                                         "detalhe": f"{base}; próximo ciclo em {restante:.0f}s",
+                                         "quando": _agora_iso()})
+            self.encerrar.wait(min(0.5, restante))
+            agora = self.relogio()
+        return True
+
+    # ------------------------------------------------------------- comandos
+    def _processar_acoes(self):
+        while True:
+            try:
+                acao, dados = self.acoes.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                if acao == "iniciar":
+                    self._acao_iniciar()
+                elif acao == "pausar":
+                    self._acao_pausar()
+                elif acao == "retomar":
+                    self._acao_iniciar("RETOMAR")
+                elif acao == "emergencia":
+                    self._acao_emergencia()
+                elif acao == "liberar_risco":
+                    self._acao_liberar_risco()
+                elif acao == "limites":
+                    self._acao_limites(dados)
+                elif acao == "config":
+                    self._verificar_config()
+                elif acao == "selecao":
+                    self._registrar_selecao()
+                elif acao == "catalogo":
+                    self._acao_catalogo()
+                elif acao == "sair":
+                    return
+            except RuntimeError as exc:
+                self.publicar("log", {"instante": _agora_iso(), "nivel": "erro", "mensagem": str(exc)})
+                self.logger.erro("comando recusado", comando=acao, detalhe=str(exc))
+
+    def _verificar_config(self):
+        try:
+            jev.configuracao()
+            self.jev_configurado = True
+        except RuntimeError:
+            self.jev_configurado = False
+        try:
+            deepseek.configuracao_chat()
+            self.deepseek_configurado = True
+        except RuntimeError:
+            self.deepseek_configurado = False
+        mensagem = (f"Configuração: JEv {'ok' if self.jev_configurado else 'não configurado'}; "
+                    f"DeepSeek {'ok' if self.deepseek_configurado else 'não configurado'}")
+        self.publicar("log", {"instante": _agora_iso(), "nivel": "info", "mensagem": mensagem})
+        self.logger.info(mensagem)
+
+    def _registrar_selecao(self):
+        """Relê a seleção de mercados e registra diferenças sem dados sensíveis."""
+        anterior = self.selecao
+        self.selecao = mercados.carregar(self.caminho_selecao)
+        monitorados, operaveis = self.selecao.contagens()
+        mudancas = self.selecao.diferencas(anterior)
+        mensagem = f"Seleção de mercados: {monitorados} monitorados, {operaveis} para operar"
+        if mudancas:
+            mensagem += f"; alterados: {', '.join(mudancas)}"
+        self.publicar("log", {"instante": _agora_iso(), "nivel": "info", "mensagem": mensagem})
+        self.logger.info("seleção de mercados recarregada",
+                         monitorados=monitorados, operaveis=operaveis, alterados=len(mudancas))
+        if self.selecao.vazia():
+            self.publicar("log", {"instante": _agora_iso(), "nivel": "aviso",
+                                  "mensagem": "Nenhum mercado marcado para Monitorar; use a aba Configurações → Mercados."})
+
+    def _acao_catalogo(self):
+        """Catálogo real do terminal na thread do MT5; cache persistido para offline."""
+        try:
+            categorias = mercados.catalogo_por_categoria(self.fonte)
+            mercados.salvar_cache(categorias)
+            origem = "ao vivo"
+        except (RuntimeError, OSError, AttributeError) as exc:
+            categorias = mercados.carregar_cache()
+            origem = "cache (terminal indisponível)"
+            self.logger.aviso("catálogo indisponível; usando cache", detalhe=str(exc)[:120])
+        self.publicar("catalogo", {"categorias": categorias, "origem": origem,
+                                   "quando": _agora_iso()})
+
+    def _acao_iniciar(self, rotulo="INICIAR"):
+        if self.book is None or self.fonte is None:
+            raise RuntimeError("Conecte o MT5 antes de iniciar.")
+        try:
+            jev.configuracao()
+        except RuntimeError as exc:
+            self.publicar("log", {"instante": _agora_iso(), "nivel": "erro",
+                                  "mensagem": f"{rotulo} recusado: {exc}"})
+            self.book.active = False
+            self.logger.aviso("INICIAR recusado", detalhe=str(exc))
+            return
+        self._verificar_config()
+        self.pausado = False
+        self.emergencia_ativa = False
+        self.book.active = True
+        Path(str(self.banco) + ".pause").unlink(missing_ok=True)
+        self._persistir()
+        if not self.deepseek_configurado:
+            self.publicar("log", {"instante": _agora_iso(), "nivel": "aviso",
+                                  "mensagem": "DeepSeek não configurado: sem novas hipóteses; padrões já validados continuam sendo usados."})
+        if self.selecao.vazia():
+            self.publicar("log", {"instante": _agora_iso(), "nivel": "aviso",
+                                  "mensagem": "Nenhum mercado marcado para Monitorar; selecione na aba Configurações → Mercados."})
+        self.publicar("log", {"instante": _agora_iso(), "nivel": "info",
+                              "mensagem": f"{rotulo}: ciclo ativo e entradas paper habilitadas, sujeitas ao risco"})
+        self.logger.info(rotulo, monitorados=self.selecao.contagens()[0])
+
+    def _acao_pausar(self):
+        self.evento_pausa.clear()
+        self.pausado = True
+        if self.book is not None:
+            self.book.active = False
+            self._persistir()
+        self._estado_set("PAUSADO", "Novas análises e entradas pausadas; monitoramento ativo")
+        self.publicar("log", {"instante": _agora_iso(), "nivel": "info",
+                              "mensagem": "PAUSAR: entradas e análises suspensas; posições continuam monitoradas"})
+        self.logger.info("pausa acionada pelo operador")
+
+    def _acao_emergencia(self):
+        """Fecha tudo imediatamente; resultado confirmado posição por posição."""
+        self.evento_emergencia.clear()
+        self.emergencia_ativa = True
+        self.pausado = True
+        if self.book is not None:
+            self.book.active = False
+        self._estado_set("EMERGENCIA", "Fechando todas as posições paper")
+        self.publicar("log", {"instante": _agora_iso(), "nivel": "emergencia",
+                              "mensagem": "EMERGÊNCIA: novas entradas bloqueadas; fechando posições paper"})
+        self.logger.aviso("EMERGÊNCIA acionada", posicoes=len(self.book.fills) if self.book else 0)
+        self._executar_emergencia()
+
+    def _executar_emergencia(self):
+        if self.book is None or self.fonte is None:
+            return
+        fechadas, falhas = self.book.fechar_total(self.fonte, motivo="EMERGENCIA")
+        self._persistir()
+        id_emergencia = f"emerg-{int(self.relogio())}"
+        for resultado in fechadas:
+            self.publicar("decisao", {"id": id_emergencia, "simbolo": resultado["symbol"],
+                                      "instante": _agora_iso(), "oportunidade": "EMERGÊNCIA",
+                                      "decisao": "ENCERRADA", "justificativa": "Fechamento de emergência",
+                                      "risco": "Execução confirmada no preço observado",
+                                      "execucao": f"Fechada a {resultado['preco']:.8g}; P&L {resultado['lucro']:+.2f} {self.book.currency}"})
+            self.logger.aviso("posição encerrada na emergência", simbolo=resultado["symbol"],
+                              lucro=round(resultado["lucro"], 2))
+        for falha in falhas:
+            self.publicar("decisao", {"id": id_emergencia, "simbolo": falha["symbol"],
+                                      "instante": _agora_iso(), "oportunidade": "EMERGÊNCIA",
+                                      "decisao": "PENDENTE", "justificativa": "Falha no fechamento",
+                                      "risco": "Posição permanece aberta",
+                                      "execucao": f"{falha['motivo']}; nova tentativa automática"})
+            self.logger.erro("falha ao fechar posição na emergência", simbolo=falha["symbol"])
+        if falhas:
+            self.publicar("log", {"instante": _agora_iso(), "nivel": "erro",
+                                  "mensagem": f"EMERGÊNCIA: {len(falhas)} posição(ões) sem cotação para fechar agora; tentando novamente."})
+        if not self.book.fills:
+            self._estado_set("EMERGENCIA", "Todas as posições confirmadas encerradas; entradas bloqueadas até INICIAR")
+        self.publicar("metricas", self._metricas())
+
+    def _acao_liberar_risco(self):
+        if not self.parado_risco and not (self.book and (self.book.drawdown_blocked or self.book.daily_blocked)):
+            return
+        self.parado_risco = False
+        self.motivo_risco = ""
+        if self.book is not None:
+            self.book.drawdown_blocked = False
+            self.book.daily_blocked = False
+            self._persistir()
+        self._estado_set("PRONTO", "Risco liberado manualmente após revisão")
+        self.publicar("log", {"instante": _agora_iso(), "nivel": "aviso",
+                              "mensagem": "Liberação manual registrada: bloqueios de perda diária/drawdown removidos pelo operador após revisão"})
+        self.logger.aviso("liberação manual de risco registrada")
+
+    def _acao_limites(self, dados):
+        from dataclasses import replace
+        if self.book is None:
+            raise RuntimeError("Carteira ainda não carregada.")
+        atual = self.book.limits
+        try:
+            novo = replace(atual, risk_per_trade=float(dados["risk_per_trade"]),
+                           max_total_risk=float(dados["max_total_risk"]),
+                           max_drawdown=float(dados["max_drawdown"]))
+        except (TypeError, ValueError):
+            raise RuntimeError("Limites inválidos: use frações entre 0 e 1.") from None
+        self.book.limits = novo
+        self._persistir()
+        mensagem = (f"Limites aplicados: {novo.risk_per_trade:.2%}/operação, "
+                    f"{novo.max_total_risk:.2%} total, drawdown {novo.max_drawdown:.2%}")
+        self.publicar("log", {"instante": _agora_iso(), "nivel": "info", "mensagem": mensagem})
+        self.logger.info("limites de risco alterados pelo operador",
+                         por_operacao=round(novo.risk_per_trade, 4),
+                         total=round(novo.max_total_risk, 4), drawdown=round(novo.max_drawdown, 4))
+        self.publicar("metricas", self._metricas())
+
+    # ------------------------------------------------------------- monitoramento
+    def _monitorar(self):
+        agora = self.relogio()
+        if self.book is None or self.fonte is None or agora - self.ultimo_monitor < 2:
+            return
+        self.ultimo_monitor = agora
+        eventos_antes = len(self.book.log)
+        try:
+            conta = self.fonte.conta()
+            self.book.update(self.fonte)
+        except RuntimeError:
+            self.book.prices_valid = False
+            conta = None
+            self.publicar("log", {"instante": _agora_iso(), "nivel": "erro",
+                                  "mensagem": "MT5 sem métricas ou cotações; marcação antiga bloqueia entradas"})
+            self.logger.aviso("marcação indisponível; entradas bloqueadas")
+        # Emergência persiste até fechar todas as posições, mesmo com falhas.
+        if self.emergencia_ativa and self.book.fills:
+            self._executar_emergencia()
+        self._avaliar_risco()
+        alterou_trades = len(self.book.trades) != self.trades_conhecidos or \
+            any(e["event"] in ("open", "close") for e in self.book.log[eventos_antes:])
+        if len(self.book.trades) != self.trades_conhecidos or \
+                any(e["event"] == "close" for e in self.book.log[eventos_antes:]):
+            self.trades_conhecidos = len(self.book.trades)
+            self.publicar("trades", list(reversed(self.book.trades[-500:])))
+        self.publicar("metricas", self._metricas(conta))
+        # Persiste a cada mudança de trade; checkpoints de equity a cada 10s.
+        if alterou_trades or agora - self.ultimo_persist >= 10:
+            self.ultimo_persist = agora
+            self._persistir()
+
+    def _avaliar_risco(self):
+        """Mecanismo determinístico: limites do motor, não da tela ou da IA."""
+        book = self.book
+        limites = book.limits
+        m = book.metrics()
+        motivos = []
+        if book.drawdown_blocked:
+            motivos.append("Bloqueio de drawdown registrado na carteira")
+        if book.daily_blocked:
+            motivos.append("Bloqueio de perda diária")
+        if m["risk_fraction"] > limites.max_total_risk:
+            motivos.append(f"Exposição {m['risk_fraction']:.1%} acima de {limites.max_total_risk:.1%}")
+        if motivos:
+            if not self.parado_risco:
+                self.parado_risco = True
+                self.motivo_risco = "; ".join(motivos)
+                self._estado_set("PARADO POR RISCO", self.motivo_risco)
+                self.publicar("log", {"instante": _agora_iso(), "nivel": "aviso",
+                                      "mensagem": f"PARADO POR RISCO: {self.motivo_risco}. Análises e entradas suspensas; liberação apenas manual."})
+                self.logger.aviso("motor parado por risco", motivo=self.motivo_risco)
+        elif self.parado_risco:
+            self.publicar("log", {"instante": _agora_iso(), "nivel": "aviso",
+                                  "mensagem": "Limites voltaram ao normal; aguardando liberação manual para retomar análises"})
+
+    def _metricas(self, conta=None):
+        book = self.book
+        m = book.metrics()
+        monitorados, operaveis = self.selecao.contagens()
+        return {"estado": self.estado, "detalhe": self.detalhe,
+                "ativo": book.active, "pausado": self.pausado, "parado_risco": self.parado_risco,
+                "emergencia": self.emergencia_ativa, "motivo_risco": self.motivo_risco,
+                "moeda": book.currency, "equity": m["equity"], "saldo": book.cash,
+                "realizado": m["realized"], "aberto": m["open_profit"],
+                "exposicao": m["risk"], "exposicao_fracao": m["risk_fraction"],
+                "margem": m["margin"], "posicoes": m["positions"],
+                "drawdown": m["drawdown"], "drawdown_max": m["max_drawdown"],
+                "growth": m["growth"], "daily_return": m["daily_return"],
+                "wins": m["wins"], "losses": m["losing_trades"], "fechados": m["closed"],
+                "win_rate": m["win_rate"], "precos_validos": book.prices_valid,
+                "limites": asdict(book.limits),
+                "conta": conta, "ciclo": self.ciclo,
+                "jev_ok": self.jev_configurado, "deepseek_ok": self.deepseek_configurado,
+                "orcamento": self.orcamento.consumo() if self.orcamento else {},
+                "monitorados": monitorados, "operaveis": operaveis,
+                "posicoes_detalhe": [asdict(p) for p in book.fills]}
+
+    def _persistir(self):
+        self.book.save(self.banco)
+
+    # ------------------------------------------------------------- ciclo de análise
+    def _ciclo(self):
+        """Varredura dos candidatos monitorados, sem ciclos simultâneos."""
+        if self.ciclo_ativo:
+            self.logger.aviso("ciclo anterior ainda em andamento; próximo adiado")
+            self.publicar("log", {"instante": _agora_iso(), "nivel": "aviso",
+                                  "mensagem": "Ciclo anterior ainda em andamento; próximo adiado"})
+            return
+        self.ciclo_ativo = True
+        self.evento_ciclo_cancelado.clear()
+        self.contagem_scan = {}
+        self.ciclo += 1
+        id_ciclo = f"ciclo{self.ciclo}"
+        self.logger.info("ciclo iniciado", ciclo=self.ciclo)
+        self.publicar("estado", {"estado": "ANALISANDO", "detalhe": f"Ciclo {self.ciclo}",
+                                 "quando": _agora_iso()})
+        try:
+            self._executar_ciclo(id_ciclo)
+        finally:
+            self.ciclo_ativo = False
+            if self.evento_ciclo_cancelado.is_set():
+                self.logger.aviso("ciclo cancelado pelo operador", ciclo=self.ciclo)
+                self.publicar("log", {"instante": _agora_iso(), "nivel": "aviso",
+                                      "mensagem": "Ciclo cancelado pelo operador; restante adiado para o próximo ciclo"})
+            self.descarregar()
+            self.logger.info("ciclo concluído", ciclo=self.ciclo)
+
+    def _executar_ciclo(self, id_ciclo):
+        self._registrar_selecao()  # aplica mudanças de seleção no início do ciclo
+        try:
+            estados = list(self.fonte.estados())
+        except RuntimeError as exc:
+            self.publicar("log", {"instante": _agora_iso(), "nivel": "erro",
+                                  "mensagem": f"Scanner falhou: {exc}; nova tentativa no próximo ciclo"})
+            self.logger.erro("scanner falhou", detalhe=str(exc)[:160])
+            return
+        self.publicar("calc", {"id": id_ciclo, "simbolo": "", "instante": _agora_iso(),
+                               "etapa": "ciclo", "mensagem": f"{len(estados)} ativos elegíveis no ciclo {self.ciclo}",
+                               "amostra": None, "padroes_testados": None, "resultado": None, "erro": None})
+        self.consultas_ds_ciclo = 0
+        for estado in estados:
+            if self._cancelado_ciclo() or self.pausado or self.parado_risco:
+                break
+            if not self.selecao.monitorar(estado.symbol):
+                continue  # desmarcado: sem histórico, sem análise, sem DeepSeek
+            if estado.symbol in self.em_analise:
+                self.logger.debug("análise duplicada ignorada", simbolo=estado.symbol)
+                continue
+            try:
+                self.em_analise.add(estado.symbol)
+                self._processar_ativo(estado, id_ciclo)
+            except (RuntimeError, ValueError, KeyError) as exc:
+                self.publicar("calc", {"id": id_ciclo, "simbolo": estado.symbol, "instante": _agora_iso(),
+                                       "etapa": "erro", "mensagem": "Falha na análise do ativo",
+                                       "amostra": None, "padroes_testados": None,
+                                       "resultado": None, "erro": str(exc)[:200]})
+                self.logger.erro("falha na análise", simbolo=estado.symbol, detalhe=str(exc)[:160])
+            finally:
+                self.em_analise.discard(estado.symbol)
+                self.descarregar()  # GUI acompanha o ciclo em tempo quase real
+
+    def _coletar_janela(self, simbolo, id_analise):
+        """Download paginado da janela 30d com progresso, logs e cancelamento."""
+        def progresso(coletados, solicitado):
+            self.publicar("calc", {"id": id_analise, "simbolo": simbolo, "instante": _agora_iso(),
+                                   "etapa": "janela", "mensagem": "Baixando histórico M1 (30 dias)",
+                                   "amostra": {"candles": coletados, "dias": None,
+                                               "solicitados": solicitado},
+                                   "padroes_testados": None, "resultado": None, "erro": None})
+            self.descarregar()
+        inicio = time.time()
+        janela = self.fonte.janela_m1(simbolo, dias=30, lote=LOTE_DOWNLOAD,
+                                      cancelado=self._cancelado_ciclo, progresso=progresso)
+        duracao = round(time.time() - inicio, 2)
+        if janela is None:
+            motivo = "cancelado" if self._cancelado_ciclo() else "indisponível"
+            self.logger.info("download de histórico não concluído", simbolo=simbolo, motivo=motivo)
+            return None
+        self.logger.info("download de histórico concluído", simbolo=simbolo,
+                         candles=janela["recebidos"], lacunas=janela["lacunas"],
+                         lotes=max(1, -(-janela["recebidos"] // LOTE_DOWNLOAD)), duracao_s=duracao)
+        return janela
+
+    def _processar_ativo(self, estado, id_ciclo):
+        """Pipeline completo de um ativo monitorado.
+
+        O agendamento do DeepSeek acontece na atualização da janela
+        (_atualizar_cache), única etapa com a janela completa em memória.
+        """
+        simbolo = estado.symbol
+        id_analise = f"{id_ciclo}-{simbolo}"
+        agora = self.relogio()
+        cache = self.dados_ativo.get(simbolo)
+        vencida = cache is None or agora - cache["instante"] >= JANELA_TTL_S
+        if vencida and self._pode_atualizar_janela(simbolo):
+            janela = self._coletar_janela(simbolo, id_analise)
+            if janela is None:
+                if cache is None:
+                    self.publicar("calc", {"id": id_analise, "simbolo": simbolo, "instante": _agora_iso(),
+                                           "etapa": "dados", "mensagem": "Janela M1 de 30 dias indisponível",
+                                           "amostra": None, "padroes_testados": None,
+                                           "resultado": None, "erro": None})
+                # Com cache anterior válido, ele permanece até a próxima tentativa.
+            else:
+                self._atualizar_cache(simbolo, janela, id_analise)
+                cache = self.dados_ativo.get(simbolo)
+        if cache is None or cache.get("stats") is None:
+            self.publicar("calc", {"id": id_analise, "simbolo": simbolo, "instante": _agora_iso(),
+                                   "etapa": "dados", "mensagem": "Estatísticas aguardando atualização da janela",
+                                   "amostra": None, "padroes_testados": None,
+                                   "resultado": None, "erro": None})
+            return
+        stats = cache["stats"]
+        custo_pct = cache["custo_pct"]
+        ativos_repo = self.repositorio.padroes_ativos(simbolo)
+        self.publicar("calc", {"id": id_analise, "simbolo": simbolo, "instante": _agora_iso(),
+                               "etapa": "calculado", "mensagem": "Estatísticas locais prontas (Python; cálculo não consome tokens)",
+                               "amostra": {"candles": stats.get("candles"), "dias": stats.get("dias"),
+                                           "lacunas": stats.get("lacunas"),
+                                           "retorno_janela_pct": stats.get("retorno_janela_pct")},
+                               "padroes_testados": len(ativos_repo),
+                               "resultado": f"movimento mediano {stats['movimento_1min']['mediana_pct']}% | custo spread {custo_pct}%",
+                               "erro": None})
+        self._oportunidade(estado, id_analise)
+
+    def _pode_atualizar_janela(self, simbolo):
+        """Primeira coleta sempre; depois teto por ciclo em ordem round-robin."""
+        cache = self.dados_ativo.get(simbolo)
+        if cache is None:
+            return True
+        if simbolo not in self.ordem_janelas:
+            self.ordem_janelas.append(simbolo)
+        pendentes = [s for s in self.ordem_janelas
+                     if self.dados_ativo.get(s) is None
+                     or self.relogio() - self.dados_ativo[s].get("instante", 0) >= JANELA_TTL_S]
+        try:
+            return pendentes.index(simbolo) < JANELAS_POR_CICLO
+        except ValueError:
+            return True
+
+    def _atualizar_cache(self, simbolo, janela, id_analise):
+        """Estatísticas + revalidação + DeepSeek com a janela completa; guarda só a cauda.
+
+        A janela completa (~43k candles) vive apenas durante este método — a
+        memória por ativo fica limitada à cauda (CAUDA_CANDLES) e ao resumo.
+        O DeepSeek é agendado aqui porque as hipóteses novas precisam ser
+        validadas contra a janela completa antes do descarte.
+        """
+        descoberta, _ = janela_descoberta(janela["candles"])
+        recorte = {**janela, "candles": descoberta, "fim": descoberta[-1]["time"]}
+        spread = self.fonte.cotacao(simbolo)
+        spread_fracao = (spread[1] - spread[0]) if spread else 0.0
+        stats = estatisticas(recorte, spread_fracao)
+        custo_pct = stats.get("custo_spread_pct") or 0.0
+        janela_info = {"inicio": janela["inicio"], "fim": janela["fim"],
+                       "dias": stats.get("dias"), "candles": janela["recebidos"]}
+        # Revalida padrões ativos com a janela recém-baixada (cronologia preservada).
+        for registro in self.repositorio.padroes_ativos(simbolo):
+            interna = registro["regra"]
+            regra = {"tipo_regra": interna["tipo"], "parametros": interna["parametros"],
+                     "direcao": interna["direcao"], "horizonte_minutos": interna["horizonte_minutos"],
+                     "justificativa": registro.get("justificativa", "")}
+            validacao = padroes.validar(regra, janela["candles"], custo_pct)
+            atualizado = self.repositorio.registrar(simbolo, regra, validacao,
+                                                    registro.get("origem", "local"), janela_info)
+            if validacao["status"] != registro.get("status"):
+                self.publicar("deepseek", {"id": id_analise, "simbolo": simbolo, "instante": _agora_iso(),
+                                           "padrao": atualizado["id"], "status_consulta": "REEXAME LOCAL",
+                                           "hipotese": self._texto_hipotese(regra),
+                                           "validacao": f"{validacao['status']}: {validacao['motivo']}",
+                                           "resultado": self._texto_validacao(validacao)})
+                self.logger.info("status de padrão alterado no reexame", simbolo=simbolo,
+                                 padrao=atualizado["id"], status=validacao["status"])
+        cache = {"instante": self.relogio(), "stats": stats, "custo_pct": custo_pct,
+                 "inicio_janela": janela["inicio"], "fim_janela": janela["fim"],
+                 "tail": janela["candles"][-CAUDA_CANDLES:]}
+        self.dados_ativo[simbolo] = cache
+        self.logger.info("estatísticas locais calculadas", simbolo=simbolo,
+                         candles=stats.get("candles"), dias=stats.get("dias"))
+        # DeepSeek é agendado aqui: hipóteses são validadas antes do descarte da janela.
+        agora = self.relogio()
+        if (self.deepseek_configurado and agora >= self.proxima_tentativa_ds
+                and self.consultas_ds_ciclo < DEEPSEEK_POR_CICLO
+                and agora - self.ultimo_deepseek.get(simbolo, 0) >= DEEPSEEK_TTL_S
+                and stats.get("disponivel") and (janela["fim"] - janela["inicio"]) >= 3 * 86400):
+            self.consultas_ds_ciclo += 1
+            self._etapa_deepseek(simbolo, janela["candles"], cache, stats, id_analise)
+        # Cauda permanece no cache; a janela completa é liberada ao sair deste método.
+
+    def _etapa_deepseek(self, simbolo, candles, cache, stats, id_analise):
+        """Consulta o DeepSeek, valida cada hipótese localmente e registra."""
+        agora = self.relogio()
+        permitido, motivo = self.orcamento.permitir()
+        if not permitido:
+            if agora - self.ultimo_aviso_orcamento > 300:
+                self.ultimo_aviso_orcamento = agora
+                self.publicar("deepseek", {"id": id_analise, "simbolo": simbolo, "instante": _agora_iso(),
+                                           "padrao": "-", "status_consulta": "ORÇAMENTO",
+                                           "hipotese": "-", "validacao": "-", "resultado": motivo})
+                self.logger.aviso("consulta DeepSeek bloqueada pelo orçamento", motivo=motivo)
+            return False
+        padroes_atuais = [{k: p.get(k) for k in ("id", "regra", "status", "eventos", "fora_amostra")}
+                          for p in self.repositorio.padroes_ativos(simbolo)]
+        self.publicar("deepseek", {"id": id_analise, "simbolo": simbolo, "instante": _agora_iso(),
+                                   "padrao": "-", "status_consulta": "CONSULTANDO",
+                                   "hipotese": "Enviando resumo estatístico compacto (janela de descoberta)",
+                                   "validacao": "-", "resultado": "-"})
+        modelo = ""
+        try:
+            from . import configuracao as cfg
+            modelo = cfg.modelo_deepseek()
+        except RuntimeError:
+            pass
+        inicio = time.time()
+        self.logger.info("consulta DeepSeek iniciada", simbolo=simbolo, modelo=modelo)
+        try:
+            hipoteses, revisoes, uso, descartadas = deepseek.analisar(
+                resumo_compacto(stats), padroes_atuais, cancelado=self._cancelado_ciclo)
+        except RuntimeError as exc:
+            self.proxima_tentativa_ds = agora + TENTATIVA_DEEPSEEK_S
+            self.publicar("deepseek", {"id": id_analise, "simbolo": simbolo, "instante": _agora_iso(),
+                                       "padrao": "-", "status_consulta": "ERRO",
+                                       "hipotese": "-", "validacao": "-", "resultado": str(exc)})
+            self.logger.aviso("consulta DeepSeek falhou", simbolo=simbolo,
+                              detalhe=str(exc)[:160], duracao_s=round(time.time() - inicio, 2))
+            return False
+        self.orcamento.registrar(uso.get("tokens", 0))
+        self.ultimo_deepseek[simbolo] = agora
+        self.logger.info("resposta DeepSeek recebida", simbolo=simbolo,
+                         tokens=uso.get("tokens", 0), hipoteses=len(hipoteses),
+                         descartadas=descartadas, revisoes=len(revisoes),
+                         duracao_s=round(time.time() - inicio, 2))
+        janela_info = {"inicio": cache["inicio_janela"], "fim": cache["fim_janela"],
+                       "dias": stats.get("dias"), "candles": len(candles)}
+        custo_pct = cache["custo_pct"]
+        for hipotese in hipoteses:
+            validacao = padroes.validar(hipotese, candles, custo_pct)
+            registro = self.repositorio.registrar(simbolo, hipotese, validacao, "deepseek", janela_info)
+            self.publicar("deepseek", {"id": id_analise, "simbolo": simbolo, "instante": _agora_iso(),
+                                       "padrao": registro["id"], "status_consulta": "hipótese recebida",
+                                       "hipotese": self._texto_hipotese(hipotese),
+                                       "validacao": f"{validacao['status']}: {validacao['motivo']}",
+                                       "resultado": self._texto_validacao(validacao)})
+            self.logger.info("hipótese validada localmente", simbolo=simbolo,
+                             padrao=registro["id"], status=validacao["status"])
+        aplicadas = self.repositorio.aplicar_revisoes(simbolo, revisoes)
+        self.publicar("deepseek", {"id": id_analise, "simbolo": simbolo, "instante": _agora_iso(),
+                                   "padrao": "-", "status_consulta": "CONCLUÍDA",
+                                   "hipotese": f"{len(hipoteses)} hipóteses; {descartadas} descartadas por schema",
+                                   "validacao": f"{len(aplicadas)} revisão(ões) de expiração aplicadas",
+                                   "resultado": f"tokens usados: {uso.get('tokens', 0)}"})
+        return True
+
+    def _oportunidade(self, estado, id_analise):
+        """Padrão validado com condição verdadeira agora → decisão JEv.
+
+        Somente símbolos marcados para Operar chegam a esta etapa. Posições
+        abertas continuam supervisionadas em _monitorar, independentemente
+        da seleção.
+        """
+        if self.book is None or not self.book.active or self.parado_risco or self.emergencia_ativa:
+            return
+        simbolo = estado.symbol
+        if not self.selecao.operar(simbolo):
+            return
+        validados = self.repositorio.validados(simbolo)
+        if not validados:
+            return
+        instante_candle = estado.candles[-1]["time"] if estado.candles else None
+        if len(self.avaliados) > MAX_AVALIADOS:
+            self.avaliados.clear()
+        for padrao in validados:
+            chave = (simbolo, padrao["id"])
+            if self.avaliados.get(chave) == instante_candle:
+                continue
+            if instante_candle is not None:
+                self.avaliados[chave] = instante_candle
+            candles_condicao = self._candles_para_condicao(padrao, estado)
+            if candles_condicao is None:
+                continue
+            if not padroes.condicao_atual(padrao, candles_condicao):
+                continue
+            interna = padrao["regra"]
+            regra = {"tipo_regra": interna["tipo"], "parametros": interna["parametros"],
+                     "direcao": interna["direcao"], "horizonte_minutos": interna["horizonte_minutos"]}
+            texto = self._texto_hipotese(regra)
+            taxa_oos = padrao["fora_amostra"].get("taxa")
+            evidencia = f"{texto} | taxa OOS {taxa_oos:.0%}" if taxa_oos is not None else texto
+            self.publicar("decisao", {"id": id_analise, "simbolo": simbolo, "instante": _agora_iso(),
+                                      "oportunidade": texto, "decisao": "CONSULTANDO JEV",
+                                      "justificativa": "Padrão validado localmente com condição verdadeira no candle fechado",
+                                      "risco": evidencia, "execucao": "-"})
+            self.logger.info("oportunidade detectada; consultando JEv", simbolo=simbolo,
+                             padrao=padrao["id"], analysis_id=id_analise)
+            if self.relogio() < self.proxima_tentativa_jev:
+                self.publicar("decisao", {"id": id_analise, "simbolo": simbolo, "instante": _agora_iso(),
+                                          "oportunidade": texto, "decisao": "AGUARDANDO",
+                                          "justificativa": "JEv indisponível; nova tentativa após recuo",
+                                          "risco": "-", "execucao": "-"})
+                continue
+            estado.mathematics = dict(estado.mathematics or {})
+            estado.mathematics["padrao_validado"] = {
+                "id": padrao["id"], "regra": texto, "direcao": regra["direcao"],
+                "horizonte_minutos": regra["horizonte_minutos"],
+                "eventos": padrao["eventos"], "fora_amostra": padrao["fora_amostra"],
+                "aviso": "Estatística histórica reproduzida localmente; não é garantia de retorno"}
+            try:
+                decisao = jev.decide(estado)
+            except RuntimeError as exc:
+                self.proxima_tentativa_jev = self.relogio() + TENTATIVA_JEV_S
+                self.publicar("decisao", {"id": id_analise, "simbolo": simbolo, "instante": _agora_iso(),
+                                          "oportunidade": texto, "decisao": "AGUARDANDO",
+                                          "justificativa": str(exc), "risco": "-", "execucao": "-"})
+                self.logger.aviso("JEv indisponível", simbolo=simbolo, detalhe=str(exc)[:160])
+                continue
+            self.logger.info("decisão JEv recebida", simbolo=simbolo, acao=decisao.action,
+                             probabilidade=round(decisao.probability, 2),
+                             confianca=round(decisao.confidence, 2), analysis_id=id_analise)
+            atualizado = self.fonte.revalidar(estado)
+            if atualizado is None:
+                self.publicar("decisao", {"id": id_analise, "simbolo": simbolo, "instante": _agora_iso(),
+                                          "oportunidade": texto, "decisao": "NÃO",
+                                          "justificativa": "Sem cotação recente após JEv; entrada não executa",
+                                          "risco": "-", "execucao": "nenhuma"})
+                continue
+            estado = atualizado
+            gate = risk.check(decisao, self.book, self.book.limits, estado)
+            if gate.verdict == "EXECUTE":
+                self.book.execute(decisao, estado, gate)
+                self.book.update(self.fonte)
+                self._persistir()
+                self.publicar("decisao", {"id": id_analise, "simbolo": simbolo, "instante": _agora_iso(),
+                                          "oportunidade": texto, "decisao": f"SIM ({decisao.action})",
+                                          "justificativa": f"JEv aprovou p={decisao.probability:.0%} c={decisao.confidence:.0%}; padrão validado",
+                                          "risco": f"gate EXECUTE; risco {gate.risk_amount:.2f} {self.book.currency}",
+                                          "execucao": f"paper aberto: {gate.volume:g} lote(s) a {gate.entry:.8g}; stop {gate.stop:.8g}; alvo {gate.target:.8g}"})
+                self.publicar("trades", list(reversed(self.book.trades[-500:])))
+                self.logger.info("entrada paper aberta", simbolo=simbolo, volume=gate.volume,
+                                 entrada=round(gate.entry, 8), analysis_id=id_analise)
+            else:
+                self.publicar("decisao", {"id": id_analise, "simbolo": simbolo, "instante": _agora_iso(),
+                                          "oportunidade": texto, "decisao": "NÃO",
+                                          "justificativa": f"JEv {decisao.action} p={decisao.probability:.0%} c={decisao.confidence:.0%} ou limite de risco recusou",
+                                          "risco": gate.reason or "-",
+                                          "execucao": "nenhuma"})
+                self.logger.info("entrada recusada pelo gate de risco", simbolo=simbolo,
+                                 motivo=gate.reason or "-")
+
+    def _candles_para_condicao(self, padrao, estado):
+        """Escolhe a série para avaliar a condição no candle mais recente.
+
+        Regras com minutos > 99 exigem a cauda da janela de 30 dias; a cauda
+        é combinada com o estado somente quando contígua (sem lacunas entre
+        elas), preservando a cronologia da avaliação.
+        """
+        interna = padrao["regra"]
+        params = interna.get("parametros") or {}
+        profundidade = max([int(params.get("minutos", 0))] +
+                           [int(params.get("n", 0)) + 1] + [2])
+        if len(estado.candles) > profundidade:
+            return estado.candles
+        cache = self.dados_ativo.get(estado.symbol)
+        cauda = (cache or {}).get("tail")
+        if not cauda or not estado.candles:
+            return None
+        if cauda[-1]["time"] + 60 == estado.candles[0]["time"]:
+            return cauda[:-len(estado.candles)] + estado.candles
+        return None
+
+    # ------------------------------------------------------------- utilidades
+    @staticmethod
+    def _texto_hipotese(hipotese):
+        params = ", ".join(f"{k}={v:g}" for k, v in hipotese["parametros"].items())
+        return f"{hipotese['tipo_regra']}({params}) → {hipotese['direcao']} em {hipotese['horizonte_minutos']}min"
+
+    @staticmethod
+    def _texto_validacao(validacao):
+        total, oos = validacao["total"], validacao["oos"]
+        if total["eventos"] == 0:
+            return "sem ocorrências"
+        return (f"eventos {total['eventos']}, taxa {total['taxa']:.0%}, média {total['media_pct']}% | "
+                f"OOS {oos['eventos']}, taxa {oos['taxa']:.0%}, média {oos['media_pct']}%")
+
+    def resumo(self):
+        """Instantâneo seguro para a UI, sem segredos."""
+        monitorados, operaveis = self.selecao.contagens()
+        return {"estado": self.estado, "detalhe": self.detalhe, "ciclo": self.ciclo,
+                "jev_ok": self.jev_configurado, "deepseek_ok": self.deepseek_configurado,
+                "parado_risco": self.parado_risco, "pausado": self.pausado,
+                "emergencia": self.emergencia_ativa, "monitorados": monitorados,
+                "operaveis": operaveis,
+                "orcamento": self.orcamento.consumo() if self.orcamento else {}}

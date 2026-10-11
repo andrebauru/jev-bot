@@ -9,7 +9,6 @@ stage reads typed fields.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional
 
 ACTIONS = ("BUY", "SELL", "HOLD", "AVOID")
 
@@ -21,25 +20,34 @@ class MarketState:
     symbol: str
     asset_class: str          # "stock", "crypto", "meme", "option"
     price: float
-    change_24h: float         # fraction, e.g. +0.048 for +4.8%
-    volume_delta: float       # fraction vs its own average
-    momentum: float           # -1..1
-    news: float               # -1..1 sentiment
-    regime: str               # "bullish", "neutral", "bearish"
+    bid: float = 0.0
+    ask: float = 0.0
+    tick_time: float = 0.0
+    stop_distance: float = 0.0
+    loss_per_lot: float = 0.0
+    margin_per_lot: float = 0.0
+    volume_min: float = 0.0
+    volume_max: float = 0.0
+    volume_step: float = 0.0
+    digits: int = 5
+    trade_mode: int = 0
+    currencies: tuple[str, ...] = ()
+    source: str = "MT5"
+    timeframe: str = "M1"
+    candles: list[dict] = field(default_factory=list)
+    mathematics: dict = field(default_factory=dict)
 
 
 @dataclass
 class Decision:
     """What JEV returned for a state: a typed action and two numbers.
 
-    `source` is "jev" when the real model produced it and "offline" when the
-    deterministic local engine did. It is never hidden: the desk labels
-    which one made the call, the same way it labels live vs simulated data.
+    `source` identifies the external decision service; no offline backend exists.
     """
 
     symbol: str
     action: str               # one of ACTIONS
     probability: float        # calibrated P(action is right), 0..1
     confidence: float         # how sure JEV is it should act at all, 0..1
-    source: str = "offline"   # "jev" or "offline"
+    source: str = "jev"
     reasons: dict = field(default_factory=dict)   # feature -> signed weight
