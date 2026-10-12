@@ -338,7 +338,7 @@ O pipeline gráfico é **Python → DeepSeek → JEv**:
    positiva. Status: candidato, validado, rejeitado ou expirado
    (validade de 7 dias). Repositório em `data/padroes/<SIMBOLO>.json`,
    com escrita atômica, deduplicação e versionamento de schema.
-4. **Decisão JEv**: somente padrões validados com a condição verdadeira no
+7. **Decisão JEv**: somente padrões validados com a condição verdadeira no
    candle fechado geram consulta ao JEv, que decide SIM ou NÃO; o gate de
    risco (`risk.check`) é determinístico e bloqueia independentemente da
    decisão. O operador edita risco por trade, exposição máxima e drawdown

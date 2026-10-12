@@ -28,6 +28,7 @@ from __future__ import annotations
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
+import json
 import queue
 import threading
 import time
@@ -167,6 +168,8 @@ class Orquestrador:
         self.consultas_ds_ciclo = 0
         self.arquivo_emergencia = Path(str(self.banco) + ".emergencia")
         self.arquivo_pausa = Path(str(self.banco) + ".pause")
+        self.ultimo_resumo_hash = {}
+        self.ultimo_resumo_hash = {}
         self.cache_m1 = cache_m1.CacheM1(self.pasta_dados.parent / "cache_m1",
                                          relogio=relogio)
         self.prazo_ciclo = None
@@ -1000,7 +1003,7 @@ class Orquestrador:
                                "padroes_testados": len(ativos_repo),
                                "resultado": f"movimento mediano {stats['movimento_1min']['mediana_pct']}% | custo spread {custo_pct}%",
                                "erro": None})
-        self._oportunidade(estado, id_analise)
+        return self._oportunidade(estado, id_analise)
 
     def _pode_atualizar_janela(self, simbolo):
         """Primeira coleta sempre; depois teto por ciclo em ordem round-robin."""
@@ -1070,6 +1073,17 @@ class Orquestrador:
         spread_fracao = (spread[1] - spread[0]) if spread else 0.0
         stats = estatisticas(recorte, spread_fracao)
         custo_pct = stats.get("custo_spread_pct") or 0.0
+        # Deduplicação de chamadas: sem tokens quando o resumo de descoberta
+        # é idêntico ao da última análise (janela parada/atividade nula).
+        import hashlib as _hashlib
+        hash_resumo = _hashlib.sha1(json.dumps(
+            resumo_compacto(stats), sort_keys=True, allow_nan=False).encode("utf-8")).hexdigest()[:16]
+        if self.ultimo_resumo_hash.get(simbolo) == hash_resumo:
+            self.contadores_ciclo["deepseek_omitido"] = \
+                self.contadores_ciclo.get("deepseek_omitido", 0) + 1
+            self.logger.debug("DeepSeek omitido: resumo idêntico ao da última análise",
+                              simbolo=simbolo)
+            return
         janela_info = {"inicio": janela["inicio"], "fim": janela["fim"],
                        "dias": stats.get("dias"), "candles": janela["recebidos"]}
         # Revalida padrões ativos com a janela recém-baixada (cronologia preservada).
@@ -1107,10 +1121,11 @@ class Orquestrador:
                 and agora - self.ultimo_deepseek.get(simbolo, 0) >= DEEPSEEK_TTL_S
                 and stats.get("disponivel") and (janela["fim"] - janela["inicio"]) >= 3 * 86400):
             self.consultas_ds_ciclo += 1
-            self._etapa_deepseek(simbolo, janela["candles"], cache, stats, id_analise)
+            self._etapa_deepseek(simbolo, janela["candles"], cache, stats, id_analise,
+                                 hash_resumo=hash_resumo)
         # Cauda permanece no cache; a janela completa é liberada ao sair deste método.
 
-    def _etapa_deepseek(self, simbolo, candles, cache, stats, id_analise):
+    def _etapa_deepseek(self, simbolo, candles, cache, stats, id_analise, hash_resumo=None):
         """Consulta o DeepSeek, valida cada hipótese localmente e registra."""
         agora = self.relogio()
         permitido, motivo = self.orcamento.permitir()
@@ -1149,6 +1164,9 @@ class Orquestrador:
             return False
         self.orcamento.registrar(uso.get("tokens", 0))
         self.ultimo_deepseek[simbolo] = agora
+        if hash_resumo is not None:
+            self.ultimo_resumo_hash[simbolo] = hash_resumo
+        self.ultimo_resumo_hash[simbolo] = hash_resumo
         self._estado_set("ANALISANDO", f"Ciclo {self.ciclo} · VALIDANDO {simbolo}",
                          registrar=False, fase="VALIDANDO")
         self.logger.info("resposta DeepSeek recebida", simbolo=simbolo,
@@ -1187,20 +1205,21 @@ class Orquestrador:
         da seleção.
         """
         if self.book is None or not self.book.active or self.parado_risco or self.emergencia_ativa:
-            return
+            return "inativo"
         simbolo = estado.symbol
         if not self.selecao.operar(simbolo):
             self.contadores_ciclo["somente_monitorar"] = \
                 self.contadores_ciclo.get("somente_monitorar", 0) + 1
-            return
+            return "somente_monitorar"
         validados = self.repositorio.validados(simbolo)
         if not validados:
             self.contadores_ciclo["sem_padrao"] = \
                 self.contadores_ciclo.get("sem_padrao", 0) + 1
-            return
+            return "sem_padrao"
         instante_candle = estado.candles[-1]["time"] if estado.candles else None
         if len(self.avaliados) > MAX_AVALIADOS:
             self.avaliados.clear()
+        condicao_presente = False
         for padrao in validados:
             chave = (simbolo, padrao["id"])
             if self.avaliados.get(chave) == instante_candle:
@@ -1212,16 +1231,40 @@ class Orquestrador:
                 continue
             if not padroes.condicao_atual(padrao, candles_condicao):
                 continue
+            condicao_presente = True
             interna = padrao["regra"]
             regra = {"tipo_regra": interna["tipo"], "parametros": interna["parametros"],
                      "direcao": interna["direcao"], "horizonte_minutos": interna["horizonte_minutos"]}
             texto = self._texto_hipotese(regra)
             taxa_oos = padrao["fora_amostra"].get("taxa")
             evidencia = f"{texto} | taxa OOS {taxa_oos:.0%}" if taxa_oos is not None else texto
+            # Contrato versionado DeepSeek → JEv: validado antes de qualquer uso.
+            contrato = padroes.contrato_oportunidade(
+                padrao, candles_condicao, id_analise,
+                {"equity": self.book.equity(), "moeda": self.book.currency,
+                 "exposicao_fracao": self.book.metrics()["risk_fraction"],
+                 "max_total_risk": self.book.limits.max_total_risk,
+                 "max_drawdown": self.book.limits.max_drawdown,
+                 "precos_validos": self.book.prices_valid},
+                agora=self.relogio())
+            ok_contrato, motivo_contrato = padroes.validar_contrato(
+                contrato, agora=self.relogio())
+            if not ok_contrato:
+                self.contadores_ciclo["contrato_invalido"] = \
+                    self.contadores_ciclo.get("contrato_invalido", 0) + 1
+                self.publicar("decisao", {"id": id_analise, "simbolo": simbolo,
+                                          "instante": _agora_iso(), "oportunidade": texto,
+                                          "decisao": "NÃO", "justificativa":
+                                          f"Contrato inválido: {motivo_contrato}",
+                                          "risco": evidencia, "execucao": "nenhuma"})
+                self.logger.aviso("contrato de oportunidade inválido", simbolo=simbolo,
+                                  padrao=padrao["id"], motivo=motivo_contrato)
+                return "contrato_invalido"
             self.publicar("decisao", {"id": id_analise, "simbolo": simbolo, "instante": _agora_iso(),
                                       "oportunidade": texto, "decisao": "CONSULTANDO JEV",
                                       "justificativa": "Padrão validado localmente com condição verdadeira no candle fechado",
-                                      "risco": evidencia, "execucao": "-"})
+                                      "risco": evidencia, "execucao": "-",
+                                      "padrao": padrao["id"], "candle_ref": instante_candle})
             self.logger.info("oportunidade detectada; consultando JEv", simbolo=simbolo,
                              padrao=padrao["id"], analysis_id=id_analise)
             self.contadores_ciclo["aguardando_decisao"] = \
@@ -1235,6 +1278,7 @@ class Orquestrador:
                                           "risco": "-", "execucao": "-"})
                 continue
             estado.mathematics = dict(estado.mathematics or {})
+            estado.mathematics["oportunidade"] = contrato
             estado.mathematics["padrao_validado"] = {
                 "id": padrao["id"], "regra": texto, "direcao": regra["direcao"],
                 "horizonte_minutos": regra["horizonte_minutos"],
@@ -1263,7 +1307,10 @@ class Orquestrador:
                 continue
             estado = atualizado
             gate = risk.check(decisao, self.book, self.book.limits, estado)
-            if gate.verdict != "EXECUTE":
+            if decisao.action not in ("BUY", "SELL"):
+                self.contadores_ciclo["jev_nao"] = \
+                    self.contadores_ciclo.get("jev_nao", 0) + 1  # JEv decidiu NÃO
+            elif gate.verdict != "EXECUTE":
                 self.contadores_ciclo["risco_bloqueado"] = \
                     self.contadores_ciclo.get("risco_bloqueado", 0) + 1
             if gate.verdict == "EXECUTE":
@@ -1276,18 +1323,30 @@ class Orquestrador:
                                           "oportunidade": texto, "decisao": f"SIM ({decisao.action})",
                                           "justificativa": f"JEv aprovou p={decisao.probability:.0%} c={decisao.confidence:.0%}; padrão validado",
                                           "risco": f"gate EXECUTE; risco {gate.risk_amount:.2f} {self.book.currency}",
-                                          "execucao": f"paper aberto: {gate.volume:g} lote(s) a {gate.entry:.8g}; stop {gate.stop:.8g}; alvo {gate.target:.8g}"})
+                                          "execucao": f"paper aberto: {gate.volume:g} lote(s) a {gate.entry:.8g}; stop {gate.stop:.8g}; alvo {gate.target:.8g}",
+                                          "padrao": padrao["id"], "candle_ref": instante_candle})
                 self.publicar("trades", list(reversed(self.book.trades[-500:])))
                 self.logger.info("entrada paper aberta", simbolo=simbolo, volume=gate.volume,
-                                 entrada=round(gate.entry, 8), analysis_id=id_analise)
+                                 entrada=round(gate.entry, 8), analysis_id=id_analise,
+                                 padrao=padrao["id"], candle_ref=instante_candle)
+                return "executada"
             else:
+                if gate.verdict == "EXECUTE" or decisao.action in ("BUY", "SELL"):
+                    self.contadores_ciclo["jev_nao"] = \
+                        self.contadores_ciclo.get("jev_nao", 0) + 1
                 self.publicar("decisao", {"id": id_analise, "simbolo": simbolo, "instante": _agora_iso(),
                                           "oportunidade": texto, "decisao": "NÃO",
                                           "justificativa": f"JEv {decisao.action} p={decisao.probability:.0%} c={decisao.confidence:.0%} ou limite de risco recusou",
                                           "risco": gate.reason or "-",
-                                          "execucao": "nenhuma"})
+                                          "execucao": "nenhuma",
+                                          "padrao": padrao["id"], "candle_ref": instante_candle})
                 self.logger.info("entrada recusada pelo gate de risco", simbolo=simbolo,
                                  motivo=gate.reason or "-")
+                return "jev_nao"
+        if validados and not condicao_presente:
+            self.contadores_ciclo["validado_condicao_ausente"] = \
+                self.contadores_ciclo.get("validado_condicao_ausente", 0) + 1
+            return "condicao_ausente"
 
     def _candles_para_condicao(self, padrao, estado):
         """Escolhe a série para avaliar a condição no candle mais recente.

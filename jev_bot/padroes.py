@@ -26,6 +26,7 @@ from pathlib import Path
 from . import motor_matematico
 
 SCHEMA = 1
+ALGORITMO_VERSAO = "regras-v2.1"  # semântica de regras + validação (off-by-one corrigido)
 MIN_EVENTOS = 40        # ocorrências mínimas na janela inteira
 MIN_EVENTOS_OOS = 12    # ocorrências mínimas fora da amostra
 MIN_TAXA = 0.55         # taxa de acerto mínima, dentro e fora da amostra
@@ -201,27 +202,135 @@ def validar(regra, candles, custo_pct):
     jamais participam da decisão de descoberta, apenas da verificação.
     """
     tipo = regra["tipo_regra"]
-    indices = indices_condicao(tipo, regra["parametros"], candles)
-    total = _resultado(indices, regra["direcao"], regra["horizonte_minutos"], candles, custo_pct)
+    horizonte = regra["horizonte_minutos"]
+    brutos = indices_condicao(tipo, regra["parametros"], candles)
+    # Eventos sobrepostos: eventos dependentes (a menos de h candles) contam
+    # uma vez; evita que sequências correlacionadas inflem a amostra.
+    indices = []
+    for i in brutos:
+        if not indices or i - indices[-1] > horizonte:
+            indices.append(i)
+    total = _resultado(indices, regra["direcao"], horizonte, candles, custo_pct)
     corte = int(len(candles) * motor_matematico.CORTE_OOS)
     dentro = [i for i in indices if i < corte]
     fora = [i for i in indices if i >= corte]
-    amostra = _resultado(dentro, regra["direcao"], regra["horizonte_minutos"], candles, custo_pct)
-    oos = _resultado(fora, regra["direcao"], regra["horizonte_minutos"], candles, custo_pct)
+    amostra = _resultado(dentro, regra["direcao"], horizonte, candles, custo_pct)
+    oos = _resultado(fora, regra["direcao"], horizonte, candles, custo_pct)
+    # Estabilidade por subperíodo: metades cronológicas do fora-da-amostra.
+    meio = len(fora) // 2
+    oos_1 = _resultado(fora[:meio], regra["direcao"], horizonte, candles, custo_pct)
+    oos_2 = _resultado(fora[meio:], regra["direcao"], horizonte, candles, custo_pct)
+    estabilidade = {"oos_primeira_metade": oos_1, "oos_segunda_metade": oos_2}
     if total["eventos"] == 0:
         return {"status": "rejeitado", "motivo": "Sem ocorrências na janela",
-                "total": total, "amostra": amostra, "oos": oos, "custo_pct": custo_pct,
+                "total": total, "amostra": amostra, "oos": oos,
+                "estabilidade": estabilidade, "custo_pct": custo_pct,
                 "wilson_inferior": None}
     if total["eventos"] < MIN_EVENTOS or oos["eventos"] < MIN_EVENTOS_OOS:
         return {"status": "rejeitado", "motivo": "Amostra insuficiente",
-                "total": total, "amostra": amostra, "oos": oos, "custo_pct": custo_pct,
+                "total": total, "amostra": amostra, "oos": oos,
+                "estabilidade": estabilidade, "custo_pct": custo_pct,
                 "wilson_inferior": round(wilson_inferior(total["acertos"], total["eventos"]), 4)}
     aprovado = (amostra["taxa"] >= MIN_TAXA and oos["taxa"] >= MIN_TAXA and total["media_pct"] > 0)
     motivo = ("Evidência dentro e fora da amostra" if aprovado
               else "Taxa/expectativa abaixo do mínimo fora da amostra")
     return {"status": "validado" if aprovado else "rejeitado", "motivo": motivo,
-            "total": total, "amostra": amostra, "oos": oos, "custo_pct": custo_pct,
+            "total": total, "amostra": amostra, "oos": oos, "estabilidade": estabilidade,
+            "custo_pct": custo_pct,
             "wilson_inferior": round(wilson_inferior(total["acertos"], total["eventos"]), 4)}
+
+
+# ---------------------------------------------------------------------------
+# Contrato DeepSeek → JEv (payload versionado e validado por esquema)
+# ---------------------------------------------------------------------------
+
+SCHEMA_CONTRATO = 1
+CAMPOS_CONTRATO = ("schema_version", "analysis_id", "symbol", "timeframe",
+                   "window_start", "window_end", "pattern_id", "hypothesis",
+                   "validation_status", "sample_size", "out_of_sample_metrics",
+                   "expected_net_return", "direction", "reference_price",
+                   "expiry", "risk_context", "evidence_hash")
+
+
+def contrato_oportunidade(padrao, candles, analysis_id, risk_context, agora=None):
+    """Monta o payload versionado entregue ao JEv com uma oportunidade validada.
+
+    Todos os campos derivam de dados calculados em Python (padrão validado
+    no repositório + janela atual). `evidence_hash` amarra o payload às
+    evidências: hash do JSON canônico do padrão + janela + métricas — um
+    recálculo divergente invalida o contrato antes do JEv.
+    """
+    regra = padrao["regra"]
+    close_referencia = float(candles[-1]["close"])
+    eventos = padrao.get("eventos") or {}
+    fora = padrao.get("fora_amostra") or {}
+    evidencia = {
+        "pattern_id": padrao["id"], "chave": padrao.get("chave"),
+        "algoritmo_versao": padrao.get("algoritmo_versao", ALGORITMO_VERSAO),
+        "janela": [padrao.get("janela_inicio"), padrao.get("janela_fim")],
+        "eventos": eventos, "fora_amostra": fora,
+        "custo_spread_pct": padrao.get("custo_spread_pct"),
+        "wilson_inferior": padrao.get("wilson_inferior"),
+        "reference_price": close_referencia,
+    }
+    canônico = json.dumps(evidencia, sort_keys=True, allow_nan=False)
+    validade = padrao.get("validado_em", 0) + VALIDADE_DIAS * 86400
+    return {
+        "schema_version": SCHEMA_CONTRATO,
+        "analysis_id": analysis_id,
+        "symbol": padrao["simbolo"],
+        "timeframe": "M1",
+        "window_start": padrao.get("janela_inicio"),
+        "window_end": padrao.get("janela_fim"),
+        "pattern_id": padrao["id"],
+        "hypothesis": (f"{regra['tipo']} {regra['parametros']} → {regra['direcao']} "
+                       f"em {regra['horizonte_minutos']}min"),
+        "validation_status": "VALIDADO",
+        "sample_size": eventos.get("eventos", 0),
+        "out_of_sample_metrics": fora,
+        "expected_net_return": eventos.get("media_pct", 0.0),
+        "direction": regra["direcao"],
+        "reference_price": close_referencia,
+        "expiry": validade,
+        "risk_context": risk_context,
+        "evidence_hash": hashlib.sha1(canônico.encode("utf-8")).hexdigest(),
+    }
+
+
+def validar_contrato(payload, agora=None):
+    """Esquema do contrato: campos obrigatórios, coerência e vigência.
+
+    Devolve (ok, motivo). Falha fechada: contrato inválido nunca chega ao
+    JEv nem a uma entrada paper.
+    """
+    agora = time.time() if agora is None else agora
+    if not isinstance(payload, dict):
+        return False, "contrato não é um objeto"
+    faltando = [c for c in CAMPOS_CONTRATO if c not in payload]
+    if faltando:
+        return False, f"campos ausentes: {', '.join(faltando)}"
+    if payload["schema_version"] != SCHEMA_CONTRATO:
+        return False, f"schema_version incompatível: {payload['schema_version']}"
+    if payload["timeframe"] != "M1":
+        return False, f"timeframe deve ser M1: {payload['timeframe']}"
+    if payload["validation_status"] != "VALIDADO":
+        return False, f"status não é VALIDADO: {payload['validation_status']}"
+    if payload["direction"] not in DIRECOES:
+        return False, f"direção inválida: {payload['direction']}"
+    if not isinstance(payload["sample_size"], int) or payload["sample_size"] < MIN_EVENTOS:
+        return False, f"amostra insuficiente no contrato: {payload['sample_size']}"
+    if not isinstance(payload["expected_net_return"], (int, float)) or             payload["expected_net_return"] <= 0:
+        return False, "expectativa líquida deve ser positiva"
+    if not isinstance(payload["expiry"], (int, float)) or payload["expiry"] < agora:
+        return False, "padrão expirado no contrato"
+    if payload["window_start"] is None or payload["window_end"] is None or             payload["window_end"] <= payload["window_start"]:
+        return False, "janela inválida no contrato"
+    if not isinstance(payload["evidence_hash"], str) or len(payload["evidence_hash"]) != 40:
+        return False, "evidence_hash inválido"
+    risco = payload["risk_context"]
+    if not isinstance(risco, dict) or not isinstance(risco.get("equity"), (int, float)):
+        return False, "risk_context ausente no contrato"
+    return True, ""
 
 
 # ---------------------------------------------------------------------------
@@ -296,7 +405,8 @@ class RepositorioPadroes:
         registro = next((p for p in dados["padroes"] if p.get("id") == identificador), None)
         if registro is None:
             registro = {"id": identificador, "chave": chave, "simbolo": simbolo.upper(),
-                        "schema_version": SCHEMA, "origem": origem, "criado_em": agora,
+                        "schema_version": SCHEMA, "algoritmo_versao": ALGORITMO_VERSAO,
+                        "origem": origem, "criado_em": agora,
                         "regra": {"tipo": tipo, "parametros": parametros,
                                   "direcao": regra["direcao"],
                                   "horizonte_minutos": regra["horizonte_minutos"]},
