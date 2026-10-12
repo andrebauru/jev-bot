@@ -130,11 +130,15 @@ class PainelMercados(QWidget):
         self._expandidos.add(categoria)
         selecao = mercados.carregar(self._caminho_selecao)
         self.arvore.blockSignals(True)
+        # Tick marcado na categoria antes da expansão vale para os filhos
+        # sem estado salvo explícito; a seleção salva por símbolo tem prioridade.
+        padrao_monitorar = item.checkState(COL_MONITORAR) == Qt.Checked
+        padrao_operar = item.checkState(COL_OPERAR) == Qt.Checked
         filhos = []
         for simbolo in self._catalogo.get(categoria, []):
             filho = QTreeWidgetItem([simbolo, "", ""])
             filho.setData(COL_SIMBOLO, Qt.UserRole, "simbolo")
-            monitorar, operar = selecao.mapa.get(simbolo, (False, False))
+            monitorar, operar = selecao.mapa.get(simbolo, (padrao_monitorar, padrao_operar))
             filho.setCheckState(COL_MONITORAR, Qt.Checked if monitorar else Qt.Unchecked)
             filho.setCheckState(COL_OPERAR, Qt.Checked if operar else Qt.Unchecked)
             filhos.append(filho)
@@ -245,20 +249,34 @@ class PainelMercados(QWidget):
 
     # ------------------------------------------------------------- persistência
     def _coletar(self):
-        """Estado atual da árvore no formato de persistência."""
+        """Estado atual da árvore no formato de persistência.
+
+        Categoria nunca expandida (sem filhos carregados): o tick da
+        categoria se aplica a TODOS os símbolos do catálogo real dela —
+        nada é inferido de ativos inexistentes.
+        """
         selecao = {}
         raiz = self.arvore.invisibleRootItem()
         for i in range(raiz.childCount()):
             categoria = raiz.child(i)
+            nome = categoria.text(COL_SIMBOLO)
             simbolos = {}
-            for j in range(categoria.childCount()):
-                filho = categoria.child(j)
-                monitorar = filho.checkState(COL_MONITORAR) == Qt.Checked
-                operar = filho.checkState(COL_OPERAR) == Qt.Checked and monitorar
-                if monitorar or operar:
-                    simbolos[filho.text(COL_SIMBOLO)] = {"monitorar": monitorar, "operar": operar}
+            if categoria.childCount() == 0:
+                monitorar_cat = categoria.checkState(COL_MONITORAR) == Qt.Checked
+                operar_cat = categoria.checkState(COL_OPERAR) == Qt.Checked and monitorar_cat
+                if monitorar_cat:
+                    simbolos = {simbolo: {"monitorar": True, "operar": operar_cat}
+                                for simbolo in self._catalogo.get(nome, [])}
+            else:
+                for j in range(categoria.childCount()):
+                    filho = categoria.child(j)
+                    monitorar = filho.checkState(COL_MONITORAR) == Qt.Checked
+                    operar = filho.checkState(COL_OPERAR) == Qt.Checked and monitorar
+                    if monitorar or operar:
+                        simbolos[filho.text(COL_SIMBOLO)] = {"monitorar": monitorar,
+                                                             "operar": operar}
             if simbolos:
-                selecao[categoria.text(COL_SIMBOLO)] = simbolos
+                selecao[nome] = simbolos
         return selecao
 
     def _salvar(self):

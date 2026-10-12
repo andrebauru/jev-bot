@@ -264,6 +264,51 @@ class TestPainelMercados(unittest.TestCase):
             self.assertEqual(no2.child(0).checkState(1), Qt.Checked)
             self.assertEqual(no2.child(0).checkState(2), Qt.Checked)
 
+    def test_categoria_nao_expandida_aplica_ao_catalogo_completo(self):
+        """Tick em categoria NÃO expandida vale para todos os símbolos dela."""
+        with tempfile.TemporaryDirectory() as pasta:
+            painel = self._painel(pasta)
+            painel.preencher_catalogo({"categorias": {"Crypto": ["BTCUSD", "ETHUSD"],
+                                                      "Forex": ["EURUSD"]}, "origem": "ao vivo"})
+            no = painel.arvore.topLevelItem(0)  # Crypto, SEM expandir
+            from PySide6.QtCore import Qt
+            no.setCheckState(1, Qt.Checked)  # Monitorar na categoria
+            painel._salvar()
+            dados = json.loads((Path(pasta) / "mercados.json").read_text(encoding="utf-8"))
+            crypto = dados["selecao"]["Crypto"]
+            self.assertEqual(crypto["BTCUSD"], {"monitorar": True, "operar": False})
+            self.assertEqual(crypto["ETHUSD"], {"monitorar": True, "operar": False})
+            self.assertNotIn("Forex", dados["selecao"])
+            # Expansão depois: filhos nascem marcados conforme o tick da categoria.
+            painel2 = self._painel(pasta)
+            painel2.preencher_catalogo({"categorias": {"Crypto": ["BTCUSD", "ETHUSD"]},
+                                        "origem": "ao vivo"})
+            no2 = painel2.arvore.topLevelItem(0)
+            no2.setExpanded(True)
+            self.assertEqual(no2.child(0).checkState(1), Qt.Checked)
+            self.assertEqual(no2.child(1).checkState(1), Qt.Checked)
+
+    def test_selecao_salva_por_simbolo_tem_prioridade_na_expansao(self):
+        """Estado salvo por símbolo prevalece sobre o tick da categoria."""
+        with tempfile.TemporaryDirectory() as pasta:
+            painel = self._painel(pasta)
+            painel.preencher_catalogo({"categorias": {"Crypto": ["BTCUSD", "ETHUSD"]},
+                                       "origem": "ao vivo"})
+            no = painel.arvore.topLevelItem(0)
+            no.setExpanded(True)
+            from PySide6.QtCore import Qt
+            no.child(0).setCheckState(1, Qt.Checked)   # apenas BTCUSD monitorar
+            no.child(0).setCheckState(2, Qt.Checked)   # BTCUSD operar
+            painel._salvar()
+            painel2 = self._painel(pasta)
+            painel2.preencher_catalogo({"categorias": {"Crypto": ["BTCUSD", "ETHUSD"]},
+                                        "origem": "ao vivo"})
+            no2 = painel2.arvore.topLevelItem(0)
+            no2.setCheckState(1, Qt.Checked)  # operador marca a categoria INTEIRA depois
+            no2.setExpanded(True)
+            self.assertEqual(no2.child(0).checkState(2), Qt.Checked)   # BTCUSD operar (salvo)
+            self.assertEqual(no2.child(1).checkState(1), Qt.Checked)   # ETHUSD monitorar (categoria)
+
     def test_sem_invencao_de_ativos_offline(self):
         """Sem catálogo, o painel não cria categorias fictícias."""
         with tempfile.TemporaryDirectory() as pasta:

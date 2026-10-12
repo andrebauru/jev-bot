@@ -32,7 +32,7 @@ import queue
 import threading
 import time
 
-from . import deepseek, jev, logs, mercados, padroes, risk
+from . import cache_m1, deepseek, jev, logs, mercados, padroes, risk
 from .markets import FonteMT5
 from .motor_matematico import estatisticas, janela_descoberta, resumo_compacto
 from .painel import BANCO_PADRAO, carregar_carteira
@@ -46,6 +46,12 @@ TENTATIVA_DEEPSEEK_S = 120   # recuo global após falha DeepSeek
 MARGEM_CANDLE_S = 2          # segundos após o fechamento do M1
 CAUDA_CANDLES = 720          # cauda guardada por ativo (~12h; cobre regras de 240min)
 TENTATIVAS_CONEXAO = 3       # tentativas de conexão MT5 com recuo (2s/4s/6s)
+ORCAMENTO_CICLO_S = 50       # orçamento de tempo do ciclo sem posições (cadência 1min)
+ORCAMENTO_CICLO_COM_POSICAO_S = 600  # com posições (cadência 15min)
+RESERVA_PROCESSAMENTO_S = 15  # fatia final do orçamento reservada ao processamento
+FAS = {"VARRENDO": "VARRENDO CATÁLOGO", "BAIXANDO_HISTORICO": "BAIXANDO HISTÓRICO",
+       "CALCULANDO": "CALCULANDO", "ANALISANDO_DEEPSEEK": "ANALISANDO DEEPSEEK",
+       "VALIDANDO": "VALIDANDO PADRÕES", "DECIDINDO_JEV": "DECIDINDO JEV"}
 MAX_AVALIADOS = 2000         # memoria de deduplicação por candle
 LOTE_DOWNLOAD = 4320         # candles por chamada ao terminal (3 dias)
 
@@ -133,6 +139,7 @@ class Orquestrador:
         self.ciclo = 0
         self.ciclo_ativo = False
         self.estado = "CONECTANDO"
+        self.fase = None            # subestado do trabalho em andamento
         self.detalhe = "Aguardando conexão MT5"
         self.estado_desde = self.relogio()
         self.pausado = True          # pausa inicial; autostart avalia ao conectar
@@ -160,6 +167,12 @@ class Orquestrador:
         self.consultas_ds_ciclo = 0
         self.arquivo_emergencia = Path(str(self.banco) + ".emergencia")
         self.arquivo_pausa = Path(str(self.banco) + ".pause")
+        self.cache_m1 = cache_m1.CacheM1(self.pasta_dados.parent / "cache_m1",
+                                         relogio=relogio)
+        self.prazo_ciclo = None
+        self.prazo_scan = None
+        self.pendentes_ciclo = []
+        self.contadores_ciclo = {}
 
     # ------------------------------------------------------------------ API
     def iniciar(self):
@@ -215,7 +228,7 @@ class Orquestrador:
         self.encerrar.set()
         self.acoes.put(("sair", None, self.relogio()))
 
-    def _estado_set(self, estado, detalhe="", registrar=True):
+    def _estado_set(self, estado, detalhe="", registrar=True, fase=None):
         """Transição formal de estado: fonte única de verdade para a GUI.
 
         Transições para o MESMO estado apenas atualizam o detalhe (sem
@@ -226,6 +239,8 @@ class Orquestrador:
         anterior = self.estado
         agora = self.relogio()
         mudou = anterior != estado
+        if fase is not None:
+            self.fase = fase
         self.estado, self.detalhe = estado, detalhe
         if registrar and mudou:
             self.logger.info("transição de estado", de=anterior, para=estado,
@@ -233,7 +248,7 @@ class Orquestrador:
                              motivo=str(detalhe)[:80])
             self.estado_desde = agora
         self.publicar("estado", {"estado": estado, "detalhe": detalhe,
-                                 "quando": _agora_iso()})
+                                 "fase": self.fase, "quando": _agora_iso()})
 
     def descarregar(self):
         """Envia à interface um único pacote com tudo acumulado desde o último flush."""
@@ -299,10 +314,12 @@ class Orquestrador:
         ja_ativo = self.book.active and not self.pausado
         self.pausado = False
         self.book.active = True
-        self._estado_set("PRONTO", f"Início automático ({origem}); aguardando próximo ciclo")
         if ja_ativo:
+            # Já rodando: NÃO sobrescreve ANALISANDO/AGUARDANDO com PRONTO
+            # (causa do chip em PRONTO durante downloads no vídeo).
             self.logger.debug("autostart: ciclo já ativo", origem=origem)
             return
+        self._estado_set("PRONTO", f"Início automático ({origem}); aguardando próximo ciclo")
         self.publicar("log", {"instante": _agora_iso(), "nivel": "info",
                               "mensagem": f"Início automático ({origem}): ciclo ativo e entradas paper "
                                           f"habilitadas, sujeitas ao risco ({self.selecao.contagens()[0]} mercados)"})
@@ -311,6 +328,17 @@ class Orquestrador:
         if not self.deepseek_configurado:
             self.publicar("log", {"instante": _agora_iso(), "nivel": "aviso",
                                   "mensagem": "DeepSeek não configurado: sem novas hipóteses; padrões já validados continuam sendo usados."})
+
+    def _cancelado_scan(self):
+        """Cancelamento da varredura: encerramento, emergência ou prazo vencido.
+
+        Reserva RESERVA_PROCESSAMENTO_S do orçamento para processar o que
+        foi coletado, evitando ciclos que consomem a cadência inteira.
+        """
+        if self.encerrar.is_set() or self.evento_emergencia.is_set():
+            return True
+        return bool(self.ciclo_ativo and self.prazo_scan is not None
+                    and self.relogio() > self.prazo_scan)
 
     def _cancelado_ciclo(self):
         """Cancelamento cooperativo: encerramento, emergência ou ciclo cancelado."""
@@ -354,7 +382,7 @@ class Orquestrador:
             gerenciador, fonte = self._conectar_com_retentativas()
             try:
                 self.fonte = fonte
-                fonte.cancelado = self.encerrar.is_set
+                fonte.cancelado = self._cancelado_scan
                 fonte.evento = self._evento_fonte
                 self.book = self.carga_carteira(self.banco, fonte.moeda)
                 self.arquivo_emergencia = Path(str(self.banco) + ".emergencia")
@@ -783,6 +811,7 @@ class Orquestrador:
                 "jev_ok": self.jev_configurado, "deepseek_ok": self.deepseek_configurado,
                 "orcamento": self.orcamento.consumo() if self.orcamento else {},
                 "monitorados": monitorados, "operaveis": operaveis,
+                "fase": self.fase, "contadores": dict(self.contadores_ciclo),
                 "posicoes_detalhe": [asdict(p) for p in book.fills]}
 
     def _persistir(self):
@@ -799,10 +828,11 @@ class Orquestrador:
         self.ciclo_ativo = True
         self.evento_ciclo_cancelado.clear()
         self.contagem_scan = {}
+        inicio_ciclo = self.relogio()
         self.ciclo += 1
         id_ciclo = f"ciclo{self.ciclo}"
         self.logger.info("ciclo iniciado", ciclo=self.ciclo, analysis_id=id_ciclo)
-        self._estado_set("ANALISANDO", f"Ciclo {self.ciclo}")
+        self._estado_set("ANALISANDO", f"Ciclo {self.ciclo}", fase="VARRENDO")
         try:
             self._executar_ciclo(id_ciclo)
         finally:
@@ -815,6 +845,15 @@ class Orquestrador:
             self.logger.info("ciclo concluído", ciclo=self.ciclo)
 
     def _executar_ciclo(self, id_ciclo):
+        # Orçamento de tempo: varredura de 90+ símbolos pode ultrapassar a
+        # cadência; o ciclo nunca excede o orçamento e o restante segue no
+        # próximo ciclo (continuidade incremental, sem sobreposição).
+        orcamento = (ORCAMENTO_CICLO_COM_POSICAO_S if self.book and self.book.fills
+                     else ORCAMENTO_CICLO_S)
+        self.prazo_ciclo = self.relogio() + orcamento
+        self.prazo_scan = self.prazo_ciclo - RESERVA_PROCESSAMENTO_S
+        self.contadores_ciclo = {}
+        inicio_ciclo = self.relogio()
         self._registrar_selecao()  # aplica mudanças de seleção no início do ciclo
         try:
             estados = list(self.fonte.estados())
@@ -826,38 +865,85 @@ class Orquestrador:
         self.publicar("calc", {"id": id_ciclo, "simbolo": "", "instante": _agora_iso(),
                                "etapa": "ciclo", "mensagem": f"{len(estados)} ativos elegíveis no ciclo {self.ciclo}",
                                "amostra": None, "padroes_testados": None, "resultado": None, "erro": None})
+        self.contadores_ciclo["candidatos"] = len(estados)
         self.consultas_ds_ciclo = 0
-        for estado in estados:
+        try:
+            self._varrer_e_processar(id_ciclo, estados)
+        finally:
+            duracao = round(self.relogio() - inicio_ciclo, 1)
+            resumo = "; ".join(f"{k}={v}" for k, v in sorted(self.contadores_ciclo.items()))
+            self.publicar("decisao", {"id": id_ciclo, "simbolo": "", "instante": _agora_iso(),
+                                      "oportunidade": f"Ciclo {self.ciclo}",
+                                      "decisao": "RESUMO",
+                                      "justificativa": resumo or "sem candidatos monitorados",
+                                      "risco": f"pendentes: {len(self.pendentes_ciclo)}",
+                                      "execucao": f"duração {duracao}s"})
+            self.logger.info("ciclo concluído (processamento)", ciclo=self.ciclo,
+                             duracao_s=duracao, pendentes=len(self.pendentes_ciclo),
+                             contadores=dict(self.contadores_ciclo))
+
+    def _varrer_e_processar(self, id_ciclo, estados):
+        # Continuidade incremental: pendentes do ciclo anterior têm prioridade.
+        if self.pendentes_ciclo:
+            self.logger.info("continuidade do ciclo anterior", pendentes=len(self.pendentes_ciclo))
+        ordem = [s for s in self.pendentes_ciclo]
+        ordem += [s.symbol for s in estados if s.symbol not in self.pendentes_ciclo]
+        por_simbolo = {s.symbol: s for s in estados}
+        processados = set()
+        for simbolo in ordem:
             if self._cancelado_ciclo() or self.pausado or self.parado_risco:
                 break
             self._processar_acoes()  # INICIAR/PAUSAR/EMERGÊNCIA respondem no meio do ciclo
             self.descarregar()
-            if not self.selecao.monitorar(estado.symbol):
+            estado = por_simbolo.get(simbolo)
+            if estado is None:
+                continue  # pendente que não veio nesta varredura
+            if not self.selecao.monitorar(simbolo):
                 continue  # desmarcado: sem histórico, sem análise, sem DeepSeek
-            if estado.symbol in self.em_analise:
-                self.logger.debug("análise duplicada ignorada", simbolo=estado.symbol)
+            if self.relogio() > self.prazo_ciclo:
+                self.publicar("log", {"instante": _agora_iso(), "nivel": "aviso",
+                                      "mensagem": "Orçamento de tempo do ciclo esgotado; restante segue no próximo ciclo"})
+                self.logger.aviso("orçamento do ciclo esgotado", processados=len(processados))
+                break
+            if simbolo in self.em_analise:
+                self.logger.debug("análise duplicada ignorada", simbolo=simbolo)
                 continue
             try:
-                self.em_analise.add(estado.symbol)
+                self.em_analise.add(simbolo)
                 self._processar_ativo(estado, id_ciclo)
             except (RuntimeError, ValueError, KeyError) as exc:
-                self.publicar("calc", {"id": id_ciclo, "simbolo": estado.symbol, "instante": _agora_iso(),
+                self.publicar("calc", {"id": id_ciclo, "simbolo": simbolo, "instante": _agora_iso(),
                                        "etapa": "erro", "mensagem": "Falha na análise do ativo",
                                        "amostra": None, "padroes_testados": None,
                                        "resultado": None, "erro": str(exc)[:200]})
-                self.logger.erro("falha na análise", simbolo=estado.symbol, detalhe=str(exc)[:160])
+                self.contadores_ciclo["erros"] = self.contadores_ciclo.get("erros", 0) + 1
+                self.logger.erro("falha na análise", simbolo=simbolo, detalhe=str(exc)[:160])
             finally:
-                self.em_analise.discard(estado.symbol)
+                self.em_analise.discard(simbolo)
+                processados.add(simbolo)
                 self.descarregar()  # GUI acompanha o ciclo em tempo quase real
+        # Pendências para o próximo ciclo: monitorados não processados nesta rodada.
+        monitorados = [s.symbol for s in estados if self.selecao.monitorar(s.symbol)]
+        self.pendentes_ciclo = [s for s in monitorados if s not in processados]
+        self.logger.info("varredura e processamento concluídos",
+                         processados=len(processados), pendentes=len(self.pendentes_ciclo))
 
     def _coletar_janela(self, simbolo, id_analise):
         """Download paginado da janela 30d com progresso, logs e cancelamento."""
+        self._estado_set("ANALISANDO", f"Ciclo {self.ciclo} · BAIXANDO HISTÓRICO {simbolo}",
+                         registrar=False, fase="BAIXANDO_HISTORICO")
+
         def progresso(coletados, solicitado):
             self.publicar("calc", {"id": id_analise, "simbolo": simbolo, "instante": _agora_iso(),
                                    "etapa": "janela", "mensagem": "Baixando histórico M1 (30 dias)",
                                    "amostra": {"candles": coletados, "dias": None,
                                                "solicitados": solicitado},
                                    "padroes_testados": None, "resultado": None, "erro": None})
+            # Mantém o chip/mensagem atuais durante o download (sem estado antigo).
+            self.detalhe = (f"Ciclo {self.ciclo} · BAIXANDO HISTÓRICO {simbolo} "
+                            f"({coletados}/{solicitado} candles)")
+            self.publicar("estado", {"estado": self.estado, "detalhe": self.detalhe,
+                                     "fase": self.fase, "quando": _agora_iso()})
             self.descarregar()
         inicio = time.time()
         janela = self.fonte.janela_m1(simbolo, dias=30, lote=LOTE_DOWNLOAD,
@@ -884,13 +970,15 @@ class Orquestrador:
         cache = self.dados_ativo.get(simbolo)
         vencida = cache is None or agora - cache["instante"] >= JANELA_TTL_S
         if vencida and self._pode_atualizar_janela(simbolo):
-            janela = self._coletar_janela(simbolo, id_analise)
+            janela = self._janela_com_cache(simbolo, id_analise)
             if janela is None:
                 if cache is None:
                     self.publicar("calc", {"id": id_analise, "simbolo": simbolo, "instante": _agora_iso(),
                                            "etapa": "dados", "mensagem": "Janela M1 de 30 dias indisponível",
                                            "amostra": None, "padroes_testados": None,
                                            "resultado": None, "erro": None})
+                    self.contadores_ciclo["sem_dados"] = \
+                        self.contadores_ciclo.get("sem_dados", 0) + 1
                 # Com cache anterior válido, ele permanece até a próxima tentativa.
             else:
                 self._atualizar_cache(simbolo, janela, id_analise)
@@ -929,6 +1017,43 @@ class Orquestrador:
         except ValueError:
             return True
 
+    def _janela_com_cache(self, simbolo, id_analise):
+        """Janela atual preferindo cache incremental; janela completa no miss.
+
+        Cache hit: anexa somente os candles novos (1 chamada curta) com
+        verificação de continuidade; miss ou falha de integridade: fetch
+        paginado completo. Em ambos os casos o cache em disco é atualizado
+        de forma atômica e recortado aos últimos 30 dias.
+        """
+        armazenados = self.cache_m1.carregar(simbolo)
+        if armazenados:
+            ultimo = armazenados[-1]["time"]
+            novos = self.fonte.incremento_m1(simbolo, desde=ultimo)
+            if novos is not None:
+                combinados, info = self.cache_m1.anexar(simbolo, novos)
+                if not info["recarregar"] and len(combinados) >= 2:
+                    self.contadores_ciclo["cache_incremental"] = \
+                        self.contadores_ciclo.get("cache_incremental", 0) + 1
+                    self.logger.info("cache incremental aplicado", simbolo=simbolo,
+                                     anexados=info["anexados"], candles=len(combinados),
+                                     lacunas=info["lacunas"])
+                    return {"simbolo": simbolo, "candles": combinados,
+                            "inicio": combinados[0]["time"], "fim": combinados[-1]["time"],
+                            "solicitados": len(combinados), "recebidos": len(combinados),
+                            "lacunas": info["lacunas"],
+                            "minutos_lacuna": info["lacunas"], "maior_lacuna": 0}
+            self.contadores_ciclo["cache_invalido"] = \
+                self.contadores_ciclo.get("cache_invalido", 0) + 1
+            self.cache_m1.invalidar(simbolo)
+            self.logger.aviso("cache incremental indisponível; janela completa",
+                              simbolo=simbolo)
+        janela = self._coletar_janela(simbolo, id_analise)
+        if janela is not None:
+            self.contadores_ciclo["cache_completo"] = \
+                self.contadores_ciclo.get("cache_completo", 0) + 1
+            self.cache_m1.salvar(simbolo, janela["candles"])
+        return janela
+
     def _atualizar_cache(self, simbolo, janela, id_analise):
         """Estatísticas + revalidação + DeepSeek com a janela completa; guarda só a cauda.
 
@@ -937,6 +1062,8 @@ class Orquestrador:
         O DeepSeek é agendado aqui porque as hipóteses novas precisam ser
         validadas contra a janela completa antes do descarte.
         """
+        self._estado_set("ANALISANDO", f"Ciclo {self.ciclo} · CALCULANDO {simbolo}",
+                         registrar=False, fase="CALCULANDO")
         descoberta, _ = janela_descoberta(janela["candles"])
         recorte = {**janela, "candles": descoberta, "fim": descoberta[-1]["time"]}
         spread = self.fonte.cotacao(simbolo)
@@ -946,6 +1073,8 @@ class Orquestrador:
         janela_info = {"inicio": janela["inicio"], "fim": janela["fim"],
                        "dias": stats.get("dias"), "candles": janela["recebidos"]}
         # Revalida padrões ativos com a janela recém-baixada (cronologia preservada).
+        self._estado_set("ANALISANDO", f"Ciclo {self.ciclo} · VALIDANDO {simbolo}",
+                         registrar=False, fase="VALIDANDO")
         for registro in self.repositorio.padroes_ativos(simbolo):
             interna = registro["regra"]
             regra = {"tipo_regra": interna["tipo"], "parametros": interna["parametros"],
@@ -954,6 +1083,9 @@ class Orquestrador:
             validacao = padroes.validar(regra, janela["candles"], custo_pct)
             atualizado = self.repositorio.registrar(simbolo, regra, validacao,
                                                     registro.get("origem", "local"), janela_info)
+            if validacao["status"] == "rejeitado":
+                self.contadores_ciclo["rejeitado_validacao"] = \
+                    self.contadores_ciclo.get("rejeitado_validacao", 0) + 1
             if validacao["status"] != registro.get("status"):
                 self.publicar("deepseek", {"id": id_analise, "simbolo": simbolo, "instante": _agora_iso(),
                                            "padrao": atualizado["id"], "status_consulta": "REEXAME LOCAL",
@@ -1017,6 +1149,8 @@ class Orquestrador:
             return False
         self.orcamento.registrar(uso.get("tokens", 0))
         self.ultimo_deepseek[simbolo] = agora
+        self._estado_set("ANALISANDO", f"Ciclo {self.ciclo} · VALIDANDO {simbolo}",
+                         registrar=False, fase="VALIDANDO")
         self.logger.info("resposta DeepSeek recebida", simbolo=simbolo,
                          tokens=uso.get("tokens", 0), hipoteses=len(hipoteses),
                          descartadas=descartadas, revisoes=len(revisoes),
@@ -1027,6 +1161,9 @@ class Orquestrador:
         for hipotese in hipoteses:
             validacao = padroes.validar(hipotese, candles, custo_pct)
             registro = self.repositorio.registrar(simbolo, hipotese, validacao, "deepseek", janela_info)
+            if validacao["status"] == "rejeitado":
+                self.contadores_ciclo["rejeitado_validacao"] = \
+                    self.contadores_ciclo.get("rejeitado_validacao", 0) + 1
             self.publicar("deepseek", {"id": id_analise, "simbolo": simbolo, "instante": _agora_iso(),
                                        "padrao": registro["id"], "status_consulta": "hipótese recebida",
                                        "hipotese": self._texto_hipotese(hipotese),
@@ -1053,9 +1190,13 @@ class Orquestrador:
             return
         simbolo = estado.symbol
         if not self.selecao.operar(simbolo):
+            self.contadores_ciclo["somente_monitorar"] = \
+                self.contadores_ciclo.get("somente_monitorar", 0) + 1
             return
         validados = self.repositorio.validados(simbolo)
         if not validados:
+            self.contadores_ciclo["sem_padrao"] = \
+                self.contadores_ciclo.get("sem_padrao", 0) + 1
             return
         instante_candle = estado.candles[-1]["time"] if estado.candles else None
         if len(self.avaliados) > MAX_AVALIADOS:
@@ -1083,6 +1224,10 @@ class Orquestrador:
                                       "risco": evidencia, "execucao": "-"})
             self.logger.info("oportunidade detectada; consultando JEv", simbolo=simbolo,
                              padrao=padrao["id"], analysis_id=id_analise)
+            self.contadores_ciclo["aguardando_decisao"] = \
+                self.contadores_ciclo.get("aguardando_decisao", 0) + 1
+            self._estado_set("ANALISANDO", f"Ciclo {self.ciclo} · DECIDINDO JEV {simbolo}",
+                             registrar=False, fase="DECIDINDO_JEV")
             if self.relogio() < self.proxima_tentativa_jev:
                 self.publicar("decisao", {"id": id_analise, "simbolo": simbolo, "instante": _agora_iso(),
                                           "oportunidade": texto, "decisao": "AGUARDANDO",
@@ -1098,6 +1243,8 @@ class Orquestrador:
             try:
                 decisao = jev.decide(estado)
             except RuntimeError as exc:
+                self.contadores_ciclo["ia_indisponivel"] = \
+                    self.contadores_ciclo.get("ia_indisponivel", 0) + 1
                 self.proxima_tentativa_jev = self.relogio() + TENTATIVA_JEV_S
                 self.publicar("decisao", {"id": id_analise, "simbolo": simbolo, "instante": _agora_iso(),
                                           "oportunidade": texto, "decisao": "AGUARDANDO",
@@ -1116,7 +1263,12 @@ class Orquestrador:
                 continue
             estado = atualizado
             gate = risk.check(decisao, self.book, self.book.limits, estado)
+            if gate.verdict != "EXECUTE":
+                self.contadores_ciclo["risco_bloqueado"] = \
+                    self.contadores_ciclo.get("risco_bloqueado", 0) + 1
             if gate.verdict == "EXECUTE":
+                self.contadores_ciclo["executadas"] = \
+                    self.contadores_ciclo.get("executadas", 0) + 1
                 self.book.execute(decisao, estado, gate)
                 self.book.update(self.fonte)
                 self._persistir()

@@ -125,12 +125,14 @@ def indices_condicao(tipo, parametros, candles):
         return []
     if tipo == "quedas_consecutivas":
         k = int(parametros["n"])
+        # "n fechamentos em queda consecutiva" = k closes descendo = k-1
+        # comparações; o laço anterior exigia k+1 valores (off-by-one).
         return [i for i in range(k, n)
-                if all(closes[i - j] < closes[i - j - 1] for j in range(k))]
+                if all(closes[i - j] < closes[i - j - 1] for j in range(k - 1))]
     if tipo == "altas_consecutivas":
         k = int(parametros["n"])
         return [i for i in range(k, n)
-                if all(closes[i - j] > closes[i - j - 1] for j in range(k))]
+                if all(closes[i - j] > closes[i - j - 1] for j in range(k - 1))]
     if tipo in ("queda_pct", "alta_pct"):
         m = int(parametros["minutos"])
         pct = float(parametros["pct"])

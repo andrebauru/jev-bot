@@ -47,6 +47,25 @@ try:
             stats_descoberta = motor_matematico.estatisticas(recorte, tick[1] - tick[0])
             resumo = motor_matematico.resumo_compacto(stats_descoberta)
             registrar(f"resumo compacto (descoberta): {len(str(resumo))} caracteres — payload do prompt")
+        # Cache incremental contra dados reais: salvar janela → anexar delta.
+        from jev_bot.cache_m1 import CacheM1
+        pasta_cache = RAIZ / "data" / "verificacao-cache"
+        cache = CacheM1(pasta_cache)
+        for simbolo in ("BTCUSD", "ETHUSD"):
+            tick = fonte.cotacao(simbolo)
+            janela = fonte.janela_m1(simbolo, dias=30, lote=4320)
+            if janela is None or tick is None:
+                continue
+            cache.salvar(simbolo, janela["candles"])
+            armazenados = cache.carregar(simbolo)
+            delta = fonte.incremento_m1(simbolo, desde=armazenados[-1]["time"])
+            combinados, info = cache.anexar(simbolo, delta or [])
+            registrar(f"cache {simbolo}: armazenados {len(armazenados)} | "
+                      f"delta {len(delta or [])} | anexados {info['anexados']} | "
+                      f"recarregar={info['recarregar']} | final {len(combinados)}")
+            cache.invalidar(simbolo)
+        import shutil
+        shutil.rmtree(pasta_cache, ignore_errors=True)
         registrar("verificação concluída sem ordens")
 except Exception as exc:  # relatório honesto de falha
     registrar(f"FALHA: {type(exc).__name__}: {exc}")

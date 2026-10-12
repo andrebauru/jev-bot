@@ -104,6 +104,51 @@ class FonteMT5:
             return None
         return tick.bid, tick.ask, instante
 
+    def _validar_barras(self, barras):
+        """Valida candles brutos do broker; None em qualquer dado inválido.
+
+        Retorna candles normalizados (UTC) ou None — nunca substitutos.
+        """
+        lote_validado = []
+        for b in barras:
+            try:
+                tempo, abre, alto, baixo, fecha = (float(b["time"]), float(b["open"]),
+                                                   float(b["high"]), float(b["low"]), float(b["close"]))
+                volume = int(b["tick_volume"])
+            except (TypeError, KeyError, ValueError, OverflowError):
+                return None
+            if any(not math.isfinite(v) or v <= 0 for v in (abre, alto, baixo, fecha)):
+                return None
+            if not math.isfinite(tempo) or tempo <= 0 or volume < 0:
+                return None
+            if not baixo <= min(abre, fecha) <= max(abre, fecha) <= alto:
+                return None
+            lote_validado.append({"time": tempo - self.ajuste, "open": abre, "high": alto,
+                                  "low": baixo, "close": fecha, "tick_volume": volume})
+        return lote_validado
+
+    def incremento_m1(self, simbolo, desde, max_candles=4320):
+        """Baixa somente os candles M1 encerrados mais recentes que `desde`.
+
+        Para o cache incremental: uma chamada curta em vez de rebaixar a
+        janela completa. Devolve candles cronológicos normalizados ou None
+        (sem dados / dado inválido). `desde` é o timestamp do último
+        candle já armazenado (UTC).
+        """
+        minutos = max(1, int((self.relogio() - 60 - desde) // 60) + 2)
+        quantidade = max(1, min(int(max_candles), minutos))
+        barras = self.api.copy_rates_from_pos(simbolo, self.api.TIMEFRAME_M1, 1, quantidade)
+        if barras is None or len(barras) == 0:
+            return None
+        candles = self._validar_barras(barras)
+        if candles is None:
+            return None
+        candles = [c for c in candles if c["time"] > desde]
+        if not candles:
+            return None
+        candles.sort(key=lambda c: c["time"])
+        return candles
+
     def janela_m1(self, simbolo, dias=30, lote=4320, cancelado=None, progresso=None):
         """Coleta até `dias` de candles M1 encerrados, em lotes paginados.
 
@@ -124,22 +169,9 @@ class FonteMT5:
                                                   inicio_lote, quantidade)
             if barras is None or len(barras) == 0:
                 break  # broker não tem mais histórico
-            lote_validado = []
-            for b in barras:
-                try:
-                    tempo, abre, alto, baixo, fecha = (float(b["time"]), float(b["open"]),
-                                                       float(b["high"]), float(b["low"]), float(b["close"]))
-                    volume = int(b["tick_volume"])
-                except (TypeError, KeyError, ValueError, OverflowError):
-                    return None
-                if any(not math.isfinite(v) or v <= 0 for v in (abre, alto, baixo, fecha)):
-                    return None
-                if not math.isfinite(tempo) or tempo <= 0 or volume < 0:
-                    return None
-                if not baixo <= min(abre, fecha) <= max(abre, fecha) <= alto:
-                    return None
-                lote_validado.append({"time": tempo - self.ajuste, "open": abre, "high": alto,
-                                      "low": baixo, "close": fecha, "tick_volume": volume})
+            lote_validado = self._validar_barras(barras)
+            if lote_validado is None:
+                return None
             # Lotes posteriores são mais antigos: entram na frente.
             coletados = lote_validado + coletados
             if progresso is not None:

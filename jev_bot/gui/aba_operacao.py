@@ -60,6 +60,35 @@ def _fmt_duracao(trade):
     return f"{horas}h{minutos:02d}m{segundos:02d}s" if horas else f"{minutos}m{segundos:02d}s"
 
 
+class PainelAnalise(QWidget):
+    """Painel identificado: título, contagem de itens e último processamento."""
+
+    def __init__(self, titulo, lista, parent=None):
+        super().__init__(parent)
+        colunas = QVBoxLayout(self)
+        colunas.setContentsMargins(0, 2, 0, 2)
+        colunas.setSpacing(2)
+        cabecalho = QHBoxLayout()
+        rotulo = QLabel(titulo)
+        rotulo.setStyleSheet("color:#7aa2f7; font-weight:700;")
+        cabecalho.addWidget(rotulo)
+        cabecalho.addStretch(1)
+        self.contagem = QLabel("0 itens")
+        self.contagem.setStyleSheet("color:#8ea3c8;")
+        cabecalho.addWidget(self.contagem)
+        self.ultimo = QLabel("")
+        self.ultimo.setStyleSheet("color:#8ea3c8;")
+        cabecalho.addWidget(self.ultimo)
+        colunas.addLayout(cabecalho)
+        colunas.addWidget(lista)
+        lista.setMinimumHeight(70)
+
+    def atualizar(self, quantidade, ultimo_texto=""):
+        self.contagem.setText(f"{quantidade} itens")
+        if ultimo_texto:
+            self.ultimo.setText(f"último: {ultimo_texto}")
+
+
 class ListaAnalise(QTreeWidget):
     """Lista com colunas fixas, mais recente no topo e teto de linhas."""
 
@@ -202,8 +231,16 @@ class AbaOperacao(QWidget):
                                             "Consulta", "Hipótese", "Validação local", "Resultado"])
         self.lista_decisao = ListaAnalise(["ID", "Ativo", "Horário (UTC)", "Oportunidade",
                                            "Decisão", "Justificativa", "Risco", "Execução"])
-        for indice, lista in enumerate((self.lista_calc, self.lista_deepseek, self.lista_decisao)):
-            divisor.addWidget(lista)
+        self.painel_calc = PainelAnalise("CÁLCULOS MATEMÁTICOS (Python)", self.lista_calc)
+        self.painel_deepseek = PainelAnalise("ANÁLISE DEEPSEEK (padrões candidatos)",
+                                             self.lista_deepseek)
+        self.painel_decisao = PainelAnalise("DECISÃO JEv (SIM/NÃO e motivo)",
+                                            self.lista_decisao)
+        self.paineis = {"calc": self.painel_calc, "deepseek": self.painel_deepseek,
+                        "decisao": self.painel_decisao}
+        for indice, painel in enumerate((self.painel_calc, self.painel_deepseek,
+                                         self.painel_decisao)):
+            divisor.addWidget(painel)
             divisor.setStretchFactor(indice, 1)
         divisor.setHandleWidth(4)
 
@@ -382,6 +419,9 @@ class AbaOperacao(QWidget):
                  "decisao": self.lista_decisao}.get(canal)
         if lista is not None and itens:
             lista.adicionar_lote(itens)
+            painel = self.paineis.get(canal)
+            if painel is not None:
+                painel.atualizar(lista.topLevelItemCount(), itens[0][0][2])
 
     def receber_evento(self, canal, r):
         """Compatibilidade: um registro avulso entra como lote de um item."""

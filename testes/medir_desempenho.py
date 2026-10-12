@@ -7,7 +7,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
+from unittest.mock import Mock
+
 from apoio import FonteFake, LoggerSilencioso, candles_sinteticos, estado_mt5, janela
+from jev_bot import mercados
 from jev_bot import mercados
 from jev_bot.execution.paper import Book
 from jev_bot.orquestrador import Orquestrador, CAUDA_CANDLES
@@ -53,6 +56,31 @@ def tamanho(objetos):
 
 print(f"memória por ativo: janela completa ~{tamanho(janela_completa) / 1e6:.1f} MB → "
       f"cauda ({CAUDA_CANDLES}) ~{tamanho(cauda) / 1e3:.0f} KB")
+
+# 2b) Cache incremental: hit evita refetch completo (economy de chamadas).
+with tempfile.TemporaryDirectory() as pasta:
+    arquivo = Path(pasta) / "mercados.json"
+    mercados.salvar({"selecao": {"C": {"TESTE": {"monitorar": True, "operar": True}}}}, arquivo)
+    orch = Orquestrador(banco=Path(pasta) / "db.json", pasta_dados=Path(pasta) / "padroes",
+                        caminho_selecao=arquivo)
+    orch.logger = LoggerSilencioso()
+    orch.fonte = FonteFake(cotacoes={"TESTE": (99.99, 100.0, time.time())})
+    orch.fonte.janela_m1 = Mock(return_value=janela(candles_sinteticos(43200)))
+    orch.fonte.incremento_m1 = Mock(return_value=None)
+    orch.repositorio = Mock()
+    orch.repositorio.padroes_ativos.return_value = []
+    orch.dados_ativo.clear()
+    t0 = time.time()
+    orch._janela_com_cache("TESTE", "id")
+    miss = time.time() - t0
+    novos = [{"time": candles_sinteticos(43200)[-1]["time"] + (i + 1) * 60,
+              "open": 100, "high": 100.5, "low": 99.5, "close": 100.1,
+              "tick_volume": 10} for i in range(30)]
+    orch.fonte.incremento_m1 = Mock(return_value=novos)
+    t0 = time.time()
+    orch._janela_com_cache("TESTE", "id")
+    hit = time.time() - t0
+    print(f"cache: miss (janela completa paginada) {miss:.2f}s → hit (incremento 30 candles) {hit:.3f}s")
 
 # 3) Tempo para cancelar um download paginado em andamento.
 with tempfile.TemporaryDirectory() as pasta:

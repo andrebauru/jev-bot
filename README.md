@@ -35,7 +35,10 @@ não envia ordens reais. Para outro terminal, informe `--terminal` antes do coma
 | `jev_bot/motor_matematico.py` | Estatísticas locais da janela M1 de 30 dias: movimentos, retornos condicionais, recuperação, retração, tempos e custos; corte cronológico 70/30 |
 | `jev_bot/deepseek.py` | Descoberta de padrões pelo DeepSeek via OpenRouter: schema rígido, timeout, retry controlado e orçamento de tokens |
 | `jev_bot/padroes.py` | Tipos de regra reproduzíveis, validação local (dentro/fora da amostra) e repositório JSON por ativo |
-| `jev_bot/orquestrador.py` | Cadência 1/15min, pipeline Python → DeepSeek → JEv → risco → paper, PARADO POR RISCO e emergência |
+| `jev_bot/orquestrador.py` | Cadência 1/15min, pipeline Python → DeepSeek → JEv → risco → paper, PARADO POR RISCO e emergência; orçamento de tempo e continuidade incremental |
+| `jev_bot/logs.py` | Logs em `logs/` com rotação (10 MB × 5), limpeza > 14 dias e mascaramento de segredos |
+| `jev_bot/mercados.py` | Seleção Monitorar/Operar por símbolo, persistida atomicamente em `data/mercados.json` |
+| `jev_bot/cache_m1.py` | Cache incremental de candles M1 por símbolo (JSON atômico, recorte de 30 dias, invalidação por lacuna/corrupção) |
 | `jev_bot/risk.py` | Limites (`Limits`), dimensionamento de lote e veredito de entrada (`Gate`) |
 | `jev_bot/execution/paper.py` | Carteira paper persistente (`Book`/`Fill`): posições, stops, trades e métricas |
 | `jev_bot/gui/` | Interface PySide6: abas de operação, resumo/gráficos e configurações; worker Qt sobre o orquestrador |
@@ -288,6 +291,17 @@ As imagens antigas em `assets/` e `examples/sample_run.txt` são registros
 históricos da versão demonstrativa, preservados como referência; não
 representam resultados atuais. Nenhum retorno paper deve ser apresentado
 como performance de negociação real.
+
+## Logs
+
+A pasta `logs/` na raiz reúne `jev-bot.log(.1…5)`, escritos pela thread
+do motor com o módulo `logging` (`RotatingFileHandler`): **10 MB por
+arquivo, até 5 rotacionados**, e limpeza de arquivos antigos com **mais
+de 14 dias** — o arquivo ativo nunca é excluído. Linhas com timestamp,
+nível, módulo e mensagem, com metadados seguros (`analysis_id`, símbolo,
+contagens, durações) e sem payloads completos. Um filtro mascara
+segredos (chaves, `Bearer`, senhas) inclusive em tracebacks. Erros
+graves aparecem também no painel de status da interface.
 
 ## Interface gráfica (PySide6)
 

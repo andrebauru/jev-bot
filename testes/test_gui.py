@@ -89,6 +89,30 @@ class TestGui(unittest.TestCase):
         aba.combo_ativo.setCurrentIndex(1)
         self.assertGreater(aba.grafico_equity.serie.count(), 0)
 
+    def test_paineis_com_titulo_contagem_e_resumo(self):
+        """Painéis identificados com contagem, último processamento e resumo."""
+        import os
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+        QApplication.instance() or QApplication([])
+        from jev_bot.gui.aba_operacao import AbaOperacao
+        abas = AbaOperacao(acoes={k: (lambda: None) for k in
+                                  ("iniciar", "pausar", "retomar", "emergencia",
+                                   "liberar_risco", "aplicar_limites", "cancelar_ciclo")})
+        abas.receber_lote("decisao", [
+            {"id": "c1", "simbolo": "BTCUSD", "instante": "2026-01-01T00:00:00+00:00",
+             "oportunidade": "quedas(n=3) → BUY", "decisao": "SIM (BUY)",
+             "justificativa": "padrão validado", "risco": "gate EXECUTE",
+             "execucao": "paper aberto"},
+            {"id": "c1", "simbolo": "", "instante": "2026-01-01T00:00:00+00:00",
+             "oportunidade": "Ciclo 1", "decisao": "RESUMO",
+             "justificativa": "sem_padrao=80; rejeitado_validacao=10; executadas=1",
+             "risco": "pendentes: 0", "execucao": "duração 12.3s"},
+        ])
+        self.assertIn("2 itens", abas.painel_decisao.contagem.text())
+        self.assertIn("00:00:00", abas.painel_decisao.ultimo.text())
+        self.assertEqual(abas.lista_decisao.topLevelItemCount(), 2)
+
     def test_grafico_copia_como_imagem_no_clipboard(self):
         """COPIAR COMO IMAGEM coloca o gráfico visível na área de transferência."""
         import os

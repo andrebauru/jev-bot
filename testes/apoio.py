@@ -25,6 +25,27 @@ def candles_sinteticos(n=400, seed=1, preco=100.0):
     return resultado
 
 
+def candles_deterministicos(n=6003, base=100.0):
+    """Padrão periódico de 10 candles: 3 quedas seguidas de recuperação.
+
+    closes: ..., 112, 110, 108, 106, 107, 108, 109, 110, 111, 112, ...
+    `quedas_consecutivas(n=3)` dispara em todo fim de sequência de quedas e
+    o candle seguinte sempre sobe (taxa de acerto ≈ 100% no horizonte 5).
+    n=6003 termina no 3º candle de queda (condição verdadeira "agora").
+    """
+    periodos = [112.0, 110.0, 108.0, 106.0, 107.0, 108.0, 109.0, 110.0, 111.0, 112.0]
+    resultado = []
+    for i in range(n):
+        close = base + periodos[i % 10] - 112.0 + 6.0
+        anterior = base + periodos[(i - 1) % 10] - 112.0 + 6.0
+        abre = anterior
+        alto = max(abre, close) + 0.25
+        baixo = min(abre, close) - 0.25
+        resultado.append({"time": 1_700_000_000 + i * 60, "open": abre, "high": alto,
+                          "low": baixo, "close": close, "tick_volume": 50})
+    return resultado
+
+
 def janela(candles, simbolo="TESTE"):
     return {"simbolo": simbolo, "candles": candles, "inicio": candles[0]["time"],
             "fim": candles[-1]["time"], "solicitados": len(candles), "recebidos": len(candles),
@@ -93,6 +114,9 @@ class FonteFake:
 
     def janela_m1(self, simbolo, dias=30, lote=4320, cancelado=None, progresso=None):
         return self.janelas.get(simbolo)
+
+    def incremento_m1(self, simbolo, desde, max_candles=4320):
+        return None  # sem cache incremental no dobro padrão
 
 
 def api_mock_inicializado():
