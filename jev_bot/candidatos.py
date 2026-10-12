@@ -43,6 +43,42 @@ def _taxa(valor):
     return valor if isinstance(valor, (int, float)) else 0.0
 
 
+LIMIARES_RELEVANCIA = {
+    ("movimento_1min.media_pct"): 0.05,
+    ("retorno_janela_pct"): 0.5,
+    ("custo_spread_pct"): 0.02,
+}
+
+
+def _estatistica(resumo, chaves):
+    valor = resumo
+    for chave in chaves:
+        if not isinstance(valor, dict):
+            return None
+        valor = valor.get(chave)
+    if isinstance(valor, (int, float)) and valor == valor:
+        return float(valor)
+    return None
+
+
+def mudanca_relevante(anterior, atual):
+    """Detecta mudanca estatisticamente relevante entre dois resumos.
+    Comparacao por limiares absolutos em metricas-chave (movimento medio,
+    retorno da janela, custo de spread). anterior None (primeira
+    referencia) NAO e gatilho - a revisao periodica por TTL cobre o resto.
+    Evita disparar o aprendizado por ruido de um unico candle.
+    """
+    if not isinstance(anterior, dict) or not isinstance(atual, dict):
+        return False
+    for chaves, limiar in LIMIARES_RELEVANCIA.items():
+        a = _estatistica(anterior, chaves.split("."))
+        b = _estatistica(atual, chaves.split("."))
+        if a is None or b is None:
+            continue
+        if abs(b - a) >= limiar:
+            return True
+    return False
+
 def regras_candidatas(stats, candles):
     """Regras determinísticas para a condição verdadeira no último candle.
 

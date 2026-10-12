@@ -25,14 +25,9 @@ class TestFluxoReal(unittest.TestCase):
     """Pipeline completo com mocks de IA e JEv; sem chamadas pagas."""
 
     def setUp(self):
-        """Proíbe chamadas reais de IA por padrão (testes não gastam tokens)."""
-        guardas = [
-            patch("jev_bot.orquestrador.deepseek.analisar",
-                  side_effect=AssertionError("chamada real de DeepSeek em teste")),
-            patch("jev_bot.orquestrador.jev.decide",
-                  side_effect=AssertionError("chamada real de JEv em teste")),
-        ]
-        for guarda in guardas:
+        """Bloqueia o transporte de rede das IAs (testes não gastam tokens)."""
+        for alvo in ("jev_bot.deepseek.urlopen", "jev_bot.jev.urlopen"):
+            guarda = patch(alvo, side_effect=AssertionError("rede bloqueada em teste"))
             guarda.start()
             self.addCleanup(guarda.stop)
 

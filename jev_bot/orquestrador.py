@@ -51,6 +51,22 @@ ORCAMENTO_CICLO_S = 50       # orçamento de tempo do ciclo sem posições (cad�
 ORCAMENTO_CICLO_COM_POSICAO_S = 600  # com posições (cadência 15min)
 RESERVA_PROCESSAMENTO_S = 15  # fatia final do orçamento reservada ao processamento
 HOLD_TTL_S = 300             # HOLD adia a oportunidade no máximo 5 minutos (expira, sem loop)
+# Motivos tipados por retorno do pipeline de decisão (rastreáveis na GUI).
+MOTIVOS_CODIGO = {
+    "inativo": "RISK_BLOCK",
+    "somente_monitorar": "MERCADO_SOMENTE_MONITORAR",
+    "sem_padrao": "NO_SETUP",
+    "sem_dados": "INSUFFICIENT_SAMPLE",
+    "condicao_ausente": "NO_SETUP",
+    "pre_bloqueado": "SPREAD_TOO_HIGH",
+    "contrato_invalido": "AI_INVALID_RESPONSE",
+    "hold": "DECISION_HOLD",
+    "jev_nao": "DECISION_NO",
+    "risco_bloqueado": "RISK_BLOCK",
+    "executada": "PAPER_EXECUTED",
+    "hold_expirado": "HOLD_EXPIRED",
+    "condicao_presente_sem_decisao": "DECISION_PENDING",
+}
 FAS = {"VARRENDO": "VARRENDO CATÁLOGO", "BAIXANDO_HISTORICO": "BAIXANDO HISTÓRICO",
        "CALCULANDO": "CALCULANDO", "ANALISANDO_DEEPSEEK": "ANALISANDO DEEPSEEK",
        "VALIDANDO": "VALIDANDO PADRÕES", "DECIDINDO_JEV": "DECIDINDO JEV"}
@@ -170,11 +186,15 @@ class Orquestrador:
         self.arquivo_emergencia = Path(str(self.banco) + ".emergencia")
         self.arquivo_pausa = Path(str(self.banco) + ".pause")
         self.ultimo_resumo_hash = {}
+        self.ultimo_resumo_stats = {}
+        self.fila_deepseek = []    # simbolos com descoberta pendente (pós-varredura)
         self.holds = {}            # (simbolo, oportunidade_id) -> expira_em
         self.ultimo_motivo = {}    # simbolo -> último motivo publicado
         self.ultimos = {"decisao": None, "deepseek": None,
                         "oportunidade": None, "trade": None}
         self.ultimo_resumo_hash = {}
+        self.ultimo_resumo_stats = {}
+        self.fila_deepseek = []    # simbolos com descoberta pendente (pós-varredura)
         self.holds = {}            # (simbolo, oportunidade_id) -> expira_em
         self.ultimo_motivo = {}    # simbolo -> último motivo publicado
         self.ultimos = {"decisao": None, "deepseek": None,
@@ -913,11 +933,14 @@ class Orquestrador:
                              contadores=dict(self.contadores_ciclo))
 
     def _varrer_e_processar(self, id_ciclo, estados):
-        # Continuidade incremental: pendentes do ciclo anterior têm prioridade.
+        # Continuidade incremental: pendentes do ciclo anterior têm prioridade;
+        # dentro do restante, ativos com Operar vêm antes dos demais monitorados
+        # (justiça: pendentes preservam turno, sem starvation).
         if self.pendentes_ciclo:
             self.logger.info("continuidade do ciclo anterior", pendentes=len(self.pendentes_ciclo))
-        ordem = [s for s in self.pendentes_ciclo]
-        ordem += [s.symbol for s in estados if s.symbol not in self.pendentes_ciclo]
+        restantes = [s.symbol for s in estados if s.symbol not in self.pendentes_ciclo]
+        restantes.sort(key=lambda s: not self.selecao.operar(s))
+        ordem = list(self.pendentes_ciclo) + restantes
         por_simbolo = {s.symbol: s for s in estados}
         processados = set()
         for simbolo in ordem:
@@ -952,6 +975,26 @@ class Orquestrador:
                 self.em_analise.discard(simbolo)
                 processados.add(simbolo)
                 self.descarregar()  # GUI acompanha o ciclo em tempo quase real
+        # Descoberta por evento: roda DEPOIS das decisões do ciclo, limitada
+        # por DEEPSEEK_POR_CICLO; rate limit/timeout não bloqueiam o trading
+        # (que já avaliou padrões validados e candidatos locais neste ciclo).
+        if self.deepseek_configurado and self.fila_deepseek \
+                and not self._cancelado_ciclo() and not self.parado_risco:
+            envio = self.fila_deepseek[:DEEPSEEK_POR_CICLO]
+            for simbolo, hash_resumo in envio:
+                if self._cancelado_ciclo() or self.parado_risco:
+                    break
+                cache = self.dados_ativo.get(simbolo)
+                candles = self.cache_m1.carregar(simbolo)
+                if cache is None or not candles or cache.get("stats") is None:
+                    self.logger.aviso("fila DeepSeek sem janela disponível", simbolo=simbolo)
+                    continue
+                self.contadores_ciclo["deepseek_enviados"] = \
+                    self.contadores_ciclo.get("deepseek_enviados", 0) + 1
+                self._etapa_deepseek(simbolo, candles, cache, cache["stats"],
+                                     id_ciclo, hash_resumo=hash_resumo)
+                self.descarregar()
+            self.fila_deepseek = self.fila_deepseek[DEEPSEEK_POR_CICLO:]
         # Pendências para o próximo ciclo: monitorados não processados nesta rodada.
         monitorados = [s.symbol for s in estados if self.selecao.monitorar(s.symbol)]
         self.pendentes_ciclo = [s for s in monitorados if s not in processados]
@@ -1124,6 +1167,9 @@ class Orquestrador:
             validacao = padroes.validar(regra, janela["candles"], custo_pct)
             atualizado = self.repositorio.registrar(simbolo, regra, validacao,
                                                     registro.get("origem", "local"), janela_info)
+            trades_padrao = [tr for tr in self.book.trades
+                             if tr.get("padrao") == atualizado["id"]]
+            atualizado["calibracao"] = padroes.calibracao_brier(trades_padrao)
             if validacao["status"] == "rejeitado":
                 self.contadores_ciclo["rejeitado_validacao"] = \
                     self.contadores_ciclo.get("rejeitado_validacao", 0) + 1
@@ -1146,15 +1192,21 @@ class Orquestrador:
         self._gerar_candidatos_locais(simbolo, janela, stats, custo_pct, id_analise)
         self.logger.info("estatísticas locais calculadas", simbolo=simbolo,
                          candles=stats.get("candles"), dias=stats.get("dias"))
-        # DeepSeek é agendado aqui: hipóteses são validadas antes do descarte da janela.
+        # Descoberta assíncrona: agendada na fila e executada APÓS a varredura
+        # e as decisões do ciclo — nunca na rota de decisão. Gatilhos: TTL de
+        # revisão OU mudança estatisticamente relevante; resumo idêntico
+        # (hash) omite a chamada sem custo de tokens.
         agora = self.relogio()
-        if (self.deepseek_configurado and agora >= self.proxima_tentativa_ds
+        anterior = self.ultimo_resumo_stats.get(simbolo)
+        relevante = candidatos.mudanca_relevante(anterior, resumo_compacto(stats))
+        por_ttl = agora - self.ultimo_deepseek.get(simbolo, 0) >= DEEPSEEK_TTL_S
+        identico = self.ultimo_resumo_hash.get(simbolo) == hash_resumo
+        if (self.deepseek_configurado and (por_ttl or relevante) and not identico
                 and self.consultas_ds_ciclo < DEEPSEEK_POR_CICLO
-                and agora - self.ultimo_deepseek.get(simbolo, 0) >= DEEPSEEK_TTL_S
                 and stats.get("disponivel") and (janela["fim"] - janela["inicio"]) >= 3 * 86400):
             self.consultas_ds_ciclo += 1
-            self._etapa_deepseek(simbolo, janela["candles"], cache, stats, id_analise,
-                                 hash_resumo=hash_resumo)
+            self.fila_deepseek.append((simbolo, hash_resumo))
+        self.ultimo_resumo_stats[simbolo] = resumo_compacto(stats)
         # Cauda permanece no cache; a janela completa é liberada ao sair deste método.
 
     def _gerar_candidatos_locais(self, simbolo, janela, stats, custo_pct, id_analise):
@@ -1316,11 +1368,15 @@ class Orquestrador:
                 continue
             chave = (simbolo, padrao["id"])
             if self.avaliados.get(chave) == instante_candle:
+                self.contadores_ciclo["candle_ja_avaliado"] = \
+                    self.contadores_ciclo.get("candle_ja_avaliado", 0) + 1
                 continue
             if instante_candle is not None:
                 self.avaliados[chave] = instante_candle
             candles_condicao = self._candles_para_condicao(padrao, estado)
             if candles_condicao is None:
+                self.contadores_ciclo["stale_snapshot"] = \
+                    self.contadores_ciclo.get("stale_snapshot", 0) + 1
                 continue
             if not padroes.condicao_atual(padrao, candles_condicao):
                 continue
@@ -1381,7 +1437,9 @@ class Orquestrador:
                                       "direcao": regra["direcao"], "decisao": "CONSULTANDO",
                                       "oportunidade": texto,
                                       "justificativa": "Oportunidade elegível; consultando JEv",
-                                      "risco": evidencia, "execucao": "-"})
+                                      "risco": evidencia, "execucao": "-",
+                                      "setup_id": contrato["evidence_hash"][:12],
+                                      "policy": "PENDING", "paper": "NOT_OPENED"})
             self.logger.info("oportunidade detectada; consultando JEv", simbolo=simbolo,
                              padrao=padrao["id"], analysis_id=id_analise)
             contabilizar("aguardando_decisao")
@@ -1443,6 +1501,7 @@ class Orquestrador:
                                           "justificativa": f"JEv HOLD p={decisao.probability:.0%} "
                                                            f"c={decisao.confidence:.0%}; oportunidade adiada",
                                           "risco": gate.reason or "aguardando",
+                                          "policy": "PENDING", "paper": "NOT_OPENED",
                                           "execucao": f"adiada por até {HOLD_TTL_S // 60}min, depois descartada"})
                 self.logger.info("JEv HOLD; oportunidade adiada", simbolo=simbolo,
                                  padrao=padrao["id"], expira_em=round(expira))
@@ -1456,7 +1515,8 @@ class Orquestrador:
                                           "oportunidade": texto,
                                           "justificativa": f"JEv AVOID p={decisao.probability:.0%} "
                                                            f"c={decisao.confidence:.0%}; candidata descartada",
-                                          "risco": gate.reason or "-", "execucao": "nenhuma"})
+                                          "risco": gate.reason or "-", "execucao": "nenhuma",
+                                          "policy": "VETO", "paper": "NOT_OPENED"})
                 motivos.append("jev_nao")
                 continue  # NÃO encerra apenas esta candidata; próximas seguem
             # SIM: BUY/SELL aprovado pelo JEv; o gate decide a execução paper.
@@ -1474,6 +1534,7 @@ class Orquestrador:
                                           "justificativa": f"JEv SIM p={decisao.probability:.0%} "
                                                            f"c={decisao.confidence:.0%}; padrão validado",
                                           "risco": f"autorizado; risco {gate.risk_amount:.2f} {self.book.currency}",
+                                          "policy": "ALLOW", "paper": "OPENED",
                                           "execucao": f"paper aberto: {gate.volume:g} lote(s) a {gate.entry:.8g}; stop {gate.stop:.8g}; alvo {gate.target:.8g}"})
                 self.publicar("trades", list(reversed(self.book.trades[-500:])))
                 self.logger.info("entrada paper aberta", simbolo=simbolo, volume=gate.volume,
@@ -1488,6 +1549,7 @@ class Orquestrador:
                                       "justificativa": f"JEv SIM p={decisao.probability:.0%} "
                                                        f"c={decisao.confidence:.0%}; recusado pelo risco",
                                       "risco": f"não autorizado: {gate.reason}",
+                                      "policy": "VETO", "paper": "NOT_OPENED",
                                       "execucao": "nenhuma"})
             self.logger.info("entrada recusada pelo gate de risco", simbolo=simbolo,
                              motivo=gate.reason or "-")

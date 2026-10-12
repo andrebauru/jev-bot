@@ -376,7 +376,24 @@ pelo MESMO rigor (fora da amostra, não sobrepostos, custo de spread) e os
 registra como padrões `origem: local`. Assim, rate limit, timeout ou
 indisponibilidade do DeepSeek não deixam a carteira sem avaliação nos
 candles recentes — e o JEv é consultado no MESMO candle em que a condição
-está verdadeira, sem esperar o TTL de 1 hora do aprendizado.
+está verdadeira, sem esperar o TTL de 1 hora do aprendizado. Prioridade
+de processamento: ativos `Operar` antes dos demais `Monitorar`, com
+pendências do ciclo anterior preservadas (justiça, sem starvation).
+
+**Descoberta assíncrona por evento**: o DeepSeek é agendado em fila e
+executado APÓS as decisões do ciclo — nunca na rota de decisão. Gatilhos:
+revisão periódica (TTL 1h) OU mudança estatisticamente relevante
+(`candidatos.mudanca_relevante`: movimento médio, retorno da janela ou
+custo de spread alterados além de limiares fixos). Resumo idêntico ao
+anterior omite a chamada (sem gasto de tokens). Orçamento esgotado é
+sinalizado no painel e a operação continua com padrões já validados.
+
+**Decisão JEv tipada**: `jev.decide` registra modelo, latência (ms) e
+marca `calibracao=nao_calibrada` — probabilidades do modelo não são
+tratadas como probabilidade de lucro sem calibração empírica local
+(`padroes.calibracao_brier` sobre trades paper fechados do padrão,
+Brier score com amostra >= 20). Campos `policy` (ALLOW/VETO/PENDING) e
+`paper` (OPENED/NOT_OPENED) separados em cada registro de decisão.
 
 **Decisões SIM/NAO/HOLD por ativo**: o JEv responde e a normalização é
 SIM (BUY/SELL), NAO (AVOID, contrato inválido ou recusado pelo risco) e

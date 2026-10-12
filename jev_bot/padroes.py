@@ -183,6 +183,30 @@ def _resultado(indices, direcao, horizonte, candles, custo_pct):
             "desvio_pct": round(math.sqrt(sum((v - media) ** 2 for v in liquidos) / len(liquidos)), 4)}
 
 
+def calibracao_brier(trades_do_padrao, minimo=20):
+    """Calibração empírica das probabilidades do JEv para um padrão.
+
+    Brier score = média de (probabilidade_prevista - resultado)² sobre
+    trades paper FECHADOS do padrão (resultado = 1 se lucro, 0 se
+    prejuízo). Amostra < mínimo => marcada como nao_calibrada: a
+    probabilidade do modelo não é tratada como probabilidade de lucro
+    sem evidência local.
+    """
+    pares = []
+    for trade in trades_do_padrao:
+        probabilidade = trade.get("probability")
+        lucro = trade.get("profit")
+        if not isinstance(probabilidade, (int, float)) or \
+                not isinstance(lucro, (int, float)) or \
+                trade.get("status") != "CLOSED":
+            continue
+        pares.append((probabilidade, 1.0 if lucro > 0 else 0.0))
+    n = len(pares)
+    if n < minimo:
+        return {"n": n, "status": "nao_calibrada"}
+    brier = sum((p - o) ** 2 for p, o in pares) / n
+    return {"n": n, "status": "calibrada", "brier": round(brier, 4)}
+
 def wilson_inferior(acertos, n, z=1.96):
     """Limite inferior do intervalo de confiança de Wilson para a taxa."""
     if n == 0:

@@ -3,6 +3,7 @@
 import json
 import math
 import os
+import time
 from dataclasses import asdict
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
@@ -37,6 +38,8 @@ def decide(state: MarketState, engine="jev", limites=None) -> Decision:
     """Consulta JEV e rejeita respostas incompletas ou fora do contrato esperado."""
     if engine != "jev":
         raise ValueError("Somente o motor JEV é permitido.")
+    inicio = time.monotonic()
+    modelo = os.environ.get("OPENROUTER_MODEL", "typesafe/jev-1.13").strip()
     chave, endpoint = configuracao()
     limites = limites or Limits()
     contexto = asdict(state)
@@ -47,7 +50,7 @@ def decide(state: MarketState, engine="jev", limites=None) -> Decision:
     contexto["regras_avaliacao"] = {"horizonte_minutos": 5, "modo": "paper",
         "capital_inicial_jpy": 10000, "limite_spread_fracao_preco": limites.max_spread_fraction,
         "limite_spread_fracao_stop": limites.max_spread_stop}
-    body = json.dumps({"model": os.environ.get("OPENROUTER_MODEL", "typesafe/jev-1.13").strip(),
+    body = json.dumps({"model": modelo,
                        "state": contexto, "questions": {"action": {
         "type": "choice",
         "instructions": "Evaluate only the supplied real MT5 market snapshot. Choose a trading action. "
@@ -88,4 +91,9 @@ def decide(state: MarketState, engine="jev", limites=None) -> Decision:
         raise RuntimeError(f"Jev/OpenRouter HTTP {exc.code}; confira chave, saldo e acesso ao modelo.") from None
     except (URLError, ValueError, KeyError, TypeError, AttributeError, TimeoutError):
         raise RuntimeError("JEV indisponível ou resposta inválida; execução bloqueada.") from None
-    return Decision(state.symbol, acao, probabilidade, confianca, "jev", {"engine": "openrouter-jev"})
+    return Decision(state.symbol, acao, probabilidade, confianca, "jev", {
+        "engine": "openrouter-jev", "modelo": modelo,
+        "latencia_ms": round((time.monotonic() - inicio) * 1000),
+        # Probabilidade do modelo NÃO é probabilidade de lucro: sem amostra
+        # empírica suficiente por ativo/condição, marcar como não calibrada.
+        "calibracao": "nao_calibrada"})
