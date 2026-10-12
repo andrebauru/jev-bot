@@ -14,6 +14,25 @@ from PySide6.QtWidgets import (QDoubleSpinBox, QGroupBox, QHBoxLayout,
 VERDE, VERMELHO, AMBAR, CINZA = "#22c55e", "#ef4444", "#f59e0b", "#8ea3c8"
 MAX_LINHAS = 200  # limite de linhas visíveis: inserção em lote e poda única
 
+# Estados formais do orquestrador → (texto do chip, cor). "PARADO POR
+# RISCO" permanece como rótulo visível do estado BLOQUEADO_POR_RISCO.
+ESTADOS_CHIP = {
+    "CONECTANDO": ("CONECTANDO", CINZA),
+    "INICIALIZANDO": ("INICIALIZANDO", AMBAR),
+    "PRONTO": ("PRONTO", VERDE),
+    "AGUARDANDO": ("AGUARDANDO", AMBAR),
+    "AGUARDANDO_SELECAO": ("AGUARDANDO SELEÇÃO", AMBAR),
+    "ANALISANDO": ("ANALISANDO", VERDE),
+    "PAUSADO": ("PAUSADO", AMBAR),
+    "PAUSADO_PELO_USUARIO": ("PAUSADO", AMBAR),
+    "BLOQUEADO_POR_RISCO": ("PARADO POR RISCO", VERMELHO),
+    "PARADO POR RISCO": ("PARADO POR RISCO", VERMELHO),
+    "EMERGENCIA": ("EMERGÊNCIA", VERMELHO),
+    "ERRO": ("ERRO", VERMELHO),
+    "ENCERRANDO": ("ENCERRANDO", CINZA),
+    "ENCERRADO": ("ENCERRADO", CINZA),
+}
+
 
 def _fmt_moeda(valor, moeda=""):
     return f"{valor:,.2f} {moeda}".replace(",", "X").replace(".", ",").replace("X", ".")
@@ -261,18 +280,7 @@ class AbaOperacao(QWidget):
     # ------------------------------------------------------------- atualizações
     def receber_metricas(self, m):
         """Atualiza estado, métricas e limites com o snapshot do motor."""
-        estado = m.get("estado", "-")
-        self.chip_estado.setText(estado)
-        cor = CINZA
-        if estado in ("PARADO POR RISCO", "ERRO", "EMERGENCIA"):
-            cor = VERMELHO
-            self.chip_estado.setObjectName("chipErro" if estado != "PARADO POR RISCO" else "chipParado")
-        elif estado in ("ANALISANDO", "AGUARDANDO", "PRONTO", "ENCERRADO"):
-            cor = VERDE if estado in ("ANALISANDO", "PRONTO") else AMBAR
-            self.chip_estado.setObjectName("chipAtivo" if estado == "ANALISANDO" else "chipEstado")
-        self.chip_estado.setStyleSheet(f"background:{cor};")
-        self.chip_estado.setToolTip(m.get("detalhe", ""))
-        self.mensagem.setText(m.get("detalhe", ""))
+        self._aplicar_estado(m.get("estado", "-"), m.get("detalhe", ""))
         self.btn_pausar.setText("RETOMAR" if m.get("pausado") else "PAUSAR")
         self.btn_liberar.setEnabled(bool(m.get("parado_risco")))
         moeda = m.get("moeda", "")
@@ -313,11 +321,19 @@ class AbaOperacao(QWidget):
         rotulo.setStyleSheet(f"color:{cor}; font-weight:600; font-size:11pt;")
 
     def receber_estado(self, registro):
-        """Atualiza o rótulo de mensagem com transições de estado imediatas."""
-        if registro.get("estado") == "AGUARDANDO":
-            self.mensagem.setText(registro.get("detalhe", ""))
-        elif registro.get("estado") == "ANALISANDO":
+        """Aplica a transição de estado imediata ao chip e à mensagem."""
+        self._aplicar_estado(registro.get("estado", ""), registro.get("detalhe", ""))
+        if registro.get("estado") == "ANALISANDO":
             self.progresso_download.setText("")
+
+    def _aplicar_estado(self, estado, detalhe=""):
+        """Chip de estado com texto/cor do mapa; razão objetiva na mensagem."""
+        texto, cor = ESTADOS_CHIP.get(estado, (estado or "-", CINZA))
+        self.chip_estado.setText(texto)
+        self.chip_estado.setStyleSheet(f"background:{cor};")
+        self.chip_estado.setToolTip(detalhe)
+        if detalhe:
+            self.mensagem.setText(detalhe)
 
     def receber_lote(self, canal, registros):
         """Recebe um lote coalescido e insere cada canal em uma única operação."""

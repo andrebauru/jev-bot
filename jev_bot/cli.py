@@ -45,7 +45,7 @@ def executar(a):
         with bloquear(a.book):
             from .gui.janela import executar as executar_janela
             codigo = executar_janela(terminal=a.terminal, offset_horas=a.mt5_time_offset_hours,
-                                     banco=a.book)
+                                     banco=a.book, caminho_selecao=getattr(a, "mercados", None))
         raise SystemExit(codigo if isinstance(codigo, int) and codigo else 0)
     controle = bloquear(a.book) if a.cmd == "start" else nullcontext()
     with controle, markets.FonteMT5(a.terminal, a.mt5_time_offset_hours) as fonte:
@@ -107,8 +107,11 @@ def build_parser():
     p.add_argument("--interval", type=int, default=15)
     sub = p.add_subparsers(dest="cmd")
     p.set_defaults(cmd="dashboard")
-    for nome in ("dashboard", "painel", "scan", "decisions", "run", "start", "stop", "status", "gui"):
+    for nome in ("dashboard", "painel", "scan", "decisions", "run", "start", "stop", "status"):
         sub.add_parser(nome)
+    gui = sub.add_parser("gui")
+    gui.add_argument("--mercados", default=None,
+                     help="Arquivo de seleção de mercados alternativo (padrão: data/mercados.json)")
     card = sub.add_parser("card")
     card.add_argument("symbol")
     return p

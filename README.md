@@ -333,8 +333,21 @@ O pipeline gráfico é **Python → DeepSeek → JEv**:
 Cadência: sem posições abertas, o ciclo roda a cada 1 minuto, alinhado ao
 fechamento do candle M1 (+2s); com posições, a cada 15 minutos. O
 monitoramento de preços, posições, stops e limites roda em tempo real
-independente dessa cadência. Ao atingir limite de exposição ou drawdown,
-o robô entra em **PARADO POR RISCO**: análises e entradas param, e só
+independente dessa cadência. **Inicialização automática**: com
+configuração válida, seleção de mercados não vazia e nenhum bloqueio, o
+ciclo de análise inicia sozinho ao abrir a janela — sem clique em
+INICIAR. Sem mercados selecionados, o estado é AGUARDANDO SELEÇÃO (sem
+download, sem análise, sem tokens) e o início acontece automaticamente
+quando um mercado é habilitado, se não houver pausa voluntária nem
+bloqueio. PAUSAR desliga o autostart da sessão; INICIAR retoma quando
+seguro e recusa com motivo objetivo se houver bloqueio. Estados formais:
+INICIALIZANDO → PRONTO → ANALISANDO → AGUARDANDO (entre ciclos) →
+PAUSADO_PELO_USUARIO | BLOQUEADO_POR_RISCO | AGUARDANDO_SELECAO |
+EMERGENCIA | ERRO → ENCERRANDO → ENCERRADO, com transições registradas
+em `logs/`. EMERGÊNCIA grava marca persistida (`db.json.emergencia`);
+após reiniciar, o motor permanece em EMERGÊNCIA até INICIAR manual. Ao
+atingir limite de exposição ou drawdown, o robô entra em PARADO POR
+RISCO (estado BLOQUEADO_POR_RISCO): análises e entradas param, e só
 voltam com "LIBERAR APÓS REVISÃO" (liberação manual registrada no log).
 **EMERGÊNCIA — FECHAR TUDO** exige confirmação, bloqueia entradas na hora,
 tenta fechar todas as posições paper ao preço observado e alerta falhas:

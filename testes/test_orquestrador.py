@@ -103,7 +103,7 @@ class TestOrquestrador(unittest.TestCase):
             orch.book.daily_blocked = True
             orch._monitorar()
             self.assertTrue(orch.parado_risco)
-            self.assertTrue(any(c == "estado" and r["estado"] == "PARADO POR RISCO"
+            self.assertTrue(any(c == "estado" and r["estado"] == "BLOQUEADO_POR_RISCO"
                                 for c, r in orch.eventos))
             antes = len(orch.book.fills)
             orch._oportunidade(estado_mt5(), "id")

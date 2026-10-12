@@ -18,14 +18,15 @@ from . import tema
 class JanelaPrincipal(QMainWindow):
     """Monta as abas e interliga os pacotes do motor."""
 
-    def __init__(self, terminal=None, offset_horas=None, banco=None):
+    def __init__(self, terminal=None, offset_horas=None, banco=None, caminho_selecao=None):
         super().__init__()
         self.setWindowTitle("JEv Bot — paper trading com descoberta de padrões")
         self.resize(1280, 800)
         self.setMinimumSize(960, 600)
         self.setWindowState(self.windowState() | Qt.WindowMaximized)
 
-        self.motor = MotorTrabalhador(terminal=terminal, offset_horas=offset_horas, banco=banco)
+        self.motor = MotorTrabalhador(terminal=terminal, offset_horas=offset_horas,
+                                      banco=banco, caminho_selecao=caminho_selecao)
         self.orquestrador = self.motor.orquestrador
 
         self.abas = QTabWidget()
@@ -114,10 +115,11 @@ class JanelaPrincipal(QMainWindow):
             QMessageBox.critical(self, "Motor encerrado", f"Falha do motor:\n{self.orquestrador.erro}")
 
 
-def executar(terminal=None, offset_horas=None, banco=None):
+def executar(terminal=None, offset_horas=None, banco=None, caminho_selecao=None):
     """Abre a aplicação; retorna o código de saída do Qt."""
     app = QApplication.instance() or QApplication(sys.argv)
     app.setStyleSheet(tema.FOLHA)
-    janela = JanelaPrincipal(terminal=terminal, offset_horas=offset_horas, banco=banco)
+    janela = JanelaPrincipal(terminal=terminal, offset_horas=offset_horas,
+                             banco=banco, caminho_selecao=caminho_selecao)
     janela.show()
     return app.exec()

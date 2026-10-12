@@ -45,6 +45,7 @@ TENTATIVA_JEV_S = 60         # recuo após falha JEv
 TENTATIVA_DEEPSEEK_S = 120   # recuo global após falha DeepSeek
 MARGEM_CANDLE_S = 2          # segundos após o fechamento do M1
 CAUDA_CANDLES = 720          # cauda guardada por ativo (~12h; cobre regras de 240min)
+TENTATIVAS_CONEXAO = 3       # tentativas de conexão MT5 com recuo (2s/4s/6s)
 MAX_AVALIADOS = 2000         # memoria de deduplicação por candle
 LOTE_DOWNLOAD = 4320         # candles por chamada ao terminal (3 dias)
 
@@ -133,7 +134,9 @@ class Orquestrador:
         self.ciclo_ativo = False
         self.estado = "CONECTANDO"
         self.detalhe = "Aguardando conexão MT5"
-        self.pausado = True
+        self.estado_desde = self.relogio()
+        self.pausado = True          # pausa inicial; autostart avalia ao conectar
+        self.autostart_permitido = True  # PAUSAR/EMERGÊNCIA da sessão desligam
         self.parado_risco = False
         self.emergencia_ativa = False
         self.motivo_risco = ""
@@ -155,29 +158,31 @@ class Orquestrador:
         self.contagem_scan = {}    # resumo agregado do scanner para a GUI
         self._progresso_publicado = None
         self.consultas_ds_ciclo = 0
+        self.arquivo_emergencia = Path(str(self.banco) + ".emergencia")
+        self.arquivo_pausa = Path(str(self.banco) + ".pause")
 
     # ------------------------------------------------------------------ API
     def iniciar(self):
         """INICIAR: enfileira habilitação de ciclo e entradas paper."""
-        self.acoes.put(("iniciar", None))
+        self.acoes.put(("iniciar", None, self.relogio()))
 
     def pausar(self):
         """PAUSAR: para análises e entradas; monitoramento continua."""
         self.evento_pausa.set()
-        self.acoes.put(("pausar", None))
+        self.acoes.put(("pausar", None, self.relogio()))
 
     def retomar(self):
         """RETOMAR: volta ao ciclo normal, equivalente ao INICIAR."""
-        self.acoes.put(("retomar", None))
+        self.acoes.put(("retomar", None, self.relogio()))
 
     def emergencia(self):
         """EMERGÊNCIA — FECHAR TUDO: bloqueia entradas e fecha posições paper."""
         self.evento_emergencia.set()
-        self.acoes.put(("emergencia", None))
+        self.acoes.put(("emergencia", None, self.relogio()))
 
     def liberar_risco(self):
         """Liberação manual explícita após revisão do bloqueio de risco."""
-        self.acoes.put(("liberar_risco", None))
+        self.acoes.put(("liberar_risco", None, self.relogio()))
 
     def cancelar_ciclo(self):
         """CANCELAR CICLO: aborta o ciclo atual com segurança no próximo lote."""
@@ -187,15 +192,15 @@ class Orquestrador:
         """APLICAR: limites validados e persistidos no motor de risco."""
         self.acoes.put(("limites", {"risk_per_trade": risco_trade,
                                     "max_total_risk": risco_total,
-                                    "max_drawdown": drawdown}))
+                                    "max_drawdown": drawdown}, self.relogio()))
 
     def recarregar_config(self):
         """Reavalia configuração OpenRouter/DeepSeek após edição na UI."""
-        self.acoes.put(("config", None))
+        self.acoes.put(("config", None, self.relogio()))
 
     def recarregar_selecao(self):
         """Relê a seleção de mercados após salvar na UI, registrando diferenças."""
-        self.acoes.put(("selecao", None))
+        self.acoes.put(("selecao", None, self.relogio()))
 
     def recarregar_selecao_arquivo(self):
         """Relê imediatamente (mesma thread); usado por testes e comandos."""
@@ -203,16 +208,32 @@ class Orquestrador:
 
     def pedir_catalogo(self):
         """Solicita o catálogo real ao motor (thread do MT5) ou o cache offline."""
-        self.acoes.put(("catalogo", None))
+        self.acoes.put(("catalogo", None, self.relogio()))
 
     def parar(self):
         """Encerra a thread do motor; a carteira é salva ao final."""
         self.encerrar.set()
-        self.acoes.put(("sair", None))
+        self.acoes.put(("sair", None, self.relogio()))
 
-    def _estado_set(self, estado, detalhe=""):
+    def _estado_set(self, estado, detalhe="", registrar=True):
+        """Transição formal de estado: fonte única de verdade para a GUI.
+
+        Transições para o MESMO estado apenas atualizam o detalhe (sem
+        registro de log a cada 5s); mudanças de estado são registradas
+        com duração no anterior. Nunca há desvio: o ciclo e a espera
+        também passam por aqui, evitando o estado travado em PAUSADO.
+        """
+        anterior = self.estado
+        agora = self.relogio()
+        mudou = anterior != estado
         self.estado, self.detalhe = estado, detalhe
-        self.publicar("estado", {"estado": estado, "detalhe": detalhe, "quando": _agora_iso()})
+        if registrar and mudou:
+            self.logger.info("transição de estado", de=anterior, para=estado,
+                             duracao_s=round(agora - self.estado_desde, 1),
+                             motivo=str(detalhe)[:80])
+            self.estado_desde = agora
+        self.publicar("estado", {"estado": estado, "detalhe": detalhe,
+                                 "quando": _agora_iso()})
 
     def descarregar(self):
         """Envia à interface um único pacote com tudo acumulado desde o último flush."""
@@ -230,30 +251,138 @@ class Orquestrador:
         if pacote:
             self.entrega(pacote)
 
+    def _bloqueios_ativos(self, para_autostart=False):
+        """Motivos objetivos que impedem iniciar/autostart (nunca alterados pela IA)."""
+        motivos = []
+        if self.book is not None:
+            if self.book.drawdown_blocked:
+                motivos.append("drawdown máximo atingido (persistido na carteira)")
+            if self.book.daily_blocked:
+                motivos.append("perda diária máxima atingida")
+        if self.parado_risco:
+            motivos.append("bloqueio de risco ativo")
+        if self.emergencia_ativa:
+            motivos.append("EMERGÊNCIA ativa nesta sessão")
+        if self.arquivo_emergencia.exists():
+            motivos.append("EMERGÊNCIA persistida; pressione INICIAR após revisão para liberar")
+        if para_autostart and self.arquivo_pausa.exists():
+            motivos.append("pausa manual persistida (stop); use INICIAR para retomar")
+        return motivos
+
+    def _avaliar_autostart(self, origem):
+        """Autostart seguro: somente sem bloqueios e com mercados selecionados.
+
+        Nunca desfaz pausa voluntária da sessão (autostart_permitido=False
+        após PAUSAR/EMERGÊNCIA), bloqueios de risco ou emergência.
+        """
+        if self.encerrar.is_set() or self.book is None or self.fonte is None:
+            return
+        if not self.autostart_permitido:
+            self.logger.debug("autostart ignorado: pausa/emergência da sessão", origem=origem)
+            return
+        motivos = self._bloqueios_ativos(para_autostart=True)
+        if motivos:
+            detalhe = "; ".join(motivos)
+            if self.parado_risco or self.book.drawdown_blocked or self.book.daily_blocked:
+                self.parado_risco = True
+                self._estado_set("BLOQUEADO_POR_RISCO", f"Autostart suspenso: {detalhe}")
+            else:
+                self._estado_set("EMERGENCIA", f"Autostart suspenso: {detalhe}")
+            self.publicar("log", {"instante": _agora_iso(), "nivel": "aviso",
+                                  "mensagem": f"Autostart suspenso: {detalhe}"})
+            self.logger.aviso("autostart suspenso", origem=origem, motivo=detalhe[:120])
+            return
+        if self.selecao.vazia():
+            self._estado_set("AGUARDANDO_SELECAO",
+                             "Nenhum mercado marcado para Monitorar; selecione na aba Configurações → Mercados")
+            return
+        ja_ativo = self.book.active and not self.pausado
+        self.pausado = False
+        self.book.active = True
+        self._estado_set("PRONTO", f"Início automático ({origem}); aguardando próximo ciclo")
+        if ja_ativo:
+            self.logger.debug("autostart: ciclo já ativo", origem=origem)
+            return
+        self.publicar("log", {"instante": _agora_iso(), "nivel": "info",
+                              "mensagem": f"Início automático ({origem}): ciclo ativo e entradas paper "
+                                          f"habilitadas, sujeitas ao risco ({self.selecao.contagens()[0]} mercados)"})
+        self.logger.info("início automático", origem=origem,
+                         monitorados=self.selecao.contagens()[0])
+        if not self.deepseek_configurado:
+            self.publicar("log", {"instante": _agora_iso(), "nivel": "aviso",
+                                  "mensagem": "DeepSeek não configurado: sem novas hipóteses; padrões já validados continuam sendo usados."})
+
     def _cancelado_ciclo(self):
         """Cancelamento cooperativo: encerramento, emergência ou ciclo cancelado."""
         return self.encerrar.is_set() or self.evento_emergencia.is_set() \
             or self.evento_ciclo_cancelado.is_set()
 
     # ------------------------------------------------------------- ciclo principal
+    def _conectar_com_retentativas(self):
+        """Conecta ao MT5 com tentativas limitadas e recuo, sem loop apertado.
+
+        Devolve (gerenciador, fonte_entered) para o encerramento correto do
+        contexto, mesmo com dobro de fonte nos testes.
+        """
+        ultimo_erro = None
+        for tentativa in range(1, TENTATIVAS_CONEXAO + 1):
+            if self.encerrar.is_set():
+                raise RuntimeError("Encerrado durante a conexão.")
+            self._estado_set("INICIALIZANDO", f"Conectando ao terminal MT5 (tentativa {tentativa}/3)")
+            try:
+                gerenciador = FonteMT5(self.terminal, self.offset_horas)
+                fonte = gerenciador.__enter__()
+                return gerenciador, fonte
+            except (RuntimeError, OSError, ValueError, TypeError, AttributeError) as exc:
+                ultimo_erro = exc
+                self.logger.aviso("conexão MT5 falhou", tentativa=tentativa,
+                                  detalhe=str(exc)[:120])
+                self.publicar("log", {"instante": _agora_iso(), "nivel": "aviso",
+                                      "mensagem": f"Conexão MT5 falhou ({tentativa}/3): {str(exc)[:120]}"})
+                self.descarregar()
+                recuo = 2.0 * tentativa
+                while recuo > 0 and not self.encerrar.is_set():
+                    self.encerrar.wait(min(0.5, recuo))
+                    recuo -= 0.5
+        raise RuntimeError(f"MT5 indisponível após {TENTATIVAS_CONEXAO} tentativas: "
+                           f"{str(ultimo_erro)[:120]}")
+
     def executar(self):
-        """Conecta, carrega a carteira e mantém o loop até encerrar."""
+        """Conecta (com retentativas), avalia autostart e mantém o loop."""
         self.logger.info("inicialização do motor", banco=str(self.banco))
         try:
-            with FonteMT5(self.terminal, self.offset_horas) as fonte:
+            gerenciador, fonte = self._conectar_com_retentativas()
+            try:
                 self.fonte = fonte
                 fonte.cancelado = self.encerrar.is_set
                 fonte.evento = self._evento_fonte
                 self.book = self.carga_carteira(self.banco, fonte.moeda)
-                self.book.active = False  # entradas só com INICIAR explícito
+                self.arquivo_emergencia = Path(str(self.banco) + ".emergencia")
                 self.repositorio = padroes.RepositorioPadroes(self.pasta_dados, self.relogio)
                 self.orcamento = deepseek.Orcamento(self.pasta_dados, limite_hora_seguro(),
                                                     tokens_dia_seguro(), self.relogio)
                 self._persistir()
                 self._verificar_config()
                 self._registrar_selecao()
-                self._estado_set("PRONTO", "Conectado; pressione INICIAR para começar")
                 self.publicar("trades", list(reversed(self.book.trades[-500:])))
+                # Bootstrap: bloqueios persistidos nunca são contornados pelo autostart.
+                motivos = self._bloqueios_ativos(para_autostart=True)
+                if motivos:
+                    self.pausado = True
+                    self.autostart_permitido = False
+                    self.book.active = False
+                    if self.arquivo_emergencia.exists() or self.emergencia_ativa:
+                        self._estado_set("EMERGENCIA", "EMERGÊNCIA persistida: " + "; ".join(motivos))
+                    else:
+                        self.parado_risco = True
+                        self._estado_set("BLOQUEADO_POR_RISCO", "Bloqueios persistidos: " + "; ".join(motivos))
+                    self.publicar("log", {"instante": _agora_iso(), "nivel": "aviso",
+                                          "mensagem": "Autostart suspenso: " + "; ".join(motivos)})
+                    self.logger.aviso("autostart suspenso no bootstrap", motivo="; ".join(motivos)[:120])
+                else:
+                    self.pausado = False  # aguardar seleção não é pausa do operador
+                    self._estado_set("PRONTO", "Conectado; autostart avaliado")
+                    self._avaliar_autostart("bootstrap")
                 self.descarregar()
                 while not self.encerrar.is_set():
                     self._processar_acoes()
@@ -262,11 +391,17 @@ class Orquestrador:
                     if self.encerrar.is_set() or self.pausado or self.parado_risco or self.emergencia_ativa:
                         self.encerrar.wait(0.5)
                         continue
+                    if self.selecao.vazia():
+                        self._aguardar_selecao()
+                        continue
                     if self._aguardar_slot():
                         continue
                     if self.pausado or self.parado_risco or self.emergencia_ativa:
                         continue
                     self._ciclo()
+            finally:
+                self._estado_set("ENCERRANDO", "Salvando carteira paper")
+                gerenciador.__exit__(None, None, None)
         except (RuntimeError, OSError, ValueError, TypeError, AttributeError) as exc:
             self.erro = str(exc) or "Falha controlada no MT5 ou banco local."
             self.logger.erro("falha fatal do motor", detalhe=self.erro)
@@ -283,6 +418,29 @@ class Orquestrador:
             if self.erro is None:
                 self._estado_set("ENCERRADO", "Motor encerrado; carteira paper pausada e salva")
             self.logger.info("encerramento do motor concluído")
+
+    def _aguardar_selecao(self):
+        """Sem mercados selecionados: sem análise, sem download, sem tokens.
+
+        Reavalia a seleção periodicamente; ao ser habilitado um mercado,
+        com retomada segura, o ciclo inicia automaticamente.
+        """
+        self._estado_set("AGUARDANDO_SELECAO",
+                         "Nenhum mercado marcado para Monitorar; selecione na aba Configurações → Mercados")
+        prazo = self.relogio() + 2.0
+        anterior = self.selecao
+        while not self.encerrar.is_set() and self.relogio() < prazo:
+            self._processar_acoes()
+            self._monitorar()
+            self.descarregar()
+            if self.encerrar.is_set():
+                return
+            self.encerrar.wait(0.25)
+        if self.encerrar.is_set():
+            return
+        self.selecao = mercados.carregar(self.caminho_selecao)
+        if not self.selecao.vazia() and (self.selecao.diferencas(anterior) or self.pausado):
+            self._registrar_selecao()  # registra mudança e avalia autostart
 
     def _evento_fonte(self, etapa, simbolo, mensagem):
         """Agrega o progresso do scanner em contagens; um único registro por flush.
@@ -319,9 +477,8 @@ class Orquestrador:
                 return False
             if agora - self.ultimo_aviso_slot >= 5:
                 self.ultimo_aviso_slot = agora
-                self.publicar("estado", {"estado": "AGUARDANDO",
-                                         "detalhe": f"{base}; próximo ciclo em {restante:.0f}s",
-                                         "quando": _agora_iso()})
+                self._estado_set("AGUARDANDO", f"{base}; próximo ciclo em {restante:.0f}s",
+                                 registrar=False)  # atualiza detalhe sem logar transição
             self.encerrar.wait(min(0.5, restante))
             agora = self.relogio()
         return True
@@ -330,9 +487,13 @@ class Orquestrador:
     def _processar_acoes(self):
         while True:
             try:
-                acao, dados = self.acoes.get_nowait()
+                acao, dados, enfileirado = self.acoes.get_nowait()
             except queue.Empty:
                 return
+            atraso = self.relogio() - enfileirado
+            if atraso > 1.0:
+                self.logger.aviso("comando processado com atraso", comando=acao,
+                                  atraso_s=round(atraso, 1))
             try:
                 if acao == "iniciar":
                     self._acao_iniciar()
@@ -389,6 +550,8 @@ class Orquestrador:
         if self.selecao.vazia():
             self.publicar("log", {"instante": _agora_iso(), "nivel": "aviso",
                                   "mensagem": "Nenhum mercado marcado para Monitorar; use a aba Configurações → Mercados."})
+        else:
+            self._avaliar_autostart("seleção de mercados")
 
     def _acao_catalogo(self):
         """Catálogo real do terminal na thread do MT5; cache persistido para offline."""
@@ -404,39 +567,60 @@ class Orquestrador:
                                    "quando": _agora_iso()})
 
     def _acao_iniciar(self, rotulo="INICIAR"):
+        """INICIAR/RETOMAR: ação manual do operador; recusas sempre explicadas.
+
+        A configuração de JEv/DeepSeek NÃO bloqueia mais o início: sem
+        chave, o ciclo de análise funciona e as decisões ficam em
+        AGUARDANDO. Bloqueios de risco/emergência seguem invioláveis e
+        são recusados com motivo objetivo na interface.
+        """
         if self.book is None or self.fonte is None:
             raise RuntimeError("Conecte o MT5 antes de iniciar.")
-        try:
-            jev.configuracao()
-        except RuntimeError as exc:
-            self.publicar("log", {"instante": _agora_iso(), "nivel": "erro",
-                                  "mensagem": f"{rotulo} recusado: {exc}"})
-            self.book.active = False
-            self.logger.aviso("INICIAR recusado", detalhe=str(exc))
+        if not self.pausado and self.book.active and not self.emergencia_ativa                 and not self.arquivo_emergencia.exists():
+            self.publicar("log", {"instante": _agora_iso(), "nivel": "info",
+                                  "mensagem": f"{rotulo}: ciclo já ativo; comando ignorado (proteção contra duplo clique)"})
             return
-        self._verificar_config()
-        self.pausado = False
+        motivos = self._bloqueios_ativos(para_autostart=False)
+        if self.parado_risco or self.book.drawdown_blocked or self.book.daily_blocked:
+            detalhe = "; ".join(motivos) or "bloqueio de risco ativo"
+            self.publicar("log", {"instante": _agora_iso(), "nivel": "erro",
+                                  "mensagem": f"{rotulo} recusado: {detalhe}. Revise e use LIBERAR APÓS REVISÃO."})
+            self.logger.aviso("INICIAR recusado por bloqueio de risco", motivo=detalhe[:120])
+            return
+        # INICIAR é a liberação manual explícita da emergência persistida.
+        self.arquivo_emergencia.unlink(missing_ok=True)
+        self.arquivo_pausa.unlink(missing_ok=True)
         self.emergencia_ativa = False
+        self.autostart_permitido = True
+        self.pausado = False
         self.book.active = True
-        Path(str(self.banco) + ".pause").unlink(missing_ok=True)
         self._persistir()
-        if not self.deepseek_configurado:
-            self.publicar("log", {"instante": _agora_iso(), "nivel": "aviso",
-                                  "mensagem": "DeepSeek não configurado: sem novas hipóteses; padrões já validados continuam sendo usados."})
-        if self.selecao.vazia():
-            self.publicar("log", {"instante": _agora_iso(), "nivel": "aviso",
-                                  "mensagem": "Nenhum mercado marcado para Monitorar; selecione na aba Configurações → Mercados."})
+        self._estado_set("PRONTO", f"{rotulo}: retomado pelo operador; aguardando próximo ciclo")
         self.publicar("log", {"instante": _agora_iso(), "nivel": "info",
                               "mensagem": f"{rotulo}: ciclo ativo e entradas paper habilitadas, sujeitas ao risco"})
-        self.logger.info(rotulo, monitorados=self.selecao.contagens()[0])
+        self.logger.info("início/retomada manual", rotulo=rotulo,
+                         monitorados=self.selecao.contagens()[0])
+        if not self.deepseek_configurado or not self.jev_configurado:
+            faltando = []
+            if not self.jev_configurado:
+                faltando.append("JEv/OpenRouter")
+            if not self.deepseek_configurado:
+                faltando.append("DeepSeek")
+            self.publicar("log", {"instante": _agora_iso(), "nivel": "aviso",
+                                  "mensagem": f"{' e '.join(faltando)} não configurado(s): o ciclo de análise roda; decisões de entrada ficarão em AGUARDANDO até configurar."})
+            self.logger.aviso("IA não configurada; ciclo roda sem decisões", faltando=",".join(faltando))
+        if self.selecao.vazia():
+            self._estado_set("AGUARDANDO_SELECAO",
+                             "Nenhum mercado marcado para Monitorar; selecione na aba Configurações → Mercados")
 
     def _acao_pausar(self):
         self.evento_pausa.clear()
         self.pausado = True
+        self.autostart_permitido = False  # pausa voluntária: autostart não retoma
         if self.book is not None:
             self.book.active = False
             self._persistir()
-        self._estado_set("PAUSADO", "Novas análises e entradas pausadas; monitoramento ativo")
+        self._estado_set("PAUSADO_PELO_USUARIO", "Novas análises e entradas pausadas; monitoramento ativo")
         self.publicar("log", {"instante": _agora_iso(), "nivel": "info",
                               "mensagem": "PAUSAR: entradas e análises suspensas; posições continuam monitoradas"})
         self.logger.info("pausa acionada pelo operador")
@@ -446,12 +630,18 @@ class Orquestrador:
         self.evento_emergencia.clear()
         self.emergencia_ativa = True
         self.pausado = True
+        self.autostart_permitido = False  # emergência exige INICIAR manual
         if self.book is not None:
             self.book.active = False
         self._estado_set("EMERGENCIA", "Fechando todas as posições paper")
         self.publicar("log", {"instante": _agora_iso(), "nivel": "emergencia",
                               "mensagem": "EMERGÊNCIA: novas entradas bloqueadas; fechando posições paper"})
         self.logger.aviso("EMERGÊNCIA acionada", posicoes=len(self.book.fills) if self.book else 0)
+        try:
+            self.arquivo_emergencia.parent.mkdir(parents=True, exist_ok=True)
+            self.arquivo_emergencia.write_text(_agora_iso(), encoding="ascii")
+        except OSError as exc:
+            self.logger.erro("falha ao registrar emergência persistida", detalhe=str(exc)[:120])
         self._executar_emergencia()
 
     def _executar_emergencia(self):
@@ -565,7 +755,7 @@ class Orquestrador:
             if not self.parado_risco:
                 self.parado_risco = True
                 self.motivo_risco = "; ".join(motivos)
-                self._estado_set("PARADO POR RISCO", self.motivo_risco)
+                self._estado_set("BLOQUEADO_POR_RISCO", self.motivo_risco)
                 self.publicar("log", {"instante": _agora_iso(), "nivel": "aviso",
                                       "mensagem": f"PARADO POR RISCO: {self.motivo_risco}. Análises e entradas suspensas; liberação apenas manual."})
                 self.logger.aviso("motor parado por risco", motivo=self.motivo_risco)
@@ -611,9 +801,8 @@ class Orquestrador:
         self.contagem_scan = {}
         self.ciclo += 1
         id_ciclo = f"ciclo{self.ciclo}"
-        self.logger.info("ciclo iniciado", ciclo=self.ciclo)
-        self.publicar("estado", {"estado": "ANALISANDO", "detalhe": f"Ciclo {self.ciclo}",
-                                 "quando": _agora_iso()})
+        self.logger.info("ciclo iniciado", ciclo=self.ciclo, analysis_id=id_ciclo)
+        self._estado_set("ANALISANDO", f"Ciclo {self.ciclo}")
         try:
             self._executar_ciclo(id_ciclo)
         finally:
@@ -641,6 +830,8 @@ class Orquestrador:
         for estado in estados:
             if self._cancelado_ciclo() or self.pausado or self.parado_risco:
                 break
+            self._processar_acoes()  # INICIAR/PAUSAR/EMERGÊNCIA respondem no meio do ciclo
+            self.descarregar()
             if not self.selecao.monitorar(estado.symbol):
                 continue  # desmarcado: sem histórico, sem análise, sem DeepSeek
             if estado.symbol in self.em_analise:
