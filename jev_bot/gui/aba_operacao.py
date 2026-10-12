@@ -208,12 +208,16 @@ class AbaOperacao(QWidget):
             grade.addLayout(caixa)
             self.valores[chave] = valor
         grade.addStretch(1)
+        self.resumo_ciclo = QLabel("")
+        self.resumo_ciclo.setWordWrap(True)
+        self.resumo_ciclo.setStyleSheet("color:#7aa2f7;")
         self.progresso_download = QLabel("")
         self.progresso_download.setStyleSheet("color:#8ea3c8;")
         self.mensagem = QLabel("")
         self.mensagem.setStyleSheet("color:#8ea3c8;")
         self.mensagem.setWordWrap(True)
         raiz.addWidget(grupo_metricas)
+        raiz.addWidget(self.resumo_ciclo)
         raiz.addWidget(self.progresso_download)
         raiz.addWidget(self.mensagem)
 
@@ -229,8 +233,9 @@ class AbaOperacao(QWidget):
                                         "Amostra", "Padrões", "Resultado", "Erro"])
         self.lista_deepseek = ListaAnalise(["ID", "Ativo", "Horário (UTC)", "Padrão",
                                             "Consulta", "Hipótese", "Validação local", "Resultado"])
-        self.lista_decisao = ListaAnalise(["ID", "Ativo", "Horário (UTC)", "Oportunidade",
-                                           "Decisão", "Justificativa", "Risco", "Execução"])
+        self.lista_decisao = ListaAnalise(["analysis_id", "Ativo", "Horário (UTC)",
+                                           "pattern_id", "Direção", "Decisão",
+                                           "Justificativa", "Risco / Paper"])
         self.painel_calc = PainelAnalise("CÁLCULOS MATEMÁTICOS (Python)", self.lista_calc)
         self.painel_deepseek = PainelAnalise("ANÁLISE DEEPSEEK (padrões candidatos)",
                                              self.lista_deepseek)
@@ -374,6 +379,8 @@ class AbaOperacao(QWidget):
 
     def receber_lote(self, canal, registros):
         """Recebe um lote coalescido e insere cada canal em uma única operação."""
+        if canal == "resumo" and isinstance(registros, dict):
+            registros = [registros]
         itens = []
         for r in registros:
             if canal == "calc":
@@ -404,11 +411,33 @@ class AbaOperacao(QWidget):
                     else VERMELHO if "rejeitado" in str(r.get("validacao", "")).lower() else None))
             elif canal == "decisao":
                 decisao = str(r.get("decisao") or "-")
-                cor = VERDE if decisao.startswith("SIM") else VERMELHO if decisao.startswith("NÃO") else AMBAR
+                cor = (VERDE if decisao == "SIM" else VERMELHO if decisao in ("NAO", "NÃO")
+                       else AMBAR if decisao == "HOLD" else CINZA)
                 itens.append((
                     [r.get("id"), r.get("simbolo") or "-", _fmt_horario(r.get("instante")),
-                     r.get("oportunidade") or "-", decisao, r.get("justificativa") or "-",
-                     r.get("risco") or "-", r.get("execucao") or "-"], cor))
+                     r.get("padrao") or "-", r.get("direcao") or "-", decisao,
+                     r.get("justificativa") or "-",
+                     f"{r.get('risco') or '-'} | {r.get('execucao') or '-'}"], cor))
+            elif canal == "resumo":
+                oportunidades = r.get("oportunidades", 0)
+                funil = " → ".join(f"{etapa.split('_')[0]}:{qtd}" for etapa, qtd
+                                   in (r.get("funil") or {}).items())
+                tempos = r.get("tempos") or {}
+                nomes = {"decisao": "decisão", "deepseek": "DeepSeek",
+                         "oportunidade": "oportunidade", "trade": "trade"}
+                desde = " | ".join(f"{nomes[chave]} há {valor}s"
+                                   for chave, valor in tempos.items() if valor is not None)
+                texto = (f"Ciclo {r.get('ciclo', '?')}: {oportunidades} oportunidade(s) "
+                         f"elegível(is) | funil: {funil or 'vazio'} | "
+                         f"pendentes {r.get('pendentes', 0)} | duração {r.get('duracao_s', '?')}s")
+                if desde:
+                    texto += f" | {desde}"
+                if oportunidades == 0:
+                    texto += "  ·  0 oportunidades elegíveis"
+                self.resumo_ciclo.setText(texto)
+                self.resumo_ciclo.setToolTip(r.get("motivos", ""))
+                self.paineis["decisao"].atualizar(self.lista_decisao.topLevelItemCount(),
+                                                  _fmt_horario(r.get("instante")))
             elif canal == "log":
                 self.mensagem.setText(f"{_fmt_horario(r.get('instante'))} {r.get('mensagem', '')}")
                 cor = {"erro": VERMELHO, "aviso": AMBAR, "emergencia": VERMELHO,

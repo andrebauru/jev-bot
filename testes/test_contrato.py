@@ -226,10 +226,12 @@ class TestOportunidadeNoPipeline(unittest.TestCase):
             ok, motivo_erro = padroes.validar_contrato(contrato)
             self.assertTrue(ok, motivo_erro)
             decisoes = [r for c, r in orch.eventos if c == "decisao"
-                        and r.get("decisao", "").startswith("SIM")]
+                        and r.get("decisao") == "SIM"]
             self.assertEqual(decisoes[0].get("padrao"), registro["id"])
             self.assertIsNotNone(decisoes[0].get("candle_ref"))
+            self.assertIn(decisoes[0].get("direcao"), ("BUY", "SELL"))
             self.assertEqual(orch.contadores_ciclo.get("executadas"), 1)
+            self.assertEqual(orch.contadores_ciclo.get("jev_sim"), 1)
 
     def test_jev_nao_e_condicao_ausente_contabilizados(self):
         """JEv NAO e validado-sem-condicao aparecem no resumo do ciclo."""
@@ -248,6 +250,15 @@ class TestOportunidadeNoPipeline(unittest.TestCase):
             with patch("jev_bot.orquestrador.jev.decide",
                        return_value=Decision("TESTE", "HOLD", .5, .5)):
                 motivo = orch._oportunidade(estado, "id")
+            self.assertEqual(motivo, "hold")
+            self.assertEqual(orch.contadores_ciclo.get("jev_hold"), 1)
+            self.assertTrue(any(simbolo == "TESTE" for simbolo, _ in orch.holds))
+            # AVOID: JEv decidiu NÃO (descarte imediato).
+            estado2 = estado_mt5(closes=closes)
+            estado2.candles[-1]["time"] += 60
+            with patch("jev_bot.orquestrador.jev.decide",
+                       return_value=Decision("TESTE", "AVOID", .2, .2)):
+                motivo = orch._oportunidade(estado2, "id")
             self.assertEqual(motivo, "jev_nao")
             self.assertEqual(orch.contadores_ciclo.get("jev_nao"), 1)
             closes_neutras = [100.0 + (i % 3) * .1 for i in range(100)]

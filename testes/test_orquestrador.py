@@ -190,7 +190,8 @@ class TestOrquestrador(unittest.TestCase):
             with patch("jev_bot.orquestrador.jev.decide", return_value=decisao):
                 orch._oportunidade(estado, "id")
             decisoes = [r for c, r in orch.eventos if c == "decisao"]
-            self.assertTrue(any(r["decisao"] == "NÃO" for r in decisoes))
+            self.assertTrue(any(r["decisao"] == "HOLD" for r in decisoes))
+            self.assertEqual(orch.contadores_ciclo.get("jev_hold"), 1)
             self.assertEqual(orch.book.fills, [])
             with patch("jev_bot.orquestrador.jev.decide", side_effect=RuntimeError("api fora")):
                 estado2 = estado_mt5(closes=closes)

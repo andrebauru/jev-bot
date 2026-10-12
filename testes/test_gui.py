@@ -54,13 +54,22 @@ class TestGui(unittest.TestCase):
                                         "resultado": "eventos 40, taxa 60% | OOS 12, taxa 58%"}])
         abas.receber_lote("decisao", [{"id": "c1", "simbolo": "BTCUSD",
                                        "instante": "2026-01-01T00:00:00+00:00",
-                                       "oportunidade": "quedas", "decisao": "SIM (BUY)",
-                                       "justificativa": "j", "risco": "gate EXECUTE",
-                                       "execucao": "paper aberto"}])
+                                       "padrao": "abc123", "candle_ref": 1,
+                                       "direcao": "BUY", "decisao": "SIM",
+                                       "oportunidade": "quedas", "justificativa": "j",
+                                       "risco": "autorizado", "execucao": "paper aberto"}])
         self.assertEqual(abas.lista_calc.topLevelItemCount(), 2)
         self.assertEqual(abas.lista_deepseek.topLevelItemCount(), 1)
         self.assertEqual(abas.lista_decisao.topLevelItemCount(), 1)
-        self.assertEqual(abas.lista_decisao.topLevelItem(0).text(4), "SIM (BUY)")
+        self.assertEqual(abas.lista_decisao.topLevelItem(0).text(5), "SIM")
+        self.assertEqual(abas.lista_decisao.topLevelItem(0).text(4), "BUY")
+        # Resumo de ciclo vai ao painel de status, não à lista de decisões.
+        abas.receber_lote("resumo", [{"id": "c1", "ciclo": 1,
+                                      "instante": "2026-01-01T00:00:00+00:00",
+                                      "oportunidades": 1, "motivos": "enviados_jev=1",
+                                      "pendentes": 0, "duracao_s": 3.0}])
+        self.assertIn("1 oportunidade", abas.resumo_ciclo.text())
+        self.assertEqual(abas.lista_decisao.topLevelItemCount(), 1)
         trade = {"symbol": "BTCUSD", "action": "BUY", "entry": 100.0, "volume": .01,
                  "price_now": 100.5, "exit": None, "profit": 5.0, "risk_amount": 10.0,
                  "opened_at": "2026-01-01T00:00:00+00:00", "closed_at": None,

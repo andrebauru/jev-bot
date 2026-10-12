@@ -65,7 +65,9 @@ with tempfile.TemporaryDirectory() as pasta:
                         caminho_selecao=arquivo)
     orch.logger = LoggerSilencioso()
     orch.fonte = FonteFake(cotacoes={"TESTE": (99.99, 100.0, time.time())})
-    orch.fonte.janela_m1 = Mock(return_value=janela(candles_sinteticos(43200)))
+    from apoio import candles_deterministicos
+    janela_det = janela(candles_deterministicos(43200))
+    orch.fonte.janela_m1 = Mock(return_value=janela_det)
     orch.fonte.incremento_m1 = Mock(return_value=None)
     orch.repositorio = Mock()
     orch.repositorio.padroes_ativos.return_value = []
@@ -81,6 +83,29 @@ with tempfile.TemporaryDirectory() as pasta:
     orch._janela_com_cache("TESTE", "id")
     hit = time.time() - t0
     print(f"cache: miss (janela completa paginada) {miss:.2f}s → hit (incremento 30 candles) {hit:.3f}s")
+
+# 2c) Funil por ciclo: candidatos locais gerados e validados sem IA.
+with tempfile.TemporaryDirectory() as pasta:
+    arquivo = Path(pasta) / "mercados.json"
+    mercados.salvar({"selecao": {"C": {"TESTE": {"monitorar": True, "operar": True}}}}, arquivo)
+    orch = Orquestrador(banco=Path(pasta) / "db.json", pasta_dados=Path(pasta) / "padroes",
+                        caminho_selecao=arquivo)
+    orch.logger = LoggerSilencioso()
+    from jev_bot import padroes
+    orch.repositorio = padroes.RepositorioPadroes(Path(pasta) / "padroes")
+    orch.fonte = FonteFake(cotacoes={"TESTE": (99.99, 100.0, time.time())})
+    from apoio import candles_deterministicos
+    janela_det = janela(candles_deterministicos(43200))
+    orch.fonte.janela_m1 = Mock(return_value=janela_det)
+    orch.fonte.incremento_m1 = Mock(return_value=None)
+    orch.dados_ativo.clear()
+    orch.contadores_ciclo = {}
+    orch._atualizar_cache("TESTE", orch._janela_com_cache("TESTE", "id"), "id")
+    stats = orch.dados_ativo["TESTE"]["stats"]
+    from jev_bot import candidatos
+    regras = candidatos.regras_candidatas(stats, orch.dados_ativo["TESTE"]["tail"])
+    print(f"candidatos locais determinísticos no padrão sintético: {len(regras)} "
+          f"({[r['tipo_regra'] + '/' + r['direcao'] for r in regras]})")
 
 # 3) Tempo para cancelar um download paginado em andamento.
 with tempfile.TemporaryDirectory() as pasta:

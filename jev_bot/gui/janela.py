@@ -83,7 +83,7 @@ class JanelaPrincipal(QMainWindow):
 
     def _receber_pacote(self, pacote):
         """Roteia o pacote coalescido: listas por canal e registros únicos."""
-        for canal in ("calc", "deepseek", "decisao", "log"):
+        for canal in ("calc", "deepseek", "decisao", "log", "resumo"):
             registros = pacote.get(canal)
             if registros:
                 self.aba_operacao.receber_lote(canal, registros)

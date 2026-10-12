@@ -368,6 +368,34 @@ tenta fechar todas as posições paper ao preço observado e alerta falhas:
 posição sem cotação válida permanece aberta, com nova tentativa
 automática; nada é marcado como encerrado sem confirmação do simulador.
 
+**Caminho operacional independente do aprendizado**: a cada ciclo, o
+Python gera **candidatos determinísticos** das estatísticas condicionais
+já calculadas (`jev_bot/candidatos.py`: sequências de quedas/altas,
+recuperação após queda, retração após alta — sem indicadores), os valida
+pelo MESMO rigor (fora da amostra, não sobrepostos, custo de spread) e os
+registra como padrões `origem: local`. Assim, rate limit, timeout ou
+indisponibilidade do DeepSeek não deixam a carteira sem avaliação nos
+candles recentes — e o JEv é consultado no MESMO candle em que a condição
+está verdadeira, sem esperar o TTL de 1 hora do aprendizado.
+
+**Decisões SIM/NAO/HOLD por ativo**: o JEv responde e a normalização é
+SIM (BUY/SELL), NAO (AVOID, contrato inválido ou recusado pelo risco) e
+HOLD (indisponibilidade ou adiamento explícito do modelo). `HOLD` adia
+APENAS aquela oportunidade (identificador `pattern_id@candle`) por até 5
+minutos (`HOLD_TTL_S`); expirada, é descartada — sem loop infinito — e um
+novo candle gera nova oportunidade. `NAO` encerra apenas aquela candidata;
+o laço continua para as próximas do mesmo símbolo. Indisponibilidades são
+registradas como HOLD "adiada" com motivo, nunca como decisão simulada.
+
+**Resumo por ciclo no painel de status** (nunca na lista de decisões):
+funil por ciclo — candidatos → com M1 → candidatos locais gerados/validados
+→ enviados ao DeepSeek → hipóteses recebidas → rejeitados → elegíveis →
+enviados ao JEv → SIM/NAO/HOLD → paper executados — com motivos explícitos
+de cada queda (`sem_dados`, `sem_padrao`, `rejeitado_validacao`,
+`pre_bloqueado`, `risco_bloqueado`, `ia_indisponivel`, `deepseek_omitido`,
+`hold_expirado`, `erros`) e tempo desde a última decisão, última análise
+DeepSeek, última oportunidade e último trade.
+
 Aba Resumo exibe curva de patrimônio (realizada dos fechamentos mais
 patrimônio atual com P&L aberto), drawdown desde o pico, retorno,
 taxa de acerto e estatísticas, com filtros de período e ativo. Botão

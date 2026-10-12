@@ -33,7 +33,7 @@ import queue
 import threading
 import time
 
-from . import cache_m1, deepseek, jev, logs, mercados, padroes, risk
+from . import cache_m1, candidatos, deepseek, jev, logs, mercados, padroes, risk
 from .markets import FonteMT5
 from .motor_matematico import estatisticas, janela_descoberta, resumo_compacto
 from .painel import BANCO_PADRAO, carregar_carteira
@@ -50,6 +50,7 @@ TENTATIVAS_CONEXAO = 3       # tentativas de conexão MT5 com recuo (2s/4s/6s)
 ORCAMENTO_CICLO_S = 50       # orçamento de tempo do ciclo sem posições (cadência 1min)
 ORCAMENTO_CICLO_COM_POSICAO_S = 600  # com posições (cadência 15min)
 RESERVA_PROCESSAMENTO_S = 15  # fatia final do orçamento reservada ao processamento
+HOLD_TTL_S = 300             # HOLD adia a oportunidade no máximo 5 minutos (expira, sem loop)
 FAS = {"VARRENDO": "VARRENDO CATÁLOGO", "BAIXANDO_HISTORICO": "BAIXANDO HISTÓRICO",
        "CALCULANDO": "CALCULANDO", "ANALISANDO_DEEPSEEK": "ANALISANDO DEEPSEEK",
        "VALIDANDO": "VALIDANDO PADRÕES", "DECIDINDO_JEV": "DECIDINDO JEV"}
@@ -86,7 +87,7 @@ class Coalescedor:
     dezenas, mantendo a janela fluida.
     """
     TETOS = {"calc": 60, "deepseek": 60, "decisao": 60, "log": 60}
-    UNICOS = ("metricas", "estado", "catalogo", "trades")
+    UNICOS = ("metricas", "estado", "catalogo", "trades", "resumo")
 
     def __init__(self):
         self.lotes = {}
@@ -169,7 +170,15 @@ class Orquestrador:
         self.arquivo_emergencia = Path(str(self.banco) + ".emergencia")
         self.arquivo_pausa = Path(str(self.banco) + ".pause")
         self.ultimo_resumo_hash = {}
+        self.holds = {}            # (simbolo, oportunidade_id) -> expira_em
+        self.ultimo_motivo = {}    # simbolo -> último motivo publicado
+        self.ultimos = {"decisao": None, "deepseek": None,
+                        "oportunidade": None, "trade": None}
         self.ultimo_resumo_hash = {}
+        self.holds = {}            # (simbolo, oportunidade_id) -> expira_em
+        self.ultimo_motivo = {}    # simbolo -> último motivo publicado
+        self.ultimos = {"decisao": None, "deepseek": None,
+                        "oportunidade": None, "trade": None}
         self.cache_m1 = cache_m1.CacheM1(self.pasta_dados.parent / "cache_m1",
                                          relogio=relogio)
         self.prazo_ciclo = None
@@ -760,6 +769,8 @@ class Orquestrador:
         self._avaliar_risco()
         alterou_trades = len(self.book.trades) != self.trades_conhecidos or \
             any(e["event"] in ("open", "close") for e in self.book.log[eventos_antes:])
+        if any(e["event"] in ("open", "close") for e in self.book.log[eventos_antes:]):
+            self.ultimos["trade"] = agora
         if len(self.book.trades) != self.trades_conhecidos or \
                 any(e["event"] == "close" for e in self.book.log[eventos_antes:]):
             self.trades_conhecidos = len(self.book.trades)
@@ -815,6 +826,8 @@ class Orquestrador:
                 "orcamento": self.orcamento.consumo() if self.orcamento else {},
                 "monitorados": monitorados, "operaveis": operaveis,
                 "fase": self.fase, "contadores": dict(self.contadores_ciclo),
+                "ultimos": {chave: (round(self.relogio() - valor, 1) if valor else None)
+                            for chave, valor in self.ultimos.items()},
                 "posicoes_detalhe": [asdict(p) for p in book.fills]}
 
     def _persistir(self):
@@ -874,13 +887,27 @@ class Orquestrador:
             self._varrer_e_processar(id_ciclo, estados)
         finally:
             duracao = round(self.relogio() - inicio_ciclo, 1)
+            FUNIL = ("candidatos", "sem_dados", "cache_incremental", "cache_completo",
+                     "cache_invalido", "candidatos_locais", "locais_validados",
+                     "deepseek_enviados", "hipoteses_recebidas", "rejeitado_validacao",
+                     "validados_ativos", "elegiveis", "enviados_jev", "aguardando_decisao",
+                     "jev_sim", "jev_nao", "jev_hold", "pre_bloqueado", "risco_bloqueado",
+                     "contrato_invalido", "executadas", "hold_aguardando", "hold_expirado",
+                     "erros", "sem_padrao", "somente_monitorar", "deepseek_omitido")
+            funil = {etapa: self.contadores_ciclo[etapa] for etapa in FUNIL
+                     if self.contadores_ciclo.get(etapa)}
+            tempos = {chave: (round(self.relogio() - valor, 1) if valor else None)
+                      for chave, valor in self.ultimos.items()}
             resumo = "; ".join(f"{k}={v}" for k, v in sorted(self.contadores_ciclo.items()))
-            self.publicar("decisao", {"id": id_ciclo, "simbolo": "", "instante": _agora_iso(),
-                                      "oportunidade": f"Ciclo {self.ciclo}",
-                                      "decisao": "RESUMO",
-                                      "justificativa": resumo or "sem candidatos monitorados",
-                                      "risco": f"pendentes: {len(self.pendentes_ciclo)}",
-                                      "execucao": f"duração {duracao}s"})
+            # Resumo agregado vai para o painel de status, NUNCA para a lista
+            # de decisões (que só contém respostas reais do JEv por ativo).
+            self.publicar("resumo", {"id": id_ciclo, "ciclo": self.ciclo,
+                                     "instante": _agora_iso(),
+                                     "oportunidades": self.contadores_ciclo.get("enviados_jev", 0),
+                                     "motivos": resumo or "sem candidatos monitorados",
+                                     "funil": funil, "tempos": tempos,
+                                     "pendentes": len(self.pendentes_ciclo),
+                                     "duracao_s": duracao})
             self.logger.info("ciclo concluído (processamento)", ciclo=self.ciclo,
                              duracao_s=duracao, pendentes=len(self.pendentes_ciclo),
                              contadores=dict(self.contadores_ciclo))
@@ -1112,6 +1139,11 @@ class Orquestrador:
                  "inicio_janela": janela["inicio"], "fim_janela": janela["fim"],
                  "tail": janela["candles"][-CAUDA_CANDLES:]}
         self.dados_ativo[simbolo] = cache
+        # Caminho operacional independente do aprendizado: candidatos
+        # determinísticos das estatísticas locais são validados JÁ (mesmo
+        # rigor: fora da amostra, não sobrepostos, custo) e ficam disponíveis
+        # no mesmo ciclo, mesmo com DeepSeek em rate limit/indisponível.
+        self._gerar_candidatos_locais(simbolo, janela, stats, custo_pct, id_analise)
         self.logger.info("estatísticas locais calculadas", simbolo=simbolo,
                          candles=stats.get("candles"), dias=stats.get("dias"))
         # DeepSeek é agendado aqui: hipóteses são validadas antes do descarte da janela.
@@ -1124,6 +1156,41 @@ class Orquestrador:
             self._etapa_deepseek(simbolo, janela["candles"], cache, stats, id_analise,
                                  hash_resumo=hash_resumo)
         # Cauda permanece no cache; a janela completa é liberada ao sair deste método.
+
+    def _gerar_candidatos_locais(self, simbolo, janela, stats, custo_pct, id_analise):
+        """Valida candidatos determinísticos das estatísticas locais (sem IA).
+
+        Cada regra candidata passa pela validação independente padrão; só
+        vira `validado` com amostra e taxa fora da amostra suficientes.
+        """
+        try:
+            regras = candidatos.regras_candidatas(stats, janela["candles"])
+        except (ValueError, TypeError, KeyError) as exc:
+            self.logger.aviso("falha ao gerar candidatos locais", simbolo=simbolo,
+                              detalhe=str(exc)[:120])
+            return
+        janela_info = {"inicio": janela["inicio"], "fim": janela["fim"],
+                       "dias": stats.get("dias"), "candles": janela["recebidos"]}
+        for regra in regras:
+            validacao = padroes.validar(regra, janela["candles"], custo_pct)
+            registro = self.repositorio.registrar(simbolo, regra, validacao, "local",
+                                                  janela_info)
+            self.contadores_ciclo["candidatos_locais"] = \
+                self.contadores_ciclo.get("candidatos_locais", 0) + 1
+            self.publicar("deepseek", {"id": id_analise, "simbolo": simbolo,
+                                       "instante": _agora_iso(), "padrao": registro["id"],
+                                       "status_consulta": "CANDIDATO LOCAL (Python)",
+                                       "hipotese": self._texto_hipotese(regra),
+                                       "validacao": f"{validacao['status']}: {validacao['motivo']}",
+                                       "resultado": self._texto_validacao(validacao)})
+            if validacao["status"] == "validado":
+                self.contadores_ciclo["locais_validados"] = \
+                    self.contadores_ciclo.get("locais_validados", 0) + 1
+                self.logger.info("candidato local validado", simbolo=simbolo,
+                                 padrao=registro["id"], analysis_id=id_analise)
+            if validacao["status"] == "rejeitado":
+                self.contadores_ciclo["rejeitado_validacao"] = \
+                    self.contadores_ciclo.get("rejeitado_validacao", 0) + 1
 
     def _etapa_deepseek(self, simbolo, candles, cache, stats, id_analise, hash_resumo=None):
         """Consulta o DeepSeek, valida cada hipótese localmente e registra."""
@@ -1164,8 +1231,13 @@ class Orquestrador:
             return False
         self.orcamento.registrar(uso.get("tokens", 0))
         self.ultimo_deepseek[simbolo] = agora
+        self.ultimos["deepseek"] = agora
         if hash_resumo is not None:
             self.ultimo_resumo_hash[simbolo] = hash_resumo
+        self.contadores_ciclo["deepseek_enviados"] = \
+            self.contadores_ciclo.get("deepseek_enviados", 0) + 1
+        self.contadores_ciclo["hipoteses_recebidas"] = \
+            self.contadores_ciclo.get("hipoteses_recebidas", 0) + len(hipoteses)
         self.ultimo_resumo_hash[simbolo] = hash_resumo
         self._estado_set("ANALISANDO", f"Ciclo {self.ciclo} · VALIDANDO {simbolo}",
                          registrar=False, fase="VALIDANDO")
@@ -1200,9 +1272,10 @@ class Orquestrador:
     def _oportunidade(self, estado, id_analise):
         """Padrão validado com condição verdadeira agora → decisão JEv.
 
-        Somente símbolos marcados para Operar chegam a esta etapa. Posições
-        abertas continuam supervisionadas em _monitorar, independentemente
-        da seleção.
+        Somente símbolos marcados para Operar chegam a esta etapa. NÃO e HOLD
+        encerram apenas AQUELA candidata: o laço continua para a próxima
+        padrão/oportunidade do mesmo símbolo. Posições abertas continuam
+        supervisionadas em _monitorar, independentemente da seleção.
         """
         if self.book is None or not self.book.active or self.parado_risco or self.emergencia_ativa:
             return "inativo"
@@ -1216,11 +1289,31 @@ class Orquestrador:
             self.contadores_ciclo["sem_padrao"] = \
                 self.contadores_ciclo.get("sem_padrao", 0) + 1
             return "sem_padrao"
+        self.contadores_ciclo["validados_ativos"] = \
+            self.contadores_ciclo.get("validados_ativos", 0) + len(validados)
         instante_candle = estado.candles[-1]["time"] if estado.candles else None
         if len(self.avaliados) > MAX_AVALIADOS:
             self.avaliados.clear()
         condicao_presente = False
+        agora = self.relogio()
+        motivos = []
         for padrao in validados:
+            identificador = f"{padrao['id']}@{instante_candle}"
+            # HOLD vigente: verifica ANTES do dedup (o dedup marcaria o candle
+            # como avaliado e o hold nunca seria consultado/expirado).
+            if (simbolo, identificador) in self.holds:
+                if agora < self.holds[(simbolo, identificador)]:
+                    self.contadores_ciclo["hold_aguardando"] = \
+                        self.contadores_ciclo.get("hold_aguardando", 0) + 1
+                    continue
+                self.holds.pop((simbolo, identificador), None)
+                self.contadores_ciclo["hold_expirado"] = \
+                    self.contadores_ciclo.get("hold_expirado", 0) + 1
+                self.logger.info("HOLD expirado; oportunidade descartada", simbolo=simbolo,
+                                 padrao=padrao["id"], analysis_id=id_analise)
+                if instante_candle is not None:
+                    self.avaliados[(simbolo, padrao["id"])] = instante_candle
+                continue
             chave = (simbolo, padrao["id"])
             if self.avaliados.get(chave) == instante_candle:
                 continue
@@ -1232,6 +1325,9 @@ class Orquestrador:
             if not padroes.condicao_atual(padrao, candles_condicao):
                 continue
             condicao_presente = True
+            contabilizar_elegivel = self.contadores_ciclo
+            contabilizar_elegivel["elegiveis"] = contabilizar_elegivel.get("elegiveis", 0) + 1
+            self.ultimos["oportunidade"] = agora
             interna = padrao["regra"]
             regra = {"tipo_regra": interna["tipo"], "parametros": interna["parametros"],
                      "direcao": interna["direcao"], "horizonte_minutos": interna["horizonte_minutos"]}
@@ -1252,30 +1348,53 @@ class Orquestrador:
             if not ok_contrato:
                 self.contadores_ciclo["contrato_invalido"] = \
                     self.contadores_ciclo.get("contrato_invalido", 0) + 1
+                motivos.append("contrato_invalido")
                 self.publicar("decisao", {"id": id_analise, "simbolo": simbolo,
-                                          "instante": _agora_iso(), "oportunidade": texto,
-                                          "decisao": "NÃO", "justificativa":
-                                          f"Contrato inválido: {motivo_contrato}",
+                                          "instante": _agora_iso(), "padrao": padrao["id"],
+                                          "candle_ref": instante_candle,
+                                          "direcao": regra["direcao"], "decisao": "NAO",
+                                          "oportunidade": texto,
+                                          "justificativa": f"Contrato inválido: {motivo_contrato}",
                                           "risco": evidencia, "execucao": "nenhuma"})
                 self.logger.aviso("contrato de oportunidade inválido", simbolo=simbolo,
                                   padrao=padrao["id"], motivo=motivo_contrato)
-                return "contrato_invalido"
+                continue
+
+            def contabilizar(nome):
+                """Contador por estágio do ciclo (nunca inventa decisão)."""
+                self.contadores_ciclo[nome] = self.contadores_ciclo.get(nome, 0) + 1
+
+            # Pré-checagem determinística ANTES do JEv: custo/autorização.
+            pre = risk.bloqueio_spread(estado, self.book.limits)
+            if pre:
+                contabilizar("pre_bloqueado")
+                self.publicar("decisao", {"id": id_analise, "simbolo": simbolo,
+                                          "instante": _agora_iso(), "padrao": padrao["id"],
+                                          "candle_ref": instante_candle,
+                                          "direcao": regra["direcao"], "decisao": "NAO",
+                                          "oportunidade": texto,
+                                          "justificativa": f"Pré-checagem de risco: {pre}",
+                                          "risco": "não autorizado", "execucao": "nenhuma"})
+                return "pre_bloqueado"
             self.publicar("decisao", {"id": id_analise, "simbolo": simbolo, "instante": _agora_iso(),
-                                      "oportunidade": texto, "decisao": "CONSULTANDO JEV",
-                                      "justificativa": "Padrão validado localmente com condição verdadeira no candle fechado",
-                                      "risco": evidencia, "execucao": "-",
-                                      "padrao": padrao["id"], "candle_ref": instante_candle})
+                                      "padrao": padrao["id"], "candle_ref": instante_candle,
+                                      "direcao": regra["direcao"], "decisao": "CONSULTANDO",
+                                      "oportunidade": texto,
+                                      "justificativa": "Oportunidade elegível; consultando JEv",
+                                      "risco": evidencia, "execucao": "-"})
             self.logger.info("oportunidade detectada; consultando JEv", simbolo=simbolo,
                              padrao=padrao["id"], analysis_id=id_analise)
-            self.contadores_ciclo["aguardando_decisao"] = \
-                self.contadores_ciclo.get("aguardando_decisao", 0) + 1
+            contabilizar("aguardando_decisao")
+            contabilizar("enviados_jev")
             self._estado_set("ANALISANDO", f"Ciclo {self.ciclo} · DECIDINDO JEV {simbolo}",
                              registrar=False, fase="DECIDINDO_JEV")
             if self.relogio() < self.proxima_tentativa_jev:
                 self.publicar("decisao", {"id": id_analise, "simbolo": simbolo, "instante": _agora_iso(),
-                                          "oportunidade": texto, "decisao": "AGUARDANDO",
+                                          "padrao": padrao["id"], "candle_ref": instante_candle,
+                                          "direcao": regra["direcao"], "decisao": "HOLD",
+                                          "oportunidade": texto,
                                           "justificativa": "JEv indisponível; nova tentativa após recuo",
-                                          "risco": "-", "execucao": "-"})
+                                          "risco": "-", "execucao": "adiada"})
                 continue
             estado.mathematics = dict(estado.mathematics or {})
             estado.mathematics["oportunidade"] = contrato
@@ -1287,66 +1406,103 @@ class Orquestrador:
             try:
                 decisao = jev.decide(estado)
             except RuntimeError as exc:
-                self.contadores_ciclo["ia_indisponivel"] = \
-                    self.contadores_ciclo.get("ia_indisponivel", 0) + 1
+                contabilizar("ia_indisponivel")
                 self.proxima_tentativa_jev = self.relogio() + TENTATIVA_JEV_S
                 self.publicar("decisao", {"id": id_analise, "simbolo": simbolo, "instante": _agora_iso(),
-                                          "oportunidade": texto, "decisao": "AGUARDANDO",
-                                          "justificativa": str(exc), "risco": "-", "execucao": "-"})
+                                          "padrao": padrao["id"], "candle_ref": instante_candle,
+                                          "direcao": regra["direcao"], "decisao": "HOLD",
+                                          "oportunidade": texto, "justificativa": str(exc),
+                                          "risco": "-", "execucao": "adiada"})
                 self.logger.aviso("JEv indisponível", simbolo=simbolo, detalhe=str(exc)[:160])
                 continue
+            self.ultimos["decisao"] = agora
             self.logger.info("decisão JEv recebida", simbolo=simbolo, acao=decisao.action,
                              probabilidade=round(decisao.probability, 2),
                              confianca=round(decisao.confidence, 2), analysis_id=id_analise)
             atualizado = self.fonte.revalidar(estado)
             if atualizado is None:
                 self.publicar("decisao", {"id": id_analise, "simbolo": simbolo, "instante": _agora_iso(),
-                                          "oportunidade": texto, "decisao": "NÃO",
-                                          "justificativa": "Sem cotação recente após JEv; entrada não executa",
+                                          "padrao": padrao["id"], "candle_ref": instante_candle,
+                                          "direcao": regra["direcao"], "decisao": "NAO",
+                                          "oportunidade": texto,
+                                          "justificativa": "Sem cotação recente após JEv",
                                           "risco": "-", "execucao": "nenhuma"})
                 continue
             estado = atualizado
             gate = risk.check(decisao, self.book, self.book.limits, estado)
-            if decisao.action not in ("BUY", "SELL"):
-                self.contadores_ciclo["jev_nao"] = \
-                    self.contadores_ciclo.get("jev_nao", 0) + 1  # JEv decidiu NÃO
-            elif gate.verdict != "EXECUTE":
-                self.contadores_ciclo["risco_bloqueado"] = \
-                    self.contadores_ciclo.get("risco_bloqueado", 0) + 1
+            acao = decisao.action
+            # Resposta do JEv normalizada: SIM (BUY/SELL), NAO (AVOID) ou HOLD.
+            if acao == "HOLD":
+                contabilizar("jev_hold")
+                expira = agora + HOLD_TTL_S
+                self.holds[(simbolo, identificador)] = expira
+                self.publicar("decisao", {"id": id_analise, "simbolo": simbolo, "instante": _agora_iso(),
+                                          "padrao": padrao["id"], "candle_ref": instante_candle,
+                                          "direcao": regra["direcao"], "decisao": "HOLD",
+                                          "oportunidade": texto,
+                                          "justificativa": f"JEv HOLD p={decisao.probability:.0%} "
+                                                           f"c={decisao.confidence:.0%}; oportunidade adiada",
+                                          "risco": gate.reason or "aguardando",
+                                          "execucao": f"adiada por até {HOLD_TTL_S // 60}min, depois descartada"})
+                self.logger.info("JEv HOLD; oportunidade adiada", simbolo=simbolo,
+                                 padrao=padrao["id"], expira_em=round(expira))
+                motivos.append("hold")
+                continue
+            if acao == "AVOID":
+                contabilizar("jev_nao")
+                self.publicar("decisao", {"id": id_analise, "simbolo": simbolo, "instante": _agora_iso(),
+                                          "padrao": padrao["id"], "candle_ref": instante_candle,
+                                          "direcao": regra["direcao"], "decisao": "NAO",
+                                          "oportunidade": texto,
+                                          "justificativa": f"JEv AVOID p={decisao.probability:.0%} "
+                                                           f"c={decisao.confidence:.0%}; candidata descartada",
+                                          "risco": gate.reason or "-", "execucao": "nenhuma"})
+                motivos.append("jev_nao")
+                continue  # NÃO encerra apenas esta candidata; próximas seguem
+            # SIM: BUY/SELL aprovado pelo JEv; o gate decide a execução paper.
+            contabilizar("jev_sim")
             if gate.verdict == "EXECUTE":
-                self.contadores_ciclo["executadas"] = \
-                    self.contadores_ciclo.get("executadas", 0) + 1
+                contabilizar("executadas")
                 self.book.execute(decisao, estado, gate)
                 self.book.update(self.fonte)
                 self._persistir()
+                self.ultimos["trade"] = agora
                 self.publicar("decisao", {"id": id_analise, "simbolo": simbolo, "instante": _agora_iso(),
-                                          "oportunidade": texto, "decisao": f"SIM ({decisao.action})",
-                                          "justificativa": f"JEv aprovou p={decisao.probability:.0%} c={decisao.confidence:.0%}; padrão validado",
-                                          "risco": f"gate EXECUTE; risco {gate.risk_amount:.2f} {self.book.currency}",
-                                          "execucao": f"paper aberto: {gate.volume:g} lote(s) a {gate.entry:.8g}; stop {gate.stop:.8g}; alvo {gate.target:.8g}",
-                                          "padrao": padrao["id"], "candle_ref": instante_candle})
+                                          "padrao": padrao["id"], "candle_ref": instante_candle,
+                                          "direcao": acao, "decisao": "SIM",
+                                          "oportunidade": texto,
+                                          "justificativa": f"JEv SIM p={decisao.probability:.0%} "
+                                                           f"c={decisao.confidence:.0%}; padrão validado",
+                                          "risco": f"autorizado; risco {gate.risk_amount:.2f} {self.book.currency}",
+                                          "execucao": f"paper aberto: {gate.volume:g} lote(s) a {gate.entry:.8g}; stop {gate.stop:.8g}; alvo {gate.target:.8g}"})
                 self.publicar("trades", list(reversed(self.book.trades[-500:])))
                 self.logger.info("entrada paper aberta", simbolo=simbolo, volume=gate.volume,
                                  entrada=round(gate.entry, 8), analysis_id=id_analise,
                                  padrao=padrao["id"], candle_ref=instante_candle)
                 return "executada"
-            else:
-                if gate.verdict == "EXECUTE" or decisao.action in ("BUY", "SELL"):
-                    self.contadores_ciclo["jev_nao"] = \
-                        self.contadores_ciclo.get("jev_nao", 0) + 1
-                self.publicar("decisao", {"id": id_analise, "simbolo": simbolo, "instante": _agora_iso(),
-                                          "oportunidade": texto, "decisao": "NÃO",
-                                          "justificativa": f"JEv {decisao.action} p={decisao.probability:.0%} c={decisao.confidence:.0%} ou limite de risco recusou",
-                                          "risco": gate.reason or "-",
-                                          "execucao": "nenhuma",
-                                          "padrao": padrao["id"], "candle_ref": instante_candle})
-                self.logger.info("entrada recusada pelo gate de risco", simbolo=simbolo,
-                                 motivo=gate.reason or "-")
-                return "jev_nao"
-        if validados and not condicao_presente:
-            self.contadores_ciclo["validado_condicao_ausente"] = \
-                self.contadores_ciclo.get("validado_condicao_ausente", 0) + 1
-            return "condicao_ausente"
+            contabilizar("risco_bloqueado")
+            self.publicar("decisao", {"id": id_analise, "simbolo": simbolo, "instante": _agora_iso(),
+                                      "padrao": padrao["id"], "candle_ref": instante_candle,
+                                      "direcao": acao, "decisao": "SIM",
+                                      "oportunidade": texto,
+                                      "justificativa": f"JEv SIM p={decisao.probability:.0%} "
+                                                       f"c={decisao.confidence:.0%}; recusado pelo risco",
+                                      "risco": f"não autorizado: {gate.reason}",
+                                      "execucao": "nenhuma"})
+            self.logger.info("entrada recusada pelo gate de risco", simbolo=simbolo,
+                             motivo=gate.reason or "-")
+            motivos.append("risco_bloqueado")
+        # Motivo agregado do símbolo neste ciclo (prioridade: execução > hold
+        # > NAO > risco > contrato > condição ausente).
+        for prioridade in ("executada", "hold", "jev_nao", "risco_bloqueado",
+                           "contrato_invalido"):
+            if prioridade in motivos:
+                return prioridade
+        if condicao_presente:
+            return "condicao_presente_sem_decisao"
+        self.contadores_ciclo["validado_condicao_ausente"] = \
+            self.contadores_ciclo.get("validado_condicao_ausente", 0) + 1
+        return "condicao_ausente"
 
     def _candles_para_condicao(self, padrao, estado):
         """Escolhe a série para avaliar a condição no candle mais recente.

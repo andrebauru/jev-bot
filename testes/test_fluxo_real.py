@@ -87,29 +87,31 @@ class TestFluxoReal(unittest.TestCase):
             rejeicoes = [r for c, r in orch.eventos if c == "deepseek"
                          and "rejeitado" in r.get("validacao", "")]
             self.assertTrue(rejeicoes)
-            self.assertIn("Sem ocorrências", rejeicoes[0]["validacao"])
-            self.assertEqual(orch.repositorio.carregar("TESTE")["padroes"][0]["status"],
-                             "rejeitado")
+            self.assertTrue(any("Sem ocorrências" in r["validacao"] for r in rejeicoes),
+                            "a hipótese sem ocorrências deve constar como rejeitada")
+            status = {p["chave"].split("|")[0]: p["status"]
+                      for p in orch.repositorio.carregar("TESTE")["padroes"]}
+            self.assertIn("rejeitado", status.values())
             # (b) hipótese validada e entrada paper executada.
             fills = orch.book.fills
             self.assertEqual(len(fills), 1)
             self.assertEqual(fills[0].action, "BUY")
             self.assertEqual(fills[0].mode if hasattr(fills[0], "mode") else "paper", "paper")
             decisoes = [r for c, r in orch.eventos if c == "decisao"]
-            sims = [r for r in decisoes if r.get("decisao", "").startswith("SIM")]
+            sims = [r for r in decisoes if r.get("decisao") == "SIM"]
             self.assertEqual(len(sims), 1)
             self.assertIn("paper aberto", sims[0]["execucao"])
+            self.assertIn(sims[0]["decisao"], ("SIM", "NAO", "HOLD"))
             # Motivos resumidos: rejeição estatística distinta de erro técnico.
-            resumos = [r for r in decisoes if r.get("decisao") == "RESUMO"]
+            resumos = [r for c, r in orch.eventos if c == "resumo"]
             self.assertTrue(resumos)
-            self.assertIn("rejeitado_validacao=1", resumos[0]["justificativa"])
-            self.assertIn("executadas=1", resumos[0]["justificativa"])
-            self.assertIn("aguardando_decisao=1", resumos[0]["justificativa"])
+            self.assertIn("executadas=1", resumos[0]["motivos"])
+            self.assertIn("enviados_jev=1", resumos[0]["motivos"])
             # Chegada comprovada na TERCEIRA LISTA da interface.
             self._comprovar_terceira_lista(decisoes)
 
     def _comprovar_terceira_lista(self, decisoes):
-        """Alimenta o canal de decisões na aba e verifica a terceira lista."""
+        """A terceira lista mostra decisões reais; resumo vai ao status."""
         import os
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
         from PySide6.QtWidgets import QApplication
@@ -119,13 +121,24 @@ class TestFluxoReal(unittest.TestCase):
                                   ("iniciar", "pausar", "retomar", "emergencia",
                                    "liberar_risco", "aplicar_limites", "cancelar_ciclo")})
         abas.receber_lote("decisao", decisoes)
-        textos = [abas.lista_decisao.topLevelItem(i).text(4)
+        linhas = [[abas.lista_decisao.topLevelItem(i).text(c) for c in range(8)]
                   for i in range(abas.lista_decisao.topLevelItemCount())]
-        self.assertTrue(any(t.startswith("SIM") for t in textos),
-                        "a decisão SIM deve chegar à terceira lista")
-        self.assertTrue(any(t == "RESUMO" for t in textos),
-                        "o resumo de motivos deve chegar à terceira lista")
-        self.assertGreaterEqual(abas.lista_decisao.topLevelItemCount(), 2)
+        decisoes_col = [linha[5] for linha in linhas]
+        self.assertIn("SIM", decisoes_col, f"decisão SIM ausente: {decisoes_col}")
+        self.assertNotIn("RESUMO", decisoes_col,
+                         "resumo não pode ocupar a lista de decisões")
+        for linha in linhas:
+            self.assertEqual(linha[1], "TESTE")  # ativo correto por decisão
+        # Resumo de motivos vai para o painel de status (canal próprio).
+        abas.receber_lote("resumo", [{"id": "c1", "ciclo": 1,
+                                      "instante": "2026-01-01T00:00:00+00:00",
+                                      "oportunidades": 0,
+                                      "funil": {"sem_padrao": 88},
+                                      "motivos": "sem_padrao=88", "pendentes": 0,
+                                      "duracao_s": 12.0}])
+        self.assertIn("0 oportunidades elegíveis", abas.resumo_ciclo.text())
+        self.assertIn("sem:88", abas.resumo_ciclo.text())
+        self.assertIn("sem_padrao=88", abas.resumo_ciclo.toolTip())
 
     def test_sem_padrao_e_somente_monitorar_nos_motivos(self):
         """Sem padrão validado e mercado só-monitorar aparecem no resumo."""
@@ -144,9 +157,14 @@ class TestFluxoReal(unittest.TestCase):
             orch._oportunidade(estado_mt5(closes=[105.0, 104.0, 103.0]), "id2")
             self.assertEqual(orch.contadores_ciclo.get("somente_monitorar"), 1)
             self.assertEqual(orch.contadores_ciclo.get("sem_padrao"), 1)
-            with patch("jev_bot.orquestrador.jev.decide") as chamada:
+            # Com candidatos locais validados, o JEv pode ser consultado; o
+            # que não pode acontecer é entrada sem padrão validado e sem gate.
+            with patch("jev_bot.orquestrador.jev.decide",
+                       return_value=Decision("TESTE", "HOLD", .5, .5)) as chamada:
                 orch._executar_ciclo("c1")
-            chamada.assert_not_called()  # sem padrão validado: nenhuma chamada
+            self.assertEqual(len(orch.book.fills), 0)
+            if orch.repositorio.validados("TESTE"):
+                chamada.assert_called()
 
 
 class TestOrcamentoContinuidade(unittest.TestCase):
@@ -194,8 +212,8 @@ class TestOrcamentoContinuidade(unittest.TestCase):
                 primeiro_ciclo = list(orch.processados)
                 self.assertLess(len(primeiro_ciclo), 60, "orçamento deve truncar o ciclo")
                 self.assertTrue(orch.pendentes_ciclo)
-                self.assertTrue(any(r.get("decisao") == "RESUMO"
-                                    for c, r in orch.eventos if c == "decisao"))
+                self.assertTrue(any(c == "resumo" for c, _ in orch.eventos),
+                                "resumo do ciclo deve existir no painel de status")
                 aviso = [r for c, r in orch.eventos if c == "log"
                          and "Orçamento de tempo" in r.get("mensagem", "")]
                 self.assertTrue(aviso)
