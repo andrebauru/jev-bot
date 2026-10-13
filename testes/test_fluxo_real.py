@@ -189,6 +189,49 @@ class TestFluxoReal(unittest.TestCase):
             positions = [trace.index(stage) for stage in required_order]
             self.assertEqual(positions, sorted(positions), trace)
 
+    def test_worker_jev_sell_revalida_e_abre_paper(self):
+        """A resposta SELL percorre o mesmo worker, revalidação e gate paper."""
+        with tempfile.TemporaryDirectory() as pasta:
+            orch = self._orquestrador(pasta)
+            candles = candles_deterministicos()
+            regra = {"tipo_regra": "quedas_consecutivas", "parametros": {"n": 2},
+                     "direcao": "SELL", "horizonte_minutos": 5,
+                     "justificativa": "regra local sintética validada"}
+            validacao = padroes.validar(regra, candles, 0.02)
+            self.assertEqual(validacao["status"], "validado", validacao["motivo"])
+            orch.repositorio.registrar("TESTE", regra, validacao, "local", janela(candles))
+            orch.dados_ativo["TESTE"] = {
+                "instante": time.time(),
+                "stats": {"disponivel": True, "candles": len(candles), "dias": 30,
+                          "movimento_1min": {"mediana_pct": 0.01}},
+                "custo_pct": 0.02, "tail": candles[-720:],
+            }
+            estado = estado_mt5("TESTE", closes=[c["close"] for c in candles[-100:]])
+            estado.candles[-1]["time"] = candles[-1]["time"]
+            orch.fonte.estados = lambda: iter([estado])
+            respondeu = threading.Event()
+
+            def jev_sell(_estado):
+                respondeu.set()
+                return Decision("TESTE", "SELL", .9, .9)
+
+            with patch("jev_bot.deepseek.analisar",
+                       side_effect=AssertionError("DeepSeek proibido")), \
+                    patch("jev_bot.orquestrador.jev.decide", side_effect=jev_sell):
+                orch._ciclo()
+                self.assertTrue(respondeu.wait(2))
+                limite = time.monotonic() + 2
+                while orch.pendentes_jev and time.monotonic() < limite:
+                    orch._processar_resultados_jev()
+                    time.sleep(.005)
+                orch._processar_resultados_jev()
+            self.assertEqual(len(orch.book.fills), 1)
+            self.assertEqual(orch.book.fills[0].action, "SELL")
+            sells = [r for c, r in orch.eventos if c == "decisao" and r.get("decisao") == "SIM"]
+            self.assertEqual(len(sells), 1)
+            self.assertEqual(sells[0]["direcao"], "SELL")
+            self.assertEqual(sells[0]["paper"], "OPENED")
+
     def _comprovar_terceira_lista(self, decisoes):
         """A terceira lista mostra decisões reais; resumo vai ao status."""
         import os
