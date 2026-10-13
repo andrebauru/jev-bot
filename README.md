@@ -380,13 +380,7 @@ está verdadeira, sem esperar o TTL de 1 hora do aprendizado. Prioridade
 de processamento: ativos `Operar` antes dos demais `Monitorar`, com
 pendências do ciclo anterior preservadas (justiça, sem starvation).
 
-**Descoberta assíncrona por evento**: o DeepSeek é agendado em fila e
-executado APÓS as decisões do ciclo — nunca na rota de decisão. Gatilhos:
-revisão periódica (TTL 1h) OU mudança estatisticamente relevante
-(`candidatos.mudanca_relevante`: movimento médio, retorno da janela ou
-custo de spread alterados além de limiares fixos). Resumo idêntico ao
-anterior omite a chamada (sem gasto de tokens). Orçamento esgotado é
-sinalizado no painel e a operação continua com padrões já validados.
+**Descoberta não bloqueante**: o DeepSeek é agendado em fila e processado em fatias durante a espera entre ciclos (máximo 1 símbolo por iteração de 0,5s) - nunca na rota de decisão nem bloqueando o próximo ciclo. Gatilhos: revisão periódica (TTL 1h) OU mudança estatisticamente relevante (candidatos.mudanca_relevante: movimento médio, retorno da janela ou custo de spread alterados além de limiares fixos). Resumo idêntico ao anterior omite a chamada (sem gasto de tokens). Orçamento esgotado é sinalizado no painel e a operação continua com padrões já validados. O ciclo registra run_id único e resultado (CONCLUIDO/PARCIAL/CANCELADO/ERRO) com duração.
 
 **Decisão JEv tipada**: `jev.decide` registra modelo, latência (ms) e
 marca `calibracao=nao_calibrada` — probabilidades do modelo não são

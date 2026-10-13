@@ -317,5 +317,80 @@ class TestPoliticaPaper(unittest.TestCase):
             self.assertEqual(len(orch.book.fills), 0)
 
 
+
+
+class TestCiclosMulti(unittest.TestCase):
+    """Ciclos múltiplos com IDs crescentes e timeout JEv."""
+
+    def _orquestrador(self, pasta):
+        arquivo = Path(pasta) / "mercados.json"
+        mercados.salvar({"selecao": {"C": {"TESTE": {"monitorar": True,
+                                                     "operar": True}}}}, arquivo)
+        orch = Orquestrador(banco=Path(pasta) / "db.json",
+                            pasta_dados=Path(pasta) / "padroes",
+                            caminho_selecao=arquivo, relogio=time.time)
+        orch.logger = LoggerSilencioso()
+        orch.book = Book.load(Path(pasta) / "db.json", "USD")
+        orch.book.active = True
+        orch.repositorio = padroes.RepositorioPadroes(Path(pasta) / "padroes",
+                                                      relogio=time.time)
+        orch.orcamento = Mock()
+        orch.orcamento.consumo.return_value = {}
+        orch.eventos = []
+        orch.publicar = lambda canal, registro: orch.eventos.append((canal, registro))
+        candles = candles_deterministicos()
+        closes = [c["close"] for c in candles[-100:]]
+        orch.fonte = FonteFake(estados=[estado_mt5(closes=closes)],
+                               cotacoes={"TESTE": (99.995, 100.005, time.time())},
+                               janelas={"TESTE": janela(candles)})
+        v = padroes.validar({"tipo_regra": "quedas_consecutivas", "parametros": {"n": 3},
+                             "direcao": "BUY", "horizonte_minutos": 5}, candles, 0.02)
+        registro = orch.repositorio.registrar(
+            "TESTE", {"tipo_regra": "quedas_consecutivas", "parametros": {"n": 3},
+                      "direcao": "BUY", "horizonte_minutos": 5, "justificativa": "x"},
+            v, "local", janela(candles))
+        registro["status"] = "validado"
+        orch.repositorio.salvar("TESTE", orch.repositorio.carregar("TESTE"))
+        return orch, estado_mt5(closes=closes)
+
+    def test_tres_ciclos_ids_crescentes(self):
+        """Ciclo 1 → 2 → 3 com IDs crescentes e estados coerentes."""
+        with tempfile.TemporaryDirectory() as pasta:
+            orch, _ = self._orquestrador(pasta)
+            with patch("jev_bot.orquestrador.jev.decide",
+                       return_value=Decision("TESTE", "HOLD", .5, .5)):
+                orch._ciclo()
+                c1 = orch.ciclo
+                orch._ciclo()
+                c2 = orch.ciclo
+                orch._ciclo()
+                c3 = orch.ciclo
+            self.assertEqual((c1, c2, c3), (1, 2, 3))
+            estados = [r.get("estado") for c, r in orch.eventos if c == "estado"]
+            self.assertGreaterEqual(estados.count("ANALISANDO"), 2)
+            self.assertEqual(len(orch.book.fills), 0)  # HOLD não executa
+
+    def test_jev_timeout_resulta_sem_decisao(self):
+        """JEv timeout: SEM_DECISAO; novo candle → JEv funciona."""
+        with tempfile.TemporaryDirectory() as pasta:
+            orch, estado = self._orquestrador(pasta)
+            from apoio import candles_deterministicos
+            candles = candles_deterministicos()
+            with patch("jev_bot.orquestrador.jev.decide",
+                       side_effect=RuntimeError("timeout JEv")):
+                orch._oportunidade(estado, "id1")
+            self.assertGreaterEqual(
+                orch.contadores_ciclo.get("ia_indisponivel", 0), 1,
+                "timeout JEv deve incrementar ia_indisponivel")
+            self.assertEqual(len(orch.book.fills), 0)
+            estado2 = estado_mt5(closes=[c["close"] for c in candles[-100:]])
+            estado2.candles[-1]["time"] = estado.candles[-1]["time"] + 60
+            with patch("jev_bot.orquestrador.jev.decide",
+                       return_value=Decision("TESTE", "BUY", .9, .9)):
+                motivo2 = orch._oportunidade(estado2, "id2")
+            self.assertIn(motivo2, ("executada", "risco_bloqueado",
+                                    "condicao_presente_sem_decisao"))
+            self.assertEqual(orch.contadores_ciclo.get("ia_indisponivel"), 1)
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

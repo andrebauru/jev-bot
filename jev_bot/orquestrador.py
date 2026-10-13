@@ -532,6 +532,24 @@ class Orquestrador:
             self.descarregar()
             if self.pausado or self.parado_risco or self.emergencia_ativa:
                 return True
+            # Descoberta DeepSeek: 1 símbolo por iteração de espera
+            # (não bloqueante; o próximo ciclo nunca aguarda a IA).
+            if (self.deepseek_configurado and self.fila_deepseek
+                    and not self._cancelado_ciclo() and not self.parado_risco):
+                simbolo_ds, hash_ds = self.fila_deepseek.pop(0)
+                cache_ds = self.dados_ativo.get(simbolo_ds)
+                candles_ds = self.cache_m1.carregar(simbolo_ds)
+                if cache_ds is not None and candles_ds and cache_ds.get("stats") is not None:
+                    self.contadores_ciclo["deepseek_enviados"] = \
+                        self.contadores_ciclo.get("deepseek_enviados", 0) + 1
+                    try:
+                        self._etapa_deepseek(simbolo_ds, candles_ds, cache_ds,
+                                             cache_ds["stats"], f"ciclo{self.ciclo}",
+                                             hash_resumo=hash_ds)
+                    except (RuntimeError, ValueError, KeyError) as exc:
+                        self.logger.aviso("DeepSeek na fila falhou",
+                                          simbolo=simbolo_ds, detalhe=str(exc)[:120])
+                self.descarregar()
             restante = alvo - self.relogio()
             if restante <= 0:
                 return False
@@ -867,18 +885,48 @@ class Orquestrador:
         inicio_ciclo = self.relogio()
         self.ciclo += 1
         id_ciclo = f"ciclo{self.ciclo}"
-        self.logger.info("ciclo iniciado", ciclo=self.ciclo, analysis_id=id_ciclo)
+        run_id = __import__("uuid").uuid4().hex[:8]
+        resultado_ciclo = "CONCLUIDO"
+        self.logger.info("ciclo iniciado", ciclo=self.ciclo, analysis_id=id_ciclo,
+                         run_id=run_id)
         self._estado_set("ANALISANDO", f"Ciclo {self.ciclo}", fase="VARRENDO")
         try:
             self._executar_ciclo(id_ciclo)
+            if self.evento_ciclo_cancelado.is_set():
+                resultado_ciclo = "CANCELADO"
+            elif self.pendentes_ciclo:
+                resultado_ciclo = "PARCIAL"
+        except RuntimeError as exc:
+            resultado_ciclo = "ERRO"
+            self.logger.erro("ciclo com erro", ciclo=self.ciclo, detalhe=str(exc)[:160])
         finally:
             self.ciclo_ativo = False
+            duracao = round(self.relogio() - inicio_ciclo, 1)
             if self.evento_ciclo_cancelado.is_set():
+                resultado_ciclo = "CANCELADO"
                 self.logger.aviso("ciclo cancelado pelo operador", ciclo=self.ciclo)
                 self.publicar("log", {"instante": _agora_iso(), "nivel": "aviso",
                                       "mensagem": "Ciclo cancelado pelo operador; restante adiado para o próximo ciclo"})
             self.descarregar()
-            self.logger.info("ciclo concluído", ciclo=self.ciclo)
+            self.publicar("resumo", {"id": id_ciclo, "ciclo": self.ciclo,
+                                     "run_id": run_id, "instante": _agora_iso(),
+                                     "resultado": resultado_ciclo,
+                                     "oportunidades": self.contadores_ciclo.get("enviados_jev", 0),
+                                     "motivos": "; ".join(f"{k}={v}" for k, v in sorted(self.contadores_ciclo.items())) or "sem candidatos monitorados",
+                                     "funil": {e: self.contadores_ciclo[e] for e in (
+                                         "candidatos", "candidatos_locais", "locais_validados",
+                                         "deepseek_enviados", "hipoteses_recebidas",
+                                         "rejeitado_validacao", "elegiveis", "enviados_jev",
+                                         "jev_sim", "jev_nao", "jev_hold", "executadas",
+                                         "pre_bloqueado", "risco_bloqueado", "sem_padrao",
+                                         "hold_aguardando", "hold_expirado", "erros")
+                                         if self.contadores_ciclo.get(e)},
+                                     "tempos": {chave: (round(self.relogio() - valor, 1) if valor else None)
+                                                for chave, valor in self.ultimos.items()},
+                                     "pendentes": len(self.pendentes_ciclo),
+                                     "duracao_s": duracao, "resultado": resultado_ciclo})
+            self.logger.info("ciclo concluído", ciclo=self.ciclo, resultado=resultado_ciclo,
+                             duracao_s=duracao, run_id=run_id)
 
     def _executar_ciclo(self, id_ciclo):
         # Orçamento de tempo: varredura de 90+ símbolos pode ultrapassar a
@@ -978,21 +1026,28 @@ class Orquestrador:
         # Descoberta por evento: roda DEPOIS das decisões do ciclo, limitada
         # por DEEPSEEK_POR_CICLO; rate limit/timeout não bloqueiam o trading
         # (que já avaliou padrões validados e candidatos locais neste ciclo).
+        # Fila DeepSeek: processada aqui (pós-varredura) com orçamento de
+        # tempo; o restante é processado em _aguardar_slot (não bloqueante).
         if self.deepseek_configurado and self.fila_deepseek \
                 and not self._cancelado_ciclo() and not self.parado_risco:
             envio = self.fila_deepseek[:DEEPSEEK_POR_CICLO]
-            for simbolo, hash_resumo in envio:
+            for simbolo_ds, hash_ds in envio:
                 if self._cancelado_ciclo() or self.parado_risco:
                     break
-                cache = self.dados_ativo.get(simbolo)
-                candles = self.cache_m1.carregar(simbolo)
-                if cache is None or not candles or cache.get("stats") is None:
-                    self.logger.aviso("fila DeepSeek sem janela disponível", simbolo=simbolo)
+                cache_ds = self.dados_ativo.get(simbolo_ds)
+                candles_ds = self.cache_m1.carregar(simbolo_ds)
+                if cache_ds is None or not candles_ds or cache_ds.get("stats") is None:
+                    self.logger.aviso("fila DeepSeek sem janela disponível", simbolo=simbolo_ds)
                     continue
                 self.contadores_ciclo["deepseek_enviados"] = \
                     self.contadores_ciclo.get("deepseek_enviados", 0) + 1
-                self._etapa_deepseek(simbolo, candles, cache, cache["stats"],
-                                     id_ciclo, hash_resumo=hash_resumo)
+                try:
+                    self._etapa_deepseek(simbolo_ds, candles_ds, cache_ds,
+                                         cache_ds["stats"], id_ciclo,
+                                         hash_resumo=hash_ds)
+                except (RuntimeError, ValueError, KeyError) as exc:
+                    self.logger.aviso("DeepSeek na fila falhou", simbolo=simbolo_ds,
+                                      detalhe=str(exc)[:120])
                 self.descarregar()
             self.fila_deepseek = self.fila_deepseek[DEEPSEEK_POR_CICLO:]
         # Pendências para o próximo ciclo: monitorados não processados nesta rodada.
