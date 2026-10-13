@@ -167,6 +167,28 @@ class TestGui(unittest.TestCase):
                             for label in janela.statusBar().findChildren(QLabel)))
         janela.orquestrador.parar()
 
+    def test_diagnostico_funil_mostra_zeros_e_primeiras_rejeicoes(self):
+        from jev_bot.gui.aba_operacao import AbaOperacao
+        aba = AbaOperacao(acoes={k: (lambda: None) for k in
+                                 ("iniciar", "pausar", "retomar", "emergencia",
+                                  "liberar_risco", "aplicar_limites", "cancelar_ciclo")})
+        totais = {k: 0 for k in ("symbol_selected", "symbol_operable", "symbol_available_mt5",
+                                 "fetch_ok", "candidate_generated", "quant_validated",
+                                 "queue_enqueued", "jev_request_started", "jev_response_received",
+                                 "decision_buy", "decision_sell", "decision_hold", "decision_no",
+                                 "paper_opened")}
+        aba.receber_metricas({"estado": "ANALISANDO", "diagnostico_funil": {
+            "totais": totais,
+            "motivos_rejeicao_top3": [{"codigo": "OOS_RATE_BELOW_MIN", "quantidade": 4}],
+            "ultimo_envio_jev_age_s": None, "idade_fila_s": 0,
+            "ultima_resposta_jev_age_s": None, "fila_size": 0, "worker_alive": False}})
+        texto = aba.diagnostico_funil.text()
+        self.assertIn("selecionados 0", texto)
+        self.assertIn("respostas 0", texto)
+        self.assertIn("OOS_RATE_BELOW_MIN:4", texto)
+        self.assertIn("último envio: nunca", texto)
+        self.assertIn("idade da fila: 0s", texto)
+
     def test_splitters_redimensionaveis_em_janela_normal_e_reduzida(self):
         """Conteúdo de operação mantém listas utilizáveis em dimensões variadas."""
         from PySide6.QtWidgets import QWidget, QVBoxLayout, QSplitter

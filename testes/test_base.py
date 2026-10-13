@@ -9,6 +9,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
+from urllib.error import HTTPError
 from unittest.mock import Mock, patch
 
 from jev_bot import jev
@@ -310,6 +311,38 @@ class TestFonte(unittest.TestCase):
         api.order_calc_profit.return_value = None
         self.assertIsNone(fonte._estado(info, (100, 100.01, 100000)))
 
+    def test_revalidar_exige_mesmo_candle_m1_fechado(self):
+        """Candle ainda atual mantém cotação; barra nova torna snapshot obsoleto."""
+        api = Mock()
+        api.TIMEFRAME_M1 = 1
+        api.ORDER_TYPE_BUY, api.ORDER_TYPE_SELL = 0, 1
+        api.order_calc_profit.return_value = -100
+        api.order_calc_margin.return_value = 1000
+        api.symbol_info.return_value = SimpleNamespace(name="EURUSD", trade_mode=4)
+        api.symbol_info_tick.return_value = SimpleNamespace(
+            time_msc=100000 * 1000, time=100000, bid=100, ask=100.01)
+        barra = {"time": 99940, "open": 100, "high": 101, "low": 99,
+                 "close": 100.1, "tick_volume": 10}
+        api.copy_rates_from_pos.return_value = [barra]
+        fonte = FonteMT5(api=api, ajuste_horas=0, relogio=lambda: 100000)
+        snapshot = estado(candles=[dict(barra)])
+        atualizado = fonte.revalidar(snapshot)
+        self.assertIs(atualizado, snapshot)
+        api.copy_rates_from_pos.assert_called_once_with("EURUSD", 1, 1, 1)
+
+        api.copy_rates_from_pos.return_value = [{**barra, "time": 100000}]
+        self.assertIsNone(fonte.revalidar(snapshot))
+
+    def test_revalidar_falha_fechado_sem_barra_atual(self):
+        api = Mock()
+        api.TIMEFRAME_M1 = 1
+        api.symbol_info.return_value = SimpleNamespace(trade_mode=4)
+        api.symbol_info_tick.return_value = SimpleNamespace(
+            time_msc=100000 * 1000, time=100000, bid=100, ask=100.01)
+        api.copy_rates_from_pos.return_value = None
+        fonte = FonteMT5(api=api, ajuste_horas=0, relogio=lambda: 100000)
+        self.assertIsNone(fonte.revalidar(estado(candles=[{"time": 99940}])))
+
     def test_historico_antigo_nao_e_analisado(self):
         """Mesmo com tick novo, candles antigos não alimentam uma decisão."""
         api = Mock()
@@ -344,6 +377,38 @@ class TestFonte(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 jev.decide(estado())
             chamada.assert_called_once()
+
+    def test_jev_errors_tipados_sem_chamada_real(self):
+        """HTTP 401/429/500, timeout e JSON ruim mantêm estágios explícitos."""
+        for status in (401, 429, 500):
+            with self.subTest(http=status), \
+                    patch.dict("os.environ", {"OPENROUTER_API_KEY": "mock"}, clear=True), \
+                    patch("jev_bot.jev.carregar_ambiente"), \
+                    patch("jev_bot.jev.urlopen",
+                          side_effect=HTTPError("", status, "erro mockado", None, None)):
+                with self.assertRaises(jev.JevError) as err:
+                    jev.decide(estado())
+                self.assertEqual(err.exception.code, f"HTTP_{status}")
+                self.assertEqual(err.exception.stage, "http_error")
+        with patch.dict("os.environ", {"OPENROUTER_API_KEY": "mock"}, clear=True), \
+                patch("jev_bot.jev.carregar_ambiente"), \
+                patch("jev_bot.jev.urlopen", side_effect=TimeoutError()):
+            with self.assertRaises(jev.JevError) as err:
+                jev.decide(estado())
+            self.assertEqual(err.exception.code, "JEv_TIMEOUT")
+            self.assertEqual(err.exception.stage, "timeout")
+
+        resposta = Mock()
+        resposta.__enter__ = Mock(return_value=resposta)
+        resposta.__exit__ = Mock(return_value=False)
+        resposta.read.return_value = b"not-json"
+        with patch.dict("os.environ", {"OPENROUTER_API_KEY": "mock"}, clear=True), \
+                patch("jev_bot.jev.carregar_ambiente"), \
+                patch("jev_bot.jev.urlopen", return_value=resposta):
+            with self.assertRaises(jev.JevError) as err:
+                jev.decide(estado())
+            self.assertEqual(err.exception.code, "JEv_PARSE_ERROR")
+            self.assertEqual(err.exception.stage, "parse_error")
 
 
 class TestConfiguracao(unittest.TestCase):

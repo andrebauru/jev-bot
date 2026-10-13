@@ -59,7 +59,7 @@ class TestDecisoesOperacionais(unittest.TestCase):
 
     def setUp(self):
         """Proíbe chamadas reais de IA por padrão em todos os testes."""
-        for alvo in ("jev_bot.orquestrador.deepseek.analisar",
+        for alvo in ("jev_bot.deepseek.analisar",
                      "jev_bot.orquestrador.jev.decide"):
             guarda = patch(alvo, side_effect=AssertionError("chamada real de IA em teste"))
             guarda.start()
@@ -203,7 +203,7 @@ class TestDecisoesOperacionais(unittest.TestCase):
             orch, candles, closes = self._orquestrador(pasta)
             orch.deepseek_configurado = True
             orch.orcamento.permitir.return_value = (False, "Limite de chamadas DeepSeek por hora atingido")
-            with patch("jev_bot.orquestrador.deepseek.analisar",
+            with patch("jev_bot.deepseek.analisar",
                        side_effect=AssertionError("rate limit não pode chamar a API")), \
                     patch("jev_bot.orquestrador.jev.decide",
                           return_value=Decision("TESTE", "BUY", .9, .9)) as chamada_jev:

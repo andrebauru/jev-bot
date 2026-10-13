@@ -102,7 +102,7 @@ try:
             patch("jev_bot.orquestrador.jev.configuracao", return_value=("chave", "endpoint")), \
             patch("jev_bot.orquestrador.jev.decide",
                   side_effect=RuntimeError("JEv desativado na verificação")), \
-            patch("jev_bot.orquestrador.deepseek.configuracao_chat",
+            patch("jev_bot.deepseek.configuracao_chat",
                   side_effect=RuntimeError("desativado na verificação")), \
             patch.object(Orquestrador, "_proximo_alvo", lambda self, a: (a + 1.0, "verificação")):
         janela.show()

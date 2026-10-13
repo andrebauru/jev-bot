@@ -130,7 +130,7 @@ class TestAutostart(unittest.TestCase):
             orch = self._orquestrador(pasta)
             orch.intervalo_com_posicoes = 2
             with patch("jev_bot.orquestrador.FonteMT5", return_value=ContextoFonte()), \
-                    patch("jev_bot.orquestrador.deepseek.configuracao_chat",
+                    patch("jev_bot.deepseek.configuracao_chat",
                           side_effect=RuntimeError("sem chave")), \
                     patch.object(Orquestrador, "_proximo_alvo",
                                  lambda self, agora: (agora + 1.0, "teste")):

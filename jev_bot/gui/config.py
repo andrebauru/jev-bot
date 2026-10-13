@@ -12,7 +12,7 @@ import json
 import subprocess
 import sys
 
-from .. import configuracao, deepseek
+from .. import configuracao
 
 SERVICO = configuracao.SERVICO_KEYRING
 
@@ -139,5 +139,5 @@ def testar_mt5(caminho, timeout=60):
 
 
 def testar_openrouter(chave=None, modelo=None):
-    """Testa chave e modelo na API pública/privada do OpenRouter."""
-    return deepseek.testar_conexao(chave=chave, modelo=modelo)
+    """Retém a assinatura antiga sem chamar DeepSeek/OpenRouter."""
+    return {"ok": False, "erro": "Teste DeepSeek desativado; nenhuma chamada de rede foi feita."}

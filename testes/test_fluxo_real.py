@@ -8,6 +8,7 @@ com continuidade incremental e cache incremental M1 (hit/miss).
 """
 
 import tempfile
+import threading
 import time
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -92,7 +93,7 @@ class TestFluxoReal(unittest.TestCase):
             orch.fonte.janela_m1 = lambda simbolo, **_kwargs: (
                 janela(candles) if simbolo == "TESTE" else None)
             decisao = Decision("TESTE", "BUY", .9, .9)
-            with patch("jev_bot.orquestrador.deepseek.analisar",
+            with patch("jev_bot.deepseek.analisar",
                        side_effect=AssertionError("DeepSeek desativado")) as chamada_ds, \
                      patch("jev_bot.orquestrador.jev.decide",
                            side_effect=lambda estado: (ordem.append(f"jev:{estado.symbol}") or decisao)) as chamada_jev:
@@ -127,6 +128,66 @@ class TestFluxoReal(unittest.TestCase):
             self.assertIn("enviados_jev=1", resumos[0]["motivos"])
             # Chegada comprovada na lista exclusiva de decisões JEv.
             self._comprovar_terceira_lista(decisoes)
+
+    def test_worker_jev_buy_revalida_e_abre_paper(self):
+        """Despacho assíncrono real do motor, resposta mockada, gate e paper."""
+        with tempfile.TemporaryDirectory() as pasta:
+            orch = self._orquestrador(pasta)
+            candles = candles_deterministicos()
+            regra = {"tipo_regra": "quedas_consecutivas", "parametros": {"n": 3},
+                     "direcao": "BUY", "horizonte_minutos": 5,
+                     "justificativa": "regra local sintética validada"}
+            validacao = padroes.validar(regra, candles, 0.02)
+            self.assertEqual(validacao["status"], "validado", validacao["motivo"])
+            orch.repositorio.registrar("TESTE", regra, validacao, "local", janela(candles))
+            orch.dados_ativo["TESTE"] = {
+                "instante": time.time(),
+                "stats": {"disponivel": True, "candles": len(candles), "dias": 30,
+                          "movimento_1min": {"mediana_pct": 0.01}},
+                "custo_pct": 0.02, "tail": candles[-720:],
+            }
+            closes = [c["close"] for c in candles[-100:]]
+            estado = estado_mt5("TESTE", closes=closes)
+            estado.candles[-1]["time"] = candles[-1]["time"]
+            orch.fonte.estados = lambda: iter([estado])
+            resolvida = threading.Event()
+
+            def jev_mock(_estado):
+                resolvida.set()
+                return Decision("TESTE", "BUY", .9, .9)
+
+            with patch("jev_bot.deepseek.analisar",
+                       side_effect=AssertionError("DeepSeek proibido")) as deepseek_call, \
+                    patch("jev_bot.orquestrador.jev.decide", side_effect=jev_mock) as jev_call:
+                orch._ciclo()
+                self.assertTrue(resolvida.wait(2), "worker não chamou o mock JEv")
+                limite = time.monotonic() + 2
+                while orch.pendentes_jev and time.monotonic() < limite:
+                    orch._processar_resultados_jev()
+                    time.sleep(.005)
+                orch._processar_resultados_jev()
+            jev_call.assert_called_once()
+            deepseek_call.assert_not_called()
+            self.assertEqual(len(orch.book.fills), 1)
+            opened = [r for c, r in orch.eventos if c == "decisao" and r.get("decisao") == "SIM"]
+            self.assertEqual(len(opened), 1)
+            self.assertEqual(opened[0]["simbolo"], "TESTE")
+            self.assertTrue(opened[0]["run_id"])
+            self.assertTrue(opened[0]["candle_ref"])
+            self.assertGreaterEqual(opened[0]["latencia_ms"], 0)
+            self.assertEqual(orch.funil_total["queue_enqueued"], 1)
+            self.assertEqual(orch.funil_total["worker_dequeued"], 1)
+            self.assertEqual(orch.funil_total["jev_response_received"], 1)
+            self.assertEqual(orch.funil_total["response_accepted"], 1)
+            self.assertEqual(orch.funil_total["paper_opened"], 1)
+            trace = [e["etapa"] for e in orch.funil_eventos
+                     if e.get("run_id") == opened[0]["run_id"]]
+            required_order = ("quant_validated", "eligible_for_jev", "queue_enqueue_attempt",
+                              "queue_enqueued", "worker_dequeued", "jev_request_started",
+                              "jev_http_success", "jev_response_received", "response_accepted",
+                              "decision_buy", "paper_opened")
+            positions = [trace.index(stage) for stage in required_order]
+            self.assertEqual(positions, sorted(positions), trace)
 
     def _comprovar_terceira_lista(self, decisoes):
         """A terceira lista mostra decisões reais; resumo vai ao status."""

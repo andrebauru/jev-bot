@@ -247,20 +247,42 @@ def validar(regra, candles, custo_pct):
     estabilidade = {"oos_primeira_metade": oos_1, "oos_segunda_metade": oos_2}
     if total["eventos"] == 0:
         return {"status": "rejeitado", "motivo": "Sem ocorrências na janela",
+                "reason_code": "NO_OCCURRENCES",
+                "reason_codes": ["NO_OCCURRENCES"],
                 "total": total, "amostra": amostra, "oos": oos,
                 "estabilidade": estabilidade, "custo_pct": custo_pct,
+                "cost_basis": "spread_only",
                 "wilson_inferior": None}
     if total["eventos"] < MIN_EVENTOS or oos["eventos"] < MIN_EVENTOS_OOS:
         return {"status": "rejeitado", "motivo": "Amostra insuficiente",
+                "reason_code": "INSUFFICIENT_SAMPLE",
+                "reason_codes": ["INSUFFICIENT_SAMPLE"],
                 "total": total, "amostra": amostra, "oos": oos,
                 "estabilidade": estabilidade, "custo_pct": custo_pct,
+                "cost_basis": "spread_only",
                 "wilson_inferior": round(wilson_inferior(total["acertos"], total["eventos"]), 4)}
     aprovado = (amostra["taxa"] >= MIN_TAXA and oos["taxa"] >= MIN_TAXA and total["media_pct"] > 0)
-    motivo = ("Evidência dentro e fora da amostra" if aprovado
-              else "Taxa/expectativa abaixo do mínimo fora da amostra")
+    if aprovado:
+        motivo = "Evidência dentro e fora da amostra"
+        reason_code = "QUANT_VALIDATED"
+        reason_codes = [reason_code]
+    else:
+        motivo = "Taxa/expectativa abaixo do mínimo fora da amostra"
+        reason_codes = []
+        if amostra["taxa"] < MIN_TAXA:
+            reason_codes.append("IN_SAMPLE_RATE_BELOW_MIN")
+        if oos["taxa"] < MIN_TAXA:
+            reason_codes.append("OOS_RATE_BELOW_MIN")
+        if total["media_pct"] <= 0:
+            reason_codes.append("COST_EXCEEDS_GROSS_EDGE"
+                                if total["media_pct"] + custo_pct > 0
+                                else "EXPECTED_NET_RETURN_NONPOSITIVE")
+        reason_code = reason_codes[0] if reason_codes else "QUANT_VALIDATION_FAILED"
     return {"status": "validado" if aprovado else "rejeitado", "motivo": motivo,
+            "reason_code": reason_code,
+            "reason_codes": reason_codes,
             "total": total, "amostra": amostra, "oos": oos, "estabilidade": estabilidade,
-            "custo_pct": custo_pct,
+            "custo_pct": custo_pct, "cost_basis": "spread_only",
             "wilson_inferior": round(wilson_inferior(total["acertos"], total["eventos"]), 4)}
 
 
@@ -294,6 +316,9 @@ def contrato_oportunidade(padrao, candles, analysis_id, risk_context, agora=None
         "janela": [padrao.get("janela_inicio"), padrao.get("janela_fim")],
         "eventos": eventos, "fora_amostra": fora,
         "custo_spread_pct": padrao.get("custo_spread_pct"),
+        "cost_basis": padrao.get("cost_basis", "spread_only"),
+        "commission_pct": padrao.get("commission_pct"),
+        "slippage_pct": padrao.get("slippage_pct"),
         "wilson_inferior": padrao.get("wilson_inferior"),
         "reference_price": close_referencia,
     }
@@ -313,6 +338,10 @@ def contrato_oportunidade(padrao, candles, analysis_id, risk_context, agora=None
         "sample_size": eventos.get("eventos", 0),
         "out_of_sample_metrics": fora,
         "expected_net_return": eventos.get("media_pct", 0.0),
+        "expected_net_return_basis": evidencia["cost_basis"],
+        "cost_components": {"spread_pct": padrao.get("custo_spread_pct"),
+                             "commission_pct": padrao.get("commission_pct"),
+                             "slippage_pct": padrao.get("slippage_pct")},
         "direction": regra["direcao"],
         "reference_price": close_referencia,
         "expiry": validade,
@@ -447,6 +476,9 @@ class RepositorioPadroes:
             "eventos": validacao["total"], "amostra": validacao["amostra"],
             "fora_amostra": validacao["oos"], "wilson_inferior": validacao["wilson_inferior"],
             "custo_spread_pct": validacao.get("custo_pct"),
+            "cost_basis": validacao.get("cost_basis", "spread_only"),
+            "commission_pct": validacao.get("commission_pct"),
+            "slippage_pct": validacao.get("slippage_pct"),
             "validado_em": agora,
         })
         registro["historico_status"].append({"em": agora, "status": validacao["status"],

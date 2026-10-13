@@ -215,6 +215,11 @@ class AbaOperacao(QWidget):
         self.resumo_ciclo = QLabel("")
         self.resumo_ciclo.setWordWrap(True)
         self.resumo_ciclo.setStyleSheet("color:#7aa2f7;")
+        self.diagnostico_funil = QLabel("Funil: selecionados 0 → dados válidos 0 → candidatos 0 → "
+                                        "validados 0 → enfileirados 0 → JEv 0 → respostas 0 → "
+                                        "decisões 0 → paper 0")
+        self.diagnostico_funil.setWordWrap(True)
+        self.diagnostico_funil.setStyleSheet("color:#a9b8d0; font-size:9pt;")
         self.progresso_download = QLabel("")
         self.progresso_download.setStyleSheet("color:#8ea3c8;")
         self.mensagem = QLabel("")
@@ -222,6 +227,7 @@ class AbaOperacao(QWidget):
         self.mensagem.setWordWrap(True)
         raiz.addWidget(grupo_metricas)
         raiz.addWidget(self.resumo_ciclo)
+        raiz.addWidget(self.diagnostico_funil)
         raiz.addWidget(self.progresso_download)
         raiz.addWidget(self.mensagem)
 
@@ -359,6 +365,39 @@ class AbaOperacao(QWidget):
         self._definir("equity", _fmt_moeda(m.get("equity", 0), moeda))
         self._definir("saldo", _fmt_moeda(m.get("saldo", 0), moeda))
         self._cor_valor("aberto", m.get("aberto", 0), moeda)
+        diag = m.get("diagnostico_funil") or {}
+        totais = diag.get("totais") or {}
+        decisoes = sum(totais.get(k, 0) for k in
+                       ("decision_buy", "decision_sell", "decision_hold", "decision_no"))
+        motivos = diag.get("motivos_rejeicao_top3") or []
+        top = ", ".join(f"{r.get('codigo')}:{r.get('quantidade', 0)}" for r in motivos) or "nenhum"
+        codigos = diag.get("motivos_codigo") or {}
+        categorias = (f"SEM_SETUP {codigos.get('SEM_SETUP', 0)} · "
+                      f"SEM_DADOS {codigos.get('SEM_DADOS', 0)} · "
+                      f"SEM_ELEGIBILIDADE {codigos.get('SEM_ELEGIBILIDADE', 0)} · "
+                      f"FILA_BLOQUEADA {codigos.get('FILA_BLOQUEADA', 0)} · "
+                      f"IA_INDISPONIVEL {codigos.get('IA_INDISPONIVEL', 0)} · "
+                      f"SEM_DECISAO {codigos.get('SEM_DECISAO', 0)} · "
+                      f"VETO_RISCO {codigos.get('VETO_RISCO', 0)}")
+        envio = diag.get("ultimo_envio_jev_age_s")
+        resposta = diag.get("ultima_resposta_jev_age_s")
+        envio_txt = f"há {envio:g}s" if envio is not None else "nunca"
+        resposta_txt = f"há {resposta:g}s" if resposta is not None else "nunca"
+        self.diagnostico_funil.setText(
+            "Funil (sessão): "
+            f"selecionados {totais.get('symbol_selected', 0)} → "
+            f"operáveis {totais.get('symbol_operable', 0)} → "
+            f"dados válidos {totais.get('symbol_available_mt5', 0)} → "
+            f"candidatos {totais.get('candidate_generated', 0)} → "
+            f"aprovados {totais.get('quant_validated', 0)} "
+            f"(sem elegibilidade {totais.get('ineligible_for_jev', 0)}) → "
+            f"enfileirados {totais.get('queue_enqueued', 0)} → "
+            f"chamadas JEv {totais.get('jev_request_started', 0)} → "
+            f"respostas {totais.get('jev_response_received', 0)} → "
+            f"decisões {decisoes} → paper {totais.get('paper_opened', 0)}\n"
+            f"Rejeições mais comuns: {top} | códigos: {categorias} | último envio: {envio_txt} | "
+            f"idade da fila: {diag.get('idade_fila_s', 0):g}s | última resposta: {resposta_txt}\n"
+            "Custo da validação: spread observado; comissão/slippage não estimados")
         exposicao = m.get("exposicao", 0)
         self._definir("exposicao_txt", f"{_fmt_moeda(exposicao, moeda)} "
                                        f"({m.get('exposicao_fracao', 0):.1%})")
@@ -418,7 +457,11 @@ class AbaOperacao(QWidget):
                 texto_amostra = (f"{amostra.get('candles', '-')}/"
                                  f"{amostra.get('solicitados', '?')} candles"
                                  if isinstance(amostra, dict) and r.get("etapa") == "janela"
-                                 else f"{amostra['candles']} candles / {amostra['dias']}d"
+                                  else (f"treino {amostra['candles']}c/{amostra['dias']}d · "
+                                        f"janela {amostra.get('candles_janela', '?')}c/"
+                                        f"{amostra.get('dias_janela', '?')}d"
+                                        if isinstance(amostra, dict) and "dias_janela" in amostra
+                                        else f"{amostra['candles']} candles / {amostra['dias']}d")
                                  if isinstance(amostra, dict) else "-")
                 if r.get("etapa") == "janela":
                     self.progresso_download.setText(
@@ -436,7 +479,9 @@ class AbaOperacao(QWidget):
                 itens.append(([r.get("simbolo") or "-", _fmt_horario(r.get("instante")),
                                r.get("estado") or "-", r.get("motivo") or "-", r.get("id") or "-"],
                               VERDE if r.get("motivo") in ("PAPER_EXECUTED", "DECISION_SIM")
-                              else VERMELHO if r.get("motivo") in ("NO_SETUP", "RISK_BLOCK", "ERRO")
+                              else VERMELHO if r.get("motivo") in (
+                                  "NO_SETUP", "SEM_SETUP", "RISK_BLOCK", "VETO_RISCO",
+                                  "ERRO", "ERRO_API", "FILA_BLOQUEADA")
                               else None))
             elif canal == "decisao":
                 decisao = str(r.get("decisao") or "-")
@@ -468,7 +513,21 @@ class AbaOperacao(QWidget):
                 if oportunidades == 0:
                     texto += "  ·  0 oportunidades elegíveis"
                 self.resumo_ciclo.setText(texto)
-                self.resumo_ciclo.setToolTip(r.get("motivos", ""))
+                detalhes_ativos = []
+                for simbolo, funil_ativo in sorted((r.get("ativos") or {}).items()):
+                    etapas = ", ".join(f"{k}={v}" for k, v in sorted(funil_ativo.items())
+                                         if isinstance(v, int) and v)
+                    motivo = funil_ativo.get("ultimo_motivo")
+                    detalhes_ativos.append(f"{simbolo}: {motivo or 'sem motivo'}"
+                                           + (f" ({etapas})" if etapas else ""))
+                tooltip = r.get("motivos", "")
+                motivos_top = r.get("motivos_rejeicao_top3") or []
+                if motivos_top:
+                    tooltip += "\nTop rejeições: " + ", ".join(
+                        f"{m.get('codigo')}={m.get('quantidade', 0)}" for m in motivos_top)
+                if detalhes_ativos:
+                    tooltip += "\nAtivos no ciclo:\n" + "\n".join(detalhes_ativos)
+                self.resumo_ciclo.setToolTip(tooltip)
                 self.paineis["decisao"].atualizar(self.lista_decisao.topLevelItemCount(),
                                                   _fmt_horario(r.get("instante")))
             elif canal == "log":

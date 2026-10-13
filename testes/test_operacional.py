@@ -8,13 +8,15 @@ gatilho de descoberta e calibração empírica (Brier) das probabilidades.
 
 import tempfile
 import time
+import queue
+import threading
 from pathlib import Path
 from unittest.mock import Mock, patch
 import unittest
 
 from apoio import (FonteFake, LoggerSilencioso, candles_deterministicos,
                    estado_mt5, janela)
-from jev_bot import candidatos, mercados, padroes
+from jev_bot import candidatos, jev, mercados, padroes
 from jev_bot.execution.paper import Book
 from jev_bot.orquestrador import Orquestrador
 from jev_bot.types import Decision
@@ -67,6 +69,50 @@ class TestCalibracaoBrier(unittest.TestCase):
         self.assertEqual(resultado["n"], 0)
 
 
+class TestUnidadesValidacao(unittest.TestCase):
+    """Custos usam o preço atual; falta de cotação nunca vira custo zero."""
+
+    def test_spread_percentual_usa_mid_atual_e_janela_completa(self):
+        with tempfile.TemporaryDirectory() as pasta:
+            arquivo = Path(pasta) / "mercados.json"
+            mercados.salvar({"selecao": {"C": {"TESTE": {
+                "monitorar": True, "operar": True}}}}, arquivo)
+            orch = Orquestrador(banco=Path(pasta) / "db.json",
+                                pasta_dados=Path(pasta) / "padroes",
+                                caminho_selecao=arquivo)
+            orch.logger = LoggerSilencioso()
+            orch.book = Book.load(Path(pasta) / "db.json", "USD")
+            orch.repositorio = padroes.RepositorioPadroes(Path(pasta) / "padroes")
+            candles = candles_deterministicos()
+            for candle in candles:
+                for chave in ("open", "high", "low", "close"):
+                    candle[chave] *= .01
+            dados = janela(candles)
+            orch.fonte = FonteFake(cotacoes={"TESTE": (99.5, 100.5, time.time())})
+            orch.contadores_ciclo = {}
+            orch._atualizar_cache("TESTE", dados, "run-TESTE")
+            stats = orch.dados_ativo["TESTE"]["stats"]
+            self.assertEqual(stats["custo_spread_pct"], 1.0)
+            self.assertGreater(stats["dias_janela_completa"], stats["dias"])
+
+    def test_sem_cotacao_custo_nao_e_inventado_como_zero(self):
+        with tempfile.TemporaryDirectory() as pasta:
+            arquivo = Path(pasta) / "mercados.json"
+            mercados.salvar({"selecao": {"C": {"TESTE": {
+                "monitorar": True, "operar": True}}}}, arquivo)
+            orch = Orquestrador(banco=Path(pasta) / "db.json",
+                                pasta_dados=Path(pasta) / "padroes",
+                                caminho_selecao=arquivo)
+            orch.logger = LoggerSilencioso()
+            orch.book = Book.load(Path(pasta) / "db.json", "USD")
+            orch.repositorio = padroes.RepositorioPadroes(Path(pasta) / "padroes")
+            dados = janela(candles_deterministicos())
+            orch.fonte = FonteFake(falhas=("TESTE",))
+            orch.contadores_ciclo = {}
+            with self.assertRaisesRegex(RuntimeError, "validação de custos suspensa"):
+                orch._atualizar_cache("TESTE", dados, "run-TESTE")
+
+
 class TestPrioridadeOperar(unittest.TestCase):
     """Ativos com Operar são avaliados antes dos demais monitorados."""
 
@@ -81,6 +127,7 @@ class TestPrioridadeOperar(unittest.TestCase):
         orch.logger = LoggerSilencioso()
         orch.book = Book.load(Path(pasta) / "db.json", "USD")
         orch.book.active = True
+        orch.jev_configurado = True
         orch.repositorio = padroes.RepositorioPadroes(Path(pasta) / "padroes",
                                                       relogio=time.time)
         orch.orcamento = Mock()
@@ -146,7 +193,7 @@ class TestDeepSeekDesativado(unittest.TestCase):
                 "TESTE", closes=[c["close"] for c in candles[-100:]])],
                 cotacoes={"TESTE": (99.995, 100.005, time.time())},
                 janelas={"TESTE": janela(candles)})
-            with patch("jev_bot.orquestrador.deepseek.analisar",
+            with patch("jev_bot.deepseek.analisar",
                        side_effect=AssertionError("DeepSeek deve permanecer desativado")) as analisar:
                 orch._executar_ciclo("c1")
             analisar.assert_not_called()
@@ -258,6 +305,7 @@ class TestCiclosMulti(unittest.TestCase):
         orch.logger = LoggerSilencioso()
         orch.book = Book.load(Path(pasta) / "db.json", "USD")
         orch.book.active = True
+        orch.jev_configurado = True
         orch.repositorio = padroes.RepositorioPadroes(Path(pasta) / "padroes",
                                                       relogio=time.time)
         orch.orcamento = Mock()
@@ -323,6 +371,7 @@ class TestCiclosMulti(unittest.TestCase):
                 self.assertEqual(resumo["funil"]["jev_hold"], 1)
                 self.assertEqual(resumo["funil"].get("aguardando_decisao", 0), 0)
                 self.assertEqual(resumo["jev_pendentes"], 0)
+                self.assertEqual(resumo["ativos"]["TESTE"]["eligible_for_jev"], 1)
                 self.assertEqual(decisao["run_id"], resumo["run_id"])
                 self.assertTrue(decisao["python_validated_at"])
                 self.assertTrue(decisao["jev_dispatched_at"])
@@ -349,11 +398,13 @@ class TestCiclosMulti(unittest.TestCase):
             orch.fonte.estados = estados
             orch.fonte.janela_m1 = lambda simbolo, **_kwargs: (
                 janela(candles_deterministicos()) if simbolo == "TESTE" else None)
-            import threading
+            entrou_no_worker = threading.Event()
+            liberar_resposta = threading.Event()
             terminou = threading.Event()
 
             def jev_lento(_estado):
-                time.sleep(.35)
+                entrou_no_worker.set()
+                liberar_resposta.wait(2)
                 terminou.set()
                 return Decision("TESTE", "HOLD", .5, .5)
 
@@ -361,15 +412,113 @@ class TestCiclosMulti(unittest.TestCase):
             with patch("jev_bot.orquestrador.jev.decide", side_effect=jev_lento):
                 orch._ciclo()
                 duracao_ciclo = time.monotonic() - inicio
-                self.assertLess(duracao_ciclo, .30)
+                self.assertLess(duracao_ciclo, .9)
+                self.assertTrue(entrou_no_worker.wait(.2))
                 self.assertIn("fetch:SEGUNDO", ordem)
                 self.assertFalse(terminou.is_set(), "o ciclo não esperou a resposta de rede")
                 self.assertEqual(len(orch.book.fills), 0)
+                liberar_resposta.set()
                 self.assertTrue(terminou.wait(2))
                 orch._processar_resultados_jev()
             holds = [r for canal, r in orch.eventos
                      if canal == "decisao" and r.get("decisao") == "HOLD"]
             self.assertTrue(holds)
+
+    def test_resposta_do_candle_anterior_e_descartada(self):
+        """Decisão tardia não executa paper após mudar o último candle fechado."""
+        with tempfile.TemporaryDirectory() as pasta:
+            orch, estado = self._orquestrador(pasta)
+            orch.fonte.estados = lambda: iter([estado])
+            entrou, liberar, terminou = threading.Event(), threading.Event(), threading.Event()
+
+            def jev_lento(_estado):
+                entrou.set()
+                liberar.wait(2)
+                terminou.set()
+                return Decision("TESTE", "BUY", .9, .9)
+
+            with patch("jev_bot.orquestrador.jev.decide", side_effect=jev_lento):
+                orch._ciclo()
+                self.assertTrue(entrou.wait(1))
+                estado.candles[-1]["time"] += 60
+                liberar.set()
+                self.assertTrue(terminou.wait(2))
+                limite = time.monotonic() + 1
+                while orch.pendentes_jev and time.monotonic() < limite:
+                    orch._processar_resultados_jev()
+                    time.sleep(.005)
+                orch._processar_resultados_jev()
+            self.assertEqual(len(orch.book.fills), 0)
+            self.assertEqual(orch.funil_total["response_discarded_stale"], 1)
+            self.assertFalse(any(c == "decisao" for c, _ in orch.eventos))
+
+    def test_fila_jev_cheia_nao_inventa_decisao(self):
+        """Backpressure bloqueia a oportunidade com motivo, sem fabricar HOLD."""
+        with tempfile.TemporaryDirectory() as pasta:
+            orch, estado = self._orquestrador(pasta)
+            orch.ciclo_ativo = True
+            orch.run_id_atual = "run-backpressure"
+            orch.contadores_ciclo = {}
+            orch.fila_jev = queue.Queue(maxsize=1)
+            orch.fila_jev.put_nowait(("ocupada", None, {}, time.time()))
+            motivo = orch._oportunidade(estado, "ciclo-teste")
+            self.assertIn(motivo, ("condicao_presente_sem_decisao", "condicao_ausente"))
+            self.assertFalse(any(c == "decisao" for c, _ in orch.eventos))
+            self.assertTrue(any(c == "oportunidade" and r.get("motivo") == "FILA_BLOQUEADA"
+                                for c, r in orch.eventos))
+
+    def test_jev_nao_configurado_nao_enfileira(self):
+        with tempfile.TemporaryDirectory() as pasta:
+            orch, estado = self._orquestrador(pasta)
+            orch.ciclo_ativo = True
+            orch.run_id_atual = "run-sem-config"
+            orch.contadores_ciclo = {}
+            orch.jev_configurado = False
+            with patch("jev_bot.orquestrador.jev.decide") as chamada:
+                orch._oportunidade(estado, "ciclo-sem-config")
+            chamada.assert_not_called()
+            self.assertEqual(orch.fila_jev.qsize(), 0)
+            self.assertTrue(any(c == "oportunidade" and r.get("motivo") == "IA_INDISPONIVEL"
+                                for c, r in orch.eventos))
+            self.assertFalse(any(c == "decisao" for c, _ in orch.eventos))
+
+    def test_worker_sobrevive_erro_401_e_processa_proximo_job(self):
+        """Falha HTTP tipada não mata o consumidor serial da fila."""
+        with tempfile.TemporaryDirectory() as pasta:
+            orch, estado = self._orquestrador(pasta)
+            metas = [
+                {"run_id": "r1", "symbol": "TESTE", "candidate_id": "p1", "candle_ref": 1},
+                {"run_id": "r1", "symbol": "TESTE", "candidate_id": "p2", "candle_ref": 1},
+                {"run_id": "r1", "symbol": "TESTE", "candidate_id": "p3", "candle_ref": 1},
+            ]
+            respostas = [jev.JevError("HTTP_401", "http_error"),
+                         jev.JevError("JEv_PARSE_ERROR", "parse_error", http_success=True),
+                         Decision("TESTE", "SELL", .9, .9)]
+            with patch("jev_bot.orquestrador.jev.decide", side_effect=respostas):
+                self.assertTrue(orch._enfileirar_jev("r1:req1", estado, metas[0]))
+                self.assertTrue(orch._enfileirar_jev("r1:req2", estado, metas[1]))
+                self.assertTrue(orch._enfileirar_jev("r1:req3", estado, metas[2]))
+                resultados = []
+                limite = time.monotonic() + 2
+                while len(resultados) < 3 and time.monotonic() < limite:
+                    try:
+                        resultados.append(orch.resultados_jev.get(timeout=.02))
+                    except queue.Empty:
+                        continue
+            orch.encerrar.set()
+            if orch.worker_jev:
+                orch.worker_jev.join(1)
+            self.assertEqual(resultados[0][3], {"code": "HTTP_401", "stage": "http_error",
+                                                "http_success": False})
+            self.assertEqual(resultados[1][3], {"code": "JEv_PARSE_ERROR", "stage": "parse_error",
+                                                "http_success": True})
+            self.assertEqual(resultados[2][2].action, "SELL")
+            stages = []
+            while not orch.eventos_worker_jev.empty():
+                stages.append(orch.eventos_worker_jev.get_nowait()["stage"])
+            self.assertIn("jev_http_success", stages)
+            self.assertIn("jev_response_received", stages)
+            self.assertIn("jev_parse_error", stages)
 
     def test_jev_timeout_resulta_sem_decisao(self):
         """JEv timeout: SEM_DECISAO; novo candle → JEv funciona."""
@@ -384,6 +533,10 @@ class TestCiclosMulti(unittest.TestCase):
                 orch.contadores_ciclo.get("ia_indisponivel", 0), 1,
                 "timeout JEv deve incrementar ia_indisponivel")
             self.assertEqual(len(orch.book.fills), 0)
+            self.assertFalse(any(c == "decisao" for c, _ in orch.eventos),
+                             "falha de transporte não pode virar HOLD/NAO de mercado")
+            self.assertTrue(any(c == "oportunidade" and r.get("motivo") == "ERRO_API"
+                                for c, r in orch.eventos))
             estado2 = estado_mt5(closes=[c["close"] for c in candles[-100:]])
             estado2.candles[-1]["time"] = estado.candles[-1]["time"] + 60
             with patch("jev_bot.orquestrador.jev.decide",

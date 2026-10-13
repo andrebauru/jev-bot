@@ -319,109 +319,26 @@ Todo trabalho de MT5, análise e negociação roda em uma thread separada
 bloqueia. GUI e painel de terminal compartilham o mesmo `db.json`, com
 arquivo de bloqueio contra acesso concorrente.
 
-O pipeline gráfico é **Python → DeepSeek → JEv**:
+O pipeline gráfico é **MT5 M1 fechado → Python quantitativo local → worker JEv → risco → paper**:
 
-1. **Cálculos matemáticos (Python)**: janela M1 móvel de 30 dias por ativo,
-   timestamps normalizados para UTC, lacunas contadas (não preenchidas),
-   custo de spread e estatísticas de movimentos, retornos condicionais,
-   recuperação após quedas, retração após altas e tempos até eventos.
-   Não usa indicadores técnicos e não consome tokens.
-2. **Análise DeepSeek**: iniciada automaticamente (no máximo uma consulta
-   por ativo por hora, duas por ciclo, com teto de tokens por dia e de
-   chamadas por hora configuráveis em `DEEPSEEK_*`). Recebe apenas o
-   resumo compacto dos 70% iniciais da janela; os 30% finais são
-   reservados para validação fora da amostra. Propõe hipóteses que
-   precisam usar tipos de regra suportados com parâmetros dentro de
-   faixas explícitas; nunca devolve probabilidades.
-3. **Validação local**: cada hipótese é reproduzida em Python sobre a
-   janela completa, com contagem de eventos, taxa de acerto, magnitude
-   média/mediana, dispersão, custo de spread e avaliação cronológica
-   fora da amostra (últimos 30%). Requisitos mínimos: 40 eventos totais,
-   12 fora da amostra, taxa >= 55% em ambos e expectativa líquida
-   positiva. Status: candidato, validado, rejeitado ou expirado
-   (validade de 7 dias). Repositório em `data/padroes/<SIMBOLO>.json`,
-   com escrita atômica, deduplicação e versionamento de schema.
-7. **Decisão JEv**: somente padrões validados com a condição verdadeira no
-   candle fechado geram consulta ao JEv, que decide SIM ou NÃO; o gate de
-   risco (`risk.check`) é determinístico e bloqueia independentemente da
-   decisão. O operador edita risco por trade, exposição máxima e drawdown
-   máximo na aba Operação; a IA não altera limites.
+1. **Coleta e estatísticas locais**: janela M1 móvel de até 30 dias, timestamps UTC, gaps preservados e contados, candles em formação excluídos. O cache é incremental e `Operar=true` recebe prioridade. A GUI e o ciclo exibem símbolos sem tick/histórico por motivo.
+2. **Candidatos e validação Python**: o Python produz candidatos determinísticos das estatísticas condicionais locais, sem indicadores tradicionais. Cada regra é reproduzida sobre a janela completa, com eventos não sobrepostos, corte cronológico dentro/fora da amostra, taxas, expectativa após spread e validade de sete dias. Requisitos atuais: 40 eventos totais, 12 OOS, taxa mínima de 55% em ambos e expectativa positiva. Os filtros não são afrouxados para forçar solicitações.
+3. **Decisão JEv**: somente oportunidade quantitativamente validada, com condição verdadeira no último candle fechado e pré-checagem de spread aprovada, é enfileirada. Uma fila limitada (128 itens), um worker serial e timeout HTTP explícito mantêm o scanner livre; itens que envelhecem na fila são descartados. O worker só faz rede: o thread do orquestrador revalida o último candle M1 fechado, preços, posições e risco antes de qualquer execução exclusivamente paper.
 
-Cadência: sem posições abertas, o ciclo roda a cada 1 minuto, alinhado ao
-fechamento do candle M1 (+2s); com posições, a cada 15 minutos. O
-monitoramento de preços, posições, stops e limites roda em tempo real
-independente dessa cadência. **Inicialização automática**: com
-configuração válida, seleção de mercados não vazia e nenhum bloqueio, o
-ciclo de análise inicia sozinho ao abrir a janela — sem clique em
-INICIAR. Sem mercados selecionados, o estado é AGUARDANDO SELEÇÃO (sem
-download, sem análise, sem tokens) e o início acontece automaticamente
-quando um mercado é habilitado, se não houver pausa voluntária nem
-bloqueio. PAUSAR desliga o autostart da sessão; INICIAR retoma quando
-seguro e recusa com motivo objetivo se houver bloqueio. Estados formais:
-INICIALIZANDO → PRONTO → ANALISANDO → AGUARDANDO (entre ciclos) →
-PAUSADO_PELO_USUARIO | BLOQUEADO_POR_RISCO | AGUARDANDO_SELECAO |
-EMERGENCIA | ERRO → ENCERRANDO → ENCERRADO, com transições registradas
-em `logs/`. EMERGÊNCIA grava marca persistida (`db.json.emergencia`);
-após reiniciar, o motor permanece em EMERGÊNCIA até INICIAR manual. Ao
-atingir limite de exposição ou drawdown, o robô entra em PARADO POR
-RISCO (estado BLOQUEADO_POR_RISCO): análises e entradas param, e só
-voltam com "LIBERAR APÓS REVISÃO" (liberação manual registrada no log).
-**EMERGÊNCIA — FECHAR TUDO** exige confirmação, bloqueia entradas na hora,
-tenta fechar todas as posições paper ao preço observado e alerta falhas:
-posição sem cotação válida permanece aberta, com nova tentativa
-automática; nada é marcado como encerrado sem confirmação do simulador.
+O custo histórico considerado é **spread observado convertido em percentual pelo mid-price atual**. A expectativa registrada é líquida após esse spread; comissão e slippage não são estimados porque esses valores não estão disponíveis nesta fonte. Os componentes ausentes aparecem explicitamente no diagnóstico e contrato, não são inventados.
 
-**Caminho operacional independente do aprendizado**: a cada ciclo, o
-Python gera **candidatos determinísticos** das estatísticas condicionais
-já calculadas (`jev_bot/candidatos.py`: sequências de quedas/altas,
-recuperação após queda, retração após alta — sem indicadores), os valida
-pelo MESMO rigor (fora da amostra, não sobrepostos, custo de spread) e os
-registra como padrões `origem: local`. Assim, rate limit, timeout ou
-indisponibilidade do DeepSeek não deixam a carteira sem avaliação nos
-candles recentes — e o JEv é consultado no MESMO candle em que a condição
-está verdadeira, sem esperar o TTL de 1 hora do aprendizado. Prioridade
-de processamento: ativos `Operar` antes dos demais `Monitorar`, com
-pendências do ciclo anterior preservadas (justiça, sem starvation).
+DeepSeek está desativado na rota operacional: **zero chamadas, zero filas e zero dependências do scanner**. Configurações antigas são preservadas, mas o teste de conexão DeepSeek da interface está desativado. O resumo registra `deepseek_calls=0`.
 
-**Descoberta não bloqueante**: o DeepSeek é agendado em fila e processado em fatias durante a espera entre ciclos (máximo 1 símbolo por iteração de 0,5s) - nunca na rota de decisão nem bloqueando o próximo ciclo. Gatilhos: revisão periódica (TTL 1h) OU mudança estatisticamente relevante (candidatos.mudanca_relevante: movimento médio, retorno da janela ou custo de spread alterados além de limiares fixos). Resumo idêntico ao anterior omite a chamada (sem gasto de tokens). Orçamento esgotado é sinalizado no painel e a operação continua com padrões já validados. O ciclo registra run_id único e resultado (CONCLUIDO/PARCIAL/CANCELADO/ERRO) com duração.
+**Diagnóstico compacto do funil** na aba Operação: selecionados → dados MT5 válidos → candidatos → aprovados → enfileirados → chamadas JEv → respostas → decisões → paper. Exibe zeros explicitamente, os três motivos de rejeição mais frequentes, idade da fila, último envio e última resposta. O resumo detalhado por `run_id` inclui contagens por etapa e por ativo; nunca ocupa a lista de decisões.
 
-**Decisão JEv tipada**: `jev.decide` registra modelo, latência (ms) e
-marca `calibracao=nao_calibrada` — probabilidades do modelo não são
-tratadas como probabilidade de lucro sem calibração empírica local
-(`padroes.calibracao_brier` sobre trades paper fechados do padrão,
-Brier score com amostra >= 20). Campos `policy` (ALLOW/VETO/PENDING) e
-`paper` (OPENED/NOT_OPENED) separados em cada registro de decisão.
-
-**Decisões SIM/NAO/HOLD por ativo**: o JEv responde e a normalização é
-SIM (BUY/SELL), NAO (AVOID, contrato inválido ou recusado pelo risco) e
-HOLD (indisponibilidade ou adiamento explícito do modelo). `HOLD` adia
-APENAS aquela oportunidade (identificador `pattern_id@candle`) por até 5
-minutos (`HOLD_TTL_S`); expirada, é descartada — sem loop infinito — e um
-novo candle gera nova oportunidade. `NAO` encerra apenas aquela candidata;
-o laço continua para as próximas do mesmo símbolo. Indisponibilidades são
-registradas como HOLD "adiada" com motivo, nunca como decisão simulada.
-
-**Resumo por ciclo no painel de status** (nunca na lista de decisões):
-funil por ciclo — candidatos → com M1 → candidatos locais gerados/validados
-→ enviados ao DeepSeek → hipóteses recebidas → rejeitados → elegíveis →
-enviados ao JEv → SIM/NAO/HOLD → paper executados — com motivos explícitos
-de cada queda (`sem_dados`, `sem_padrao`, `rejeitado_validacao`,
-`pre_bloqueado`, `risco_bloqueado`, `ia_indisponivel`, `deepseek_omitido`,
-`hold_expirado`, `erros`) e tempo desde a última decisão, última análise
-DeepSeek, última oportunidade e último trade.
+Erros de configuração, HTTP, parse, modelo ou timeout aparecem como `ERRO_API`/`IA_INDISPONIVEL`; não são convertidos em HOLD ou NAO do modelo. `SEM_SETUP`, `SEM_DADOS`, `SEM_ELEGIBILIDADE`, `FILA_BLOQUEADA`, `SEM_DECISAO` e `VETO_RISCO` são motivos distintos. Respostas tardias cujo candle M1 mudou são descartadas antes do gate de risco.
 
 Aba Resumo exibe curva de patrimônio (realizada dos fechamentos mais
 patrimônio atual com P&L aberto), drawdown desde o pico, retorno,
 taxa de acerto e estatísticas, com filtros de período e ativo. Botão
 direito nos gráficos: **COPIAR COMO IMAGEM** para a área de transferência.
 
-Aba Configurações: chave OpenRouter mascarada (gravada no cofre do
-sistema via `keyring` quando disponível; sem keyring, no `.env`, com
-aviso explícito), identificador do modelo DeepSeek editável e verificado
-pelo TESTAR CONEXÃO, caminho do terminal MT5 com PROCURAR e teste em
-processo isolado, credenciais MT5 reservadas (o programa usa a conta já
-aberta) e **PAPER TRADING fixo** — trading real não é habilitado por
-teste de conexão e exigirá fluxo separado de autorização.
+Aba Configurações: chave OpenRouter mascarada (gravada no cofre do sistema via `keyring` quando disponível; sem keyring, no `.env`, com aviso explícito), configuração de modelo DeepSeek legado preservada e inativa (sem teste ou chamadas), caminho do terminal MT5 com PROCURAR e teste em processo isolado, credenciais MT5 reservadas (o programa usa a conta já aberta) e **PAPER TRADING fixo**.
 
 O painel de terminal (`python -m jev_bot`) continua disponível com o
 fluxo direto JEv, sem padrões; não execute os dois ao mesmo tempo sobre

@@ -31,17 +31,18 @@ limites; o gate de risco é determinístico.
 from __future__ import annotations
 
 from dataclasses import asdict
+from collections import Counter
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 import copy
 import json
+import math
 import queue
 import threading
 import time
 
-# `deepseek` fica importado por compatibilidade com configurações legadas;
-# não é referenciado por nenhuma rotina operacional.
-from . import cache_m1, candidatos, deepseek, jev, logs, mercados, padroes, risk
+from . import cache_m1, candidatos, jev, logs, mercados, padroes, risk
 from .markets import FonteMT5
 from .motor_matematico import estatisticas, janela_descoberta, resumo_compacto
 from .painel import BANCO_PADRAO, carregar_carteira
@@ -56,6 +57,7 @@ ORCAMENTO_CICLO_S = 50       # orçamento de tempo do ciclo sem posições (cad�
 ORCAMENTO_CICLO_COM_POSICAO_S = 600  # com posições (cadência 15min)
 RESERVA_PROCESSAMENTO_S = 15  # fatia final do orçamento reservada ao processamento
 HOLD_TTL_S = 300             # HOLD adia a oportunidade no máximo 5 minutos (expira, sem loop)
+JEV_QUEUE_TTL_S = 25         # descarta requisições que aguardaram além do candle útil
 # Motivos tipados por retorno do pipeline de decisão (rastreáveis na GUI).
 MOTIVOS_CODIGO = {
     "inativo": "RISK_BLOCK",
@@ -139,9 +141,19 @@ class Orquestrador:
         self.acoes = queue.Queue()
         self.fila_jev = queue.Queue(maxsize=128)
         self.resultados_jev = queue.Queue()
+        self.eventos_worker_jev = queue.Queue()
         self.pendentes_jev = {}
         self.worker_jev = None
         self.resumos_emitidos = {}
+        self.funil_total = Counter()
+        self.funil_rejeicoes = Counter()
+        self.funil_rejeicoes_por_run = {}
+        self.funil_por_ativo = {}
+        self.funil_por_run = {}
+        self.funil_eventos = deque(maxlen=1000)
+        self.quant_validated_ids = set()
+        self.ultimo_envio_jev = None
+        self.ultima_resposta_jev = None
         self.fonte = None
         self.book = None
         self.repositorio = None
@@ -171,6 +183,7 @@ class Orquestrador:
         self.ultimo_aviso_slot = 0
         self.contagem_scan = {}    # resumo agregado do scanner para a GUI
         self._progresso_publicado = None
+        self.motivo_fonte_simbolo = {}
         self.arquivo_emergencia = Path(str(self.banco) + ".emergencia")
         self.arquivo_pausa = Path(str(self.banco) + ".pause")
         self.ultimo_resumo_hash = {}
@@ -184,6 +197,96 @@ class Orquestrador:
         self.prazo_scan = None
         self.pendentes_ciclo = []
         self.contadores_ciclo = {}
+
+    def _evento_funil(self, etapa, simbolo="", *, candidate_id=None,
+                      request_id=None, candle_ref=None, motivo=None,
+                      duracao_ms=None, run_id=None, **metricas):
+        """Contabiliza e registra uma transição auditável sem conteúdo sensível."""
+        instante = self.relogio()
+        run_id = run_id or getattr(self, "run_id_atual", None)
+        evento = {"run_id": run_id, "etapa": etapa, "symbol": simbolo or None,
+                  "candle_ref": candle_ref, "candidate_id": candidate_id,
+                  "request_id": request_id, "duracao_ms": duracao_ms,
+                  "motivo": motivo, **metricas}
+        self.funil_eventos.append(evento)
+        self.funil_total[etapa] += 1
+        if self.contadores_ciclo is not None:
+            self.contadores_ciclo[etapa] = self.contadores_ciclo.get(etapa, 0) + 1
+        if motivo and etapa in ("candidate_rejected", "ineligible_for_jev", "queue_full",
+                                "queue_expired", "fetch_error",
+                                "jev_http_error", "jev_parse_error", "jev_timeout",
+                                "risk_veto",
+                                "response_discarded_stale", "response_discarded_run_mismatch",
+                                "response_discarded_duplicate"):
+            duplicado = (etapa == "ineligible_for_jev" and motivo in (
+                "NO_SETUP", "SEM_SETUP", "SEM_DADOS", "FILA_BLOQUEADA",
+                "SPREAD_TOO_HIGH", "RISK_BLOCK", "VETO_RISCO",
+                "RESPONSE_DISCARDED_STALE", "NO_VALID_MT5_STATE", "NO_VALID_TICK",
+                "NO_VALID_CLOSED_M1_STATE", "CONTRACT_NOT_TRADABLE",
+                "SYMBOL_SELECT_FAILED", "HISTORY_FETCH_FAILED",
+                "STATISTICS_UNAVAILABLE", "CANDIDATE_GENERATION_ERROR"))
+            if not duplicado:
+                codigo = {"NO_SETUP": "SEM_SETUP", "QUEUE_FULL": "FILA_BLOQUEADA"}.get(
+                    str(motivo), str(motivo))
+                codigo = {"NO_VALID_MT5_STATE": "SEM_DADOS",
+                          "NO_VALID_TICK": "SEM_DADOS",
+                          "NO_VALID_CLOSED_M1_STATE": "SEM_DADOS",
+                          "CONTRACT_NOT_TRADABLE": "SEM_DADOS",
+                          "SYMBOL_SELECT_FAILED": "SEM_DADOS",
+                          "HISTORY_FETCH_FAILED": "SEM_DADOS",
+                          "STATISTICS_UNAVAILABLE": "SEM_DADOS",
+                          "CANDIDATE_GENERATION_ERROR": "SEM_ELEGIBILIDADE",
+                          "PIPELINE_ERROR": "SEM_ELEGIBILIDADE"}.get(codigo, codigo)
+                if etapa == "risk_veto":
+                    codigo = "VETO_RISCO"
+                if etapa == "ineligible_for_jev":
+                    codigo = {"CONTRACT_INVALID": "SEM_ELEGIBILIDADE",
+                              "CONDITION_NOT_CURRENT": "SEM_ELEGIBILIDADE",
+                              "PIPELINE_ERROR": "SEM_ELEGIBILIDADE",
+                              "SPREAD_TOO_HIGH": "VETO_RISCO",
+                              "RISK_BLOCK": "VETO_RISCO"}.get(codigo, codigo)
+                self.funil_rejeicoes[codigo] += 1
+                if run_id:
+                    self.funil_rejeicoes_por_run.setdefault(run_id, Counter())[codigo] += 1
+                for extra_code in dict.fromkeys(metricas.get("reason_codes") or ()):
+                    if extra_code == codigo:
+                        continue
+                    self.funil_rejeicoes[extra_code] += 1
+                    if run_id:
+                        self.funil_rejeicoes_por_run.setdefault(run_id, Counter())[extra_code] += 1
+        if simbolo:
+            ativo = self.funil_por_ativo.setdefault(simbolo, {})
+            ativo[etapa] = ativo.get(etapa, 0) + 1
+            ativo.update(run_id=run_id, candle_ref=candle_ref,
+                         candidate_id=candidate_id, request_id=request_id,
+                         ultimo_motivo=motivo or ativo.get("ultimo_motivo"))
+            if run_id:
+                por_ativo = self.funil_por_run.setdefault(run_id, {}).setdefault(simbolo, {})
+                por_ativo[etapa] = por_ativo.get(etapa, 0) + 1
+                por_ativo.update(run_id=run_id, candle_ref=candle_ref,
+                                 candidate_id=candidate_id, request_id=request_id,
+                                 ultimo_motivo=motivo or por_ativo.get("ultimo_motivo"))
+        if etapa == "quant_validated" and simbolo and candidate_id:
+            self.quant_validated_ids.add((run_id, simbolo, candidate_id))
+        if etapa in ("queue_enqueued", "jev_request_started"):
+            self.ultimo_envio_jev = instante
+        if etapa in ("jev_response_received", "jev_http_error", "jev_parse_error", "jev_timeout"):
+            self.ultima_resposta_jev = instante
+        campos = {"run_id": run_id, "symbol": simbolo or None,
+                  "candle_ref": candle_ref, "candidate_id": candidate_id,
+                  "request_id": request_id, "duracao_ms": duracao_ms,
+                  "motivo": motivo, **metricas}
+        if etapa in {"fetch_error", "history_insufficient", "candidate_generated",
+                     "candidate_rejected", "quant_validated", "quant_rejected",
+                     "eligible_for_jev", "ineligible_for_jev", "queue_enqueued",
+                     "queue_full", "queue_deduped", "queue_expired", "worker_dequeued",
+                     "jev_request_started", "jev_http_success", "jev_http_error",
+                     "jev_parse_error", "jev_timeout", "jev_response_received",
+                     "response_accepted", "response_discarded_stale",
+                     "response_discarded_run_mismatch", "response_discarded_duplicate",
+                     "decision_buy", "decision_sell", "decision_hold", "risk_veto",
+                     "paper_opened", "paper_not_opened"}:
+            self.logger.info("funil " + etapa, **campos)
 
     # ------------------------------------------------------------------ API
     def iniciar(self):
@@ -486,6 +589,15 @@ class Orquestrador:
         """
         self.contagem_scan[etapa] = self.contagem_scan.get(etapa, 0) + 1
         self.contagem_scan["ultimo"] = f"{simbolo}: {mensagem}" if simbolo else mensagem
+        if etapa == "ignorado" and simbolo:
+            texto = str(mensagem).casefold()
+            codigo = ("NO_VALID_TICK" if "tick" in texto else
+                      "CONTRACT_NOT_TRADABLE" if "contrato" in texto else
+                      "SYMBOL_SELECT_FAILED" if "seleção" in texto else
+                      "NO_VALID_CLOSED_M1_STATE")
+            self.motivo_fonte_simbolo[simbolo] = codigo
+        elif etapa == "dados" and simbolo:
+            self.motivo_fonte_simbolo.pop(simbolo, None)
         if etapa == "erro" and simbolo:
             self.publicar("calc", {"id": "scan-erro", "simbolo": simbolo, "instante": _agora_iso(),
                                    "etapa": "erro", "mensagem": mensagem, "amostra": None,
@@ -524,24 +636,63 @@ class Orquestrador:
         """Thread único de rede JEv; nunca toca na carteira, GUI ou scanner."""
         while not self.encerrar.is_set():
             try:
-                request_id, estado = self.fila_jev.get(timeout=0.25)
+                request_id, estado, meta, enqueued_at = self.fila_jev.get(timeout=0.25)
             except queue.Empty:
                 continue
             if request_id is None:
                 return
             inicio = time.monotonic()
+            queue_age_ms = max(0, round((self.relogio() - enqueued_at) * 1000))
+            self.eventos_worker_jev.put({"stage": "worker_dequeued", "meta": meta,
+                                         "request_id": request_id,
+                                         "duracao_ms": queue_age_ms})
+            if queue_age_ms > JEV_QUEUE_TTL_S * 1000:
+                self.eventos_worker_jev.put({"stage": "queue_expired", "meta": meta,
+                                             "request_id": request_id,
+                                             "duracao_ms": queue_age_ms,
+                                             "motivo": "QUEUE_TTL_EXPIRED"})
+                self.resultados_jev.put((request_id, meta["run_id"], None,
+                                         {"code": "QUEUE_TTL_EXPIRED", "stage": "queue_expired"},
+                                         0, meta))
+                continue
+            self.eventos_worker_jev.put({"stage": "jev_request_started", "meta": meta,
+                                         "request_id": request_id,
+                                         "duracao_ms": queue_age_ms})
             try:
                 decisao = jev.decide(estado)
                 erro = None
-            except Exception as exc:  # a thread só devolve resultado ao orquestrador
-                decisao, erro = None, str(exc)[:240]
-            self.resultados_jev.put((request_id, decisao, erro,
-                                     max(0, round((time.monotonic() - inicio) * 1000))))
+                elapsed = max(0, round((time.monotonic() - inicio) * 1000))
+                self.eventos_worker_jev.put({"stage": "jev_http_success", "meta": meta,
+                                             "request_id": request_id, "duracao_ms": elapsed})
+                self.eventos_worker_jev.put({"stage": "jev_response_received", "meta": meta,
+                                             "request_id": request_id, "duracao_ms": elapsed})
+            except Exception as exc:  # a thread só devolve erro tipado ao orquestrador
+                decisao = None
+                erro = {"code": getattr(exc, "code", "JEV_CLIENT_ERROR"),
+                        "stage": getattr(exc, "stage", "http_error"),
+                        "http_success": bool(getattr(exc, "http_success", False))}
+                etapa = ("jev_timeout" if erro["stage"] == "timeout" else
+                         "jev_parse_error" if erro["stage"] == "parse_error" else
+                         "jev_http_error")
+                if erro.get("http_success"):
+                    elapsed = max(0, round((time.monotonic() - inicio) * 1000))
+                    self.eventos_worker_jev.put({"stage": "jev_http_success", "meta": meta,
+                                                 "request_id": request_id, "duracao_ms": elapsed})
+                    self.eventos_worker_jev.put({"stage": "jev_response_received", "meta": meta,
+                                                 "request_id": request_id, "duracao_ms": elapsed})
+                self.eventos_worker_jev.put({"stage": etapa, "meta": meta,
+                                             "request_id": request_id,
+                                             "duracao_ms": max(0, round((time.monotonic() - inicio) * 1000)),
+                                             "motivo": erro["code"]})
+            self.resultados_jev.put((request_id, meta["run_id"], decisao, erro,
+                                     max(0, round((time.monotonic() - inicio) * 1000)),
+                                     meta))
 
-    def _enfileirar_jev(self, request_id, estado):
+    def _enfileirar_jev(self, request_id, estado, meta):
         """Despacha sem bloquear; um consumidor serializa as chamadas de rede."""
+        enqueued_at = self.relogio()
         try:
-            self.fila_jev.put_nowait((request_id, copy.deepcopy(estado)))
+            self.fila_jev.put_nowait((request_id, copy.deepcopy(estado), meta, enqueued_at))
         except queue.Full:
             return False
         if self.worker_jev is None or not self.worker_jev.is_alive():
@@ -552,23 +703,51 @@ class Orquestrador:
 
     def _processar_resultados_jev(self):
         """Aplica respostas na thread do orquestrador, com candle e risco atuais."""
+        self._drenar_eventos_worker_jev()
         while True:
             try:
-                request_id, decisao, erro, latencia_ms = self.resultados_jev.get_nowait()
+                request_id, result_run_id, decisao, erro, latencia_ms, meta = \
+                    self.resultados_jev.get_nowait()
             except queue.Empty:
                 return
             contexto = self.pendentes_jev.pop(request_id, None)
             if contexto is None:
+                self._evento_funil("response_discarded_duplicate", meta["symbol"],
+                                   candidate_id=meta["candidate_id"], request_id=request_id,
+                                   candle_ref=meta["candle_ref"], motivo="REQUEST_CONTEXT_NOT_PENDING",
+                                   run_id=result_run_id)
                 continue
             contadores_atuais = self.contadores_ciclo
             self.contadores_ciclo = contexto["contadores"]
             try:
-                self._finalizar_decisao_jev(contexto, decisao, erro, latencia_ms)
+                if result_run_id != contexto["run_id"]:
+                    self._evento_funil("response_discarded_run_mismatch", contexto["simbolo"],
+                                       candidate_id=contexto["padrao"], request_id=request_id,
+                                       candle_ref=contexto["candle_ref"], run_id=contexto["run_id"],
+                                       motivo="RUN_ID_MISMATCH", response_run_id=result_run_id)
+                else:
+                    self._finalizar_decisao_jev(contexto, decisao, erro, latencia_ms)
             finally:
                 contexto["contadores"]["aguardando_decisao"] = max(
                     0, contexto["contadores"].get("aguardando_decisao", 0) - 1)
                 self.contadores_ciclo = contadores_atuais
             self._atualizar_resumo_jev(contexto["run_id"], contexto["contadores"])
+        self._drenar_eventos_worker_jev()
+
+    def _drenar_eventos_worker_jev(self):
+        """Aplica telemetria publicada pela thread de rede no thread do motor."""
+        while True:
+            try:
+                event = self.eventos_worker_jev.get_nowait()
+            except queue.Empty:
+                return
+            meta = event["meta"]
+            self._evento_funil(event["stage"], meta["symbol"],
+                               candidate_id=meta["candidate_id"],
+                               request_id=event["request_id"],
+                               candle_ref=meta["candle_ref"], run_id=meta["run_id"],
+                               duracao_ms=event.get("duracao_ms"),
+                               motivo=event.get("motivo"))
 
     def _atualizar_resumo_jev(self, run_id, contadores):
         """Publica contadores finais do run_id quando a rede termina em background."""
@@ -581,6 +760,10 @@ class Orquestrador:
         funil["deepseek_calls"] = 0
         resumo["funil"] = funil
         resumo["jev_pendentes"] = em_fila
+        resumo["ativos"] = self.funil_por_run.get(run_id, {})
+        resumo["motivos_rejeicao_top3"] = [
+            {"codigo": k, "quantidade": v}
+            for k, v in self.funil_rejeicoes_por_run.get(run_id, Counter()).most_common(3)]
         resumo["motivos"] = "; ".join(f"{k}={v}" for k, v in sorted(contadores.items()))
         if resumo.get("resultado") == "PARCIAL" and not em_fila and not resumo.get("pendentes"):
             resumo["resultado"] = "CONCLUIDO"
@@ -591,17 +774,27 @@ class Orquestrador:
         simbolo = contexto["simbolo"]
         base = {**contexto["registro_base"], "instante": _agora_iso()}
         if erro:
+            code = erro.get("code", "JEV_CLIENT_ERROR")
+            stage = erro.get("stage", "http_error")
+            if stage == "queue_expired":
+                self._publicar_motivo(simbolo, contexto["id"], "FILA_BLOQUEADA", code,
+                                      candle_ref=contexto["candle_ref"],
+                                      candidate_id=contexto["padrao"], run_id=contexto["run_id"])
+                return
             self.contadores_ciclo["ia_indisponivel"] = \
                 self.contadores_ciclo.get("ia_indisponivel", 0) + 1
             self.proxima_tentativa_jev = self.relogio() + TENTATIVA_JEV_S
-            self.publicar("decisao", {**base, "decisao": "HOLD",
-                                      "justificativa": erro, "risco": "-", "execucao": "adiada",
-                                      "run_id": contexto["run_id"],
-                                      "python_validated_at": contexto["python_validated_at"],
-                                      "jev_dispatched_at": contexto["jev_dispatched_at"],
-                                      "latencia_detecao_ms": contexto["latencia_detecao_ms"],
-                                      "latencia_ms": latencia_ms})
-            self.logger.aviso("JEv indisponível", simbolo=simbolo, detalhe=erro[:160])
+            self._evento_funil("ineligible_for_jev", simbolo,
+                               candidate_id=contexto["padrao"],
+                               request_id=contexto.get("request_id"),
+                               candle_ref=contexto["candle_ref"], run_id=contexto["run_id"],
+                               motivo="IA_INDISPONIVEL", error_code=code, error_stage=stage)
+            self._publicar_motivo(simbolo, contexto["id"], "ERRO_API", code,
+                                  candle_ref=contexto["candle_ref"],
+                                  candidate_id=contexto["padrao"], run_id=contexto["run_id"])
+            self.logger.aviso("JEv indisponível", simbolo=simbolo,
+                              run_id=contexto["run_id"], request_id=contexto.get("request_id"),
+                              error_code=code, error_stage=stage)
             return
 
         atualizado = self.fonte.revalidar(contexto["estado"])
@@ -609,10 +802,22 @@ class Orquestrador:
                 or atualizado.candles[-1].get("time") != contexto["candle_ref"]):
             self.contadores_ciclo["stale_jev_response"] = \
                 self.contadores_ciclo.get("stale_jev_response", 0) + 1
+            self._evento_funil("response_discarded_stale", simbolo,
+                               candidate_id=contexto["padrao"], request_id=contexto.get("request_id"),
+                               candle_ref=contexto["candle_ref"], run_id=contexto["run_id"],
+                               motivo="CLOSED_M1_CHANGED")
+            self._publicar_motivo(simbolo, contexto["id"], "RESPONSE_DISCARDED_STALE",
+                                  "candle M1 mudou durante a espera da resposta JEv",
+                                  candle_ref=contexto["candle_ref"],
+                                  candidate_id=contexto["padrao"], run_id=contexto["run_id"])
             self.logger.info("resposta JEv descartada: candle vencido", simbolo=simbolo,
                              run_id=contexto["run_id"], candle_ref=contexto["candle_ref"])
             return
 
+        self._evento_funil("response_accepted", simbolo,
+                           candidate_id=contexto["padrao"], request_id=contexto.get("request_id"),
+                           candle_ref=contexto["candle_ref"], run_id=contexto["run_id"],
+                           duracao_ms=latencia_ms)
         self.ultimos["decisao"] = self.relogio()
         self.logger.info("decisão JEv recebida", simbolo=simbolo, acao=decisao.action,
                          probabilidade=round(decisao.probability, 2),
@@ -626,6 +831,13 @@ class Orquestrador:
                     "latencia_detecao_ms": contexto["latencia_detecao_ms"],
                     "latencia_ms": latencia_ms}
         if acao == "HOLD":
+            self._evento_funil("decision_hold", simbolo,
+                               candidate_id=contexto["padrao"], request_id=contexto.get("request_id"),
+                               candle_ref=contexto["candle_ref"], run_id=contexto["run_id"])
+            self._evento_funil("paper_not_opened", simbolo,
+                               candidate_id=contexto["padrao"], request_id=contexto.get("request_id"),
+                               candle_ref=contexto["candle_ref"], run_id=contexto["run_id"],
+                               motivo="JEv_HOLD")
             self.contadores_ciclo["jev_hold"] = self.contadores_ciclo.get("jev_hold", 0) + 1
             expira = self.relogio() + HOLD_TTL_S
             self.holds[(simbolo, contexto["identificador"])] = expira
@@ -638,6 +850,13 @@ class Orquestrador:
                                       **metadata})
             return
         if acao == "AVOID":
+            self._evento_funil("decision_no", simbolo,
+                               candidate_id=contexto["padrao"], request_id=contexto.get("request_id"),
+                               candle_ref=contexto["candle_ref"], run_id=contexto["run_id"])
+            self._evento_funil("paper_not_opened", simbolo,
+                               candidate_id=contexto["padrao"], request_id=contexto.get("request_id"),
+                               candle_ref=contexto["candle_ref"], run_id=contexto["run_id"],
+                               motivo="JEv_AVOID")
             self.contadores_ciclo["jev_nao"] = self.contadores_ciclo.get("jev_nao", 0) + 1
             self.publicar("decisao", {**base, "decisao": "NAO",
                                       "justificativa": f"JEv AVOID p={decisao.probability:.0%} "
@@ -646,9 +865,15 @@ class Orquestrador:
                                       "policy": "VETO", "paper": "NOT_OPENED", **metadata})
             return
         self.contadores_ciclo["jev_sim"] = self.contadores_ciclo.get("jev_sim", 0) + 1
+        self._evento_funil("decision_buy" if acao == "BUY" else "decision_sell", simbolo,
+                           candidate_id=contexto["padrao"], request_id=contexto.get("request_id"),
+                           candle_ref=contexto["candle_ref"], run_id=contexto["run_id"])
         if gate.verdict == "EXECUTE":
             self.contadores_ciclo["executadas"] = self.contadores_ciclo.get("executadas", 0) + 1
             self.book.execute(decisao, atualizado, gate)
+            self._evento_funil("paper_opened", simbolo,
+                               candidate_id=contexto["padrao"], request_id=contexto.get("request_id"),
+                               candle_ref=contexto["candle_ref"], run_id=contexto["run_id"])
             self.book.update(self.fonte)
             self._persistir()
             self.ultimos["trade"] = self.relogio()
@@ -666,6 +891,14 @@ class Orquestrador:
             return
         self.contadores_ciclo["risco_bloqueado"] = \
             self.contadores_ciclo.get("risco_bloqueado", 0) + 1
+        self._evento_funil("risk_veto", simbolo,
+                           candidate_id=contexto["padrao"], request_id=contexto.get("request_id"),
+                           candle_ref=contexto["candle_ref"], run_id=contexto["run_id"],
+                           motivo=gate.reason or "RISK_VETO")
+        self._evento_funil("paper_not_opened", simbolo,
+                           candidate_id=contexto["padrao"], request_id=contexto.get("request_id"),
+                           candle_ref=contexto["candle_ref"], run_id=contexto["run_id"],
+                           motivo=gate.reason or "RISK_VETO")
         self.publicar("decisao", {**base, "decisao": "SIM", "direcao": acao,
                                   "justificativa": f"JEv SIM p={decisao.probability:.0%} "
                                                    f"c={decisao.confidence:.0%}; recusado pelo risco",
@@ -952,6 +1185,41 @@ class Orquestrador:
         book = self.book
         m = book.metrics()
         monitorados, operaveis = self.selecao.contagens()
+        agora = self.relogio()
+        por_idade = [ctx.get("enqueued_at") for ctx in self.pendentes_jev.values()
+                     if ctx.get("enqueued_at") is not None]
+        diagnostico = {
+            "totais": {k: self.funil_total.get(k, 0) for k in (
+                "symbol_selected", "symbol_operable", "symbol_available_mt5",
+                "fetch_attempt", "fetch_ok", "fetch_error", "closed_m1_count",
+                "cache_hit", "history_sufficient", "history_insufficient",
+                "candidate_generated", "candidate_rejected", "quant_validated",
+                "quant_rejected", "eligible_for_jev", "ineligible_for_jev",
+                "queue_enqueue_attempt", "queue_enqueued", "queue_full",
+                "queue_deduped", "queue_expired", "worker_dequeued",
+                "jev_request_started", "jev_http_success", "jev_http_error",
+                "jev_parse_error", "jev_timeout", "jev_response_received",
+                "response_accepted", "response_discarded_stale",
+                "response_discarded_run_mismatch", "response_discarded_duplicate",
+                "decision_buy", "decision_sell", "decision_hold", "decision_no", "risk_veto",
+                "paper_opened", "paper_not_opened")},
+            "motivos_rejeicao_top3": [
+                {"codigo": k, "quantidade": v}
+                for k, v in self.funil_rejeicoes.most_common(3)],
+            "motivos_codigo": {code: self.funil_rejeicoes.get(code, 0) for code in (
+                "SEM_SETUP", "SEM_DADOS", "SEM_ELEGIBILIDADE", "FILA_BLOQUEADA",
+                "IA_INDISPONIVEL", "SEM_DECISAO", "VETO_RISCO")},
+            "ultimo_envio_jev_age_s": (round(agora - self.ultimo_envio_jev, 1)
+                                       if self.ultimo_envio_jev is not None else None),
+            "idade_fila_s": (round(agora - min(por_idade), 1) if por_idade else 0),
+            "ultima_resposta_jev_age_s": (round(agora - self.ultima_resposta_jev, 1)
+                                          if self.ultima_resposta_jev is not None else None),
+            "fila_size": self.fila_jev.qsize(),
+            "worker_alive": bool(self.worker_jev and self.worker_jev.is_alive()),
+            "cost_model": {"basis": "spread_only", "commission_pct": None,
+                           "slippage_pct": None,
+                           "notice": "comissão/slippage não foram estimados"},
+        }
         return {"estado": self.estado, "detalhe": self.detalhe,
                 "ativo": book.active, "pausado": self.pausado, "parado_risco": self.parado_risco,
                 "emergencia": self.emergencia_ativa, "motivo_risco": self.motivo_risco,
@@ -968,6 +1236,7 @@ class Orquestrador:
                 "jev_ok": self.jev_configurado, "deepseek_calls": 0,
                 "monitorados": monitorados, "operaveis": operaveis,
                 "fase": self.fase, "contadores": dict(self.contadores_ciclo),
+                "diagnostico_funil": diagnostico,
                 "ultimos": {chave: (round(self.relogio() - valor, 1) if valor else None)
                             for chave, valor in self.ultimos.items()},
                 "posicoes_detalhe": [asdict(p) for p in book.fills]}
@@ -1024,22 +1293,42 @@ class Orquestrador:
                             "resultado": resultado_ciclo,
                                       "oportunidades": self.contadores_ciclo.get("enviados_jev", 0),
                                       "motivos": "; ".join(f"{k}={v}" for k, v in sorted(self.contadores_ciclo.items())) or "sem candidatos monitorados",
-                                     "funil": {**{e: self.contadores_ciclo[e] for e in (
-                                         "candidatos", "candidatos_locais", "locais_validados",
-                                         "rejeitado_validacao", "elegiveis", "enviados_jev",
-                                         "jev_sim", "jev_nao", "jev_hold", "executadas",
-                                         "pre_bloqueado", "risco_bloqueado", "sem_padrao",
-                                         "hold_aguardando", "hold_expirado", "erros")
-                                         if self.contadores_ciclo.get(e)},
+                                      "funil": {**{e: self.contadores_ciclo[e] for e in (
+                                          "symbol_selected", "symbol_operable", "symbol_available_mt5",
+                                          "fetch_attempt", "fetch_ok", "fetch_error", "closed_m1_count",
+                                          "cache_hit", "history_sufficient", "history_insufficient",
+                                          "candidate_generated", "candidate_rejected", "quant_validated",
+                                          "quant_rejected", "eligible_for_jev", "ineligible_for_jev",
+                                          "queue_enqueue_attempt", "queue_enqueued", "queue_full",
+                                          "queue_deduped", "queue_expired", "worker_dequeued",
+                                          "jev_request_started", "jev_http_success", "jev_http_error",
+                                          "jev_parse_error", "jev_timeout", "jev_response_received",
+                                          "response_accepted", "response_discarded_stale",
+                                          "response_discarded_run_mismatch", "response_discarded_duplicate",
+                                          "decision_buy", "decision_sell", "decision_hold", "decision_no",
+                                          "risk_veto", "paper_opened", "paper_not_opened",
+                                          "candidatos", "candidatos_locais", "locais_validados",
+                                          "rejeitado_validacao", "elegiveis", "enviados_jev",
+                                          "jev_sim", "jev_nao", "jev_hold", "executadas",
+                                          "pre_bloqueado", "risco_bloqueado", "sem_padrao",
+                                          "hold_aguardando", "hold_expirado", "erros")
+                                          if self.contadores_ciclo.get(e)},
                                          "deepseek_calls": 0},
                                       "tempos": {chave: (round(self.relogio() - valor, 1) if valor else None)
                                                  for chave, valor in self.ultimos.items()},
-                                      "pendentes": len(self.pendentes_ciclo),
-                                      "jev_pendentes": jev_pendentes,
-                                      "duracao_s": duracao}
+                            "pendentes": len(self.pendentes_ciclo),
+                            "jev_pendentes": jev_pendentes,
+                            "ativos": self.funil_por_run.get(run_id, {}),
+                            "motivos_rejeicao_top3": [
+                                {"codigo": k, "quantidade": v}
+                                for k, v in self.funil_rejeicoes_por_run.get(run_id, Counter()).most_common(3)],
+                            "duracao_s": duracao}
             self.resumos_emitidos[run_id] = resumo_ciclo
             while len(self.resumos_emitidos) > 12:
-                self.resumos_emitidos.pop(next(iter(self.resumos_emitidos)))
+                expirado = next(iter(self.resumos_emitidos))
+                self.resumos_emitidos.pop(expirado)
+                self.funil_por_run.pop(expirado, None)
+                self.funil_rejeicoes_por_run.pop(expirado, None)
             self.publicar("resumo", dict(resumo_ciclo))
             self.logger.info("ciclo concluído", ciclo=self.ciclo, resultado=resultado_ciclo,
                              duracao_s=duracao, run_id=run_id)
@@ -1053,6 +1342,7 @@ class Orquestrador:
         self.prazo_ciclo = self.relogio() + orcamento
         self.prazo_scan = self.prazo_ciclo - RESERVA_PROCESSAMENTO_S
         self.contadores_ciclo = {"deepseek_calls": 0}
+        self.quant_validated_ids = set()
         inicio_ciclo = self.relogio()
         self.run_id_atual = run_id or id_ciclo
         self._registrar_selecao()  # aplica mudanças de seleção no início do ciclo
@@ -1060,7 +1350,19 @@ class Orquestrador:
             self._varrer_e_processar(id_ciclo, None)  # scanner incremental por símbolo
         finally:
             duracao = round(self.relogio() - inicio_ciclo, 1)
-            FUNIL = ("candidatos", "sem_dados", "cache_incremental", "cache_completo",
+            FUNIL = ("symbol_selected", "symbol_operable", "symbol_available_mt5",
+                     "fetch_attempt", "fetch_ok", "fetch_error", "closed_m1_count",
+                     "cache_hit", "history_sufficient", "history_insufficient",
+                     "candidate_generated", "candidate_rejected", "quant_validated",
+                     "quant_rejected", "eligible_for_jev", "ineligible_for_jev",
+                     "queue_enqueue_attempt", "queue_enqueued", "queue_full", "queue_deduped",
+                     "queue_expired", "worker_dequeued", "jev_request_started", "jev_http_success",
+                     "jev_http_error", "jev_parse_error", "jev_timeout", "jev_response_received",
+                     "response_accepted", "response_discarded_stale",
+                     "response_discarded_run_mismatch", "response_discarded_duplicate",
+                     "decision_buy", "decision_sell", "decision_hold", "decision_no",
+                     "risk_veto", "paper_opened", "paper_not_opened",
+                     "candidatos", "sem_dados", "cache_incremental", "cache_completo",
                      "cache_invalido", "candidatos_locais", "locais_validados",
                      "rejeitado_validacao",
                      "validados_ativos", "elegiveis", "enviados_jev", "aguardando_decisao",
@@ -1100,6 +1402,10 @@ class Orquestrador:
                         if monitorar]
         prioridade_operar = [s for s in selecionados if self.selecao.operar(s)]
         apenas_monitorar = [s for s in selecionados if not self.selecao.operar(s)]
+        for ativo in selecionados:
+            self._evento_funil("symbol_selected", ativo)
+            if self.selecao.operar(ativo):
+                self._evento_funil("symbol_operable", ativo)
         pendentes = [s for s in self.pendentes_ciclo if s in selecionados]
         ordem = list(dict.fromkeys(pendentes + prioridade_operar + apenas_monitorar))
         self.contadores_ciclo["candidatos"] = len(ordem)
@@ -1122,29 +1428,56 @@ class Orquestrador:
                 self.logger.debug("análise duplicada ignorada", simbolo=simbolo)
                 continue
             estado = None
+            fetch_completed = False
+            inicio_fetch = time.monotonic()
             try:
                 self.em_analise.add(simbolo)
+                self._evento_funil("fetch_attempt", simbolo)
                 try:
                     # FonteMT5 filtra símbolo antes de solicitar cotação/candles.
                     estado = next(iter(self.fonte.estados(simbolo=simbolo)), None)
                 except TypeError:
                     # Dobros legados podem não aceitar o seletor; filtra localmente.
                     estado = next((s for s in self.fonte.estados() if s.symbol == simbolo), None)
+                fetch_completed = True
                 # A fonte pode enfileirar pausa/emergência enquanto obtém o
                 # estado; aplicá-las antes de executar o ativo mantém cancelamento cooperativo.
                 self._processar_acoes()
                 if self.pausado or self.parado_risco or self._cancelado_ciclo():
                     break
                 if estado is None:
-                    motivo = "SEM_DADOS"
+                    motivo = self.motivo_fonte_simbolo.pop(simbolo, "NO_VALID_MT5_STATE")
                     self.contadores_ciclo["sem_dados"] = self.contadores_ciclo.get("sem_dados", 0) + 1
-                    self._publicar_motivo(simbolo, id_ciclo, motivo, "sem M1/tick/contrato válido")
+                    self._evento_funil("fetch_error", simbolo, motivo=motivo,
+                                       duracao_ms=round((time.monotonic() - inicio_fetch) * 1000))
+                    self._evento_funil("history_insufficient", simbolo,
+                                       motivo=motivo)
+                    self._publicar_motivo(simbolo, id_ciclo, motivo,
+                                          "sem M1/tick/contrato válido")
                 else:
+                    self._evento_funil("fetch_ok", simbolo,
+                                       candle_ref=(estado.candles[-1].get("time") if estado.candles else None),
+                                       duracao_ms=round((time.monotonic() - inicio_fetch) * 1000))
+                    self._evento_funil("symbol_available_mt5", simbolo,
+                                       candle_ref=(estado.candles[-1].get("time") if estado.candles else None))
+                    self._evento_funil("closed_m1_count", simbolo,
+                                       candle_ref=(estado.candles[-1].get("time") if estado.candles else None),
+                                       quantidade=len(estado.candles))
                     retorno = self._processar_ativo(estado, id_ciclo)
                     codigo = MOTIVOS_CODIGO.get(retorno, retorno or "SEM_DECISAO")
-                    self._publicar_motivo(simbolo, id_ciclo, codigo, retorno or "sem candidato elegível")
+                    self._publicar_motivo(simbolo, id_ciclo, codigo,
+                                          retorno or "sem candidato elegível",
+                                          candle_ref=(estado.candles[-1].get("time")
+                                                      if estado.candles else None))
             except (RuntimeError, ValueError, KeyError) as exc:
                 self.contadores_ciclo["erros"] = self.contadores_ciclo.get("erros", 0) + 1
+                if not fetch_completed:
+                    self._evento_funil("fetch_error", simbolo, motivo="MT5_STATE_ERROR",
+                                       detalhe=str(exc)[:120],
+                                       duracao_ms=round((time.monotonic() - inicio_fetch) * 1000))
+                else:
+                    self._evento_funil("ineligible_for_jev", simbolo, motivo="PIPELINE_ERROR",
+                                       detalhe=str(exc)[:120])
                 self._publicar_motivo(simbolo, id_ciclo, "ERRO", str(exc)[:160])
                 self.logger.erro("falha na análise", simbolo=simbolo, detalhe=str(exc)[:160])
             finally:
@@ -1159,18 +1492,27 @@ class Orquestrador:
                          varridos=len(processados), pendentes=len(self.pendentes_ciclo),
                          deepseek_operacional=0)
 
-    def _publicar_motivo(self, simbolo, cycle_id, codigo, detalhe):
+    def _publicar_motivo(self, simbolo, cycle_id, codigo, detalhe,
+                         candle_ref=None, candidate_id=None, run_id=None):
         """Resultado individual de triagem, sem fabricar decisão JEv.
 
         Publica no canal `oportunidade` (painel Python Quantitativo da GUI):
         ativo, estado matemático e motivo — inclusive rejeições.
         """
+        if codigo not in ("DECISION_PENDING", "DECISION_HOLD", "DECISION_NO",
+                          "PAPER_EXECUTED", "SEM_DECISAO", "ERRO_API"):
+            self._evento_funil("ineligible_for_jev", simbolo,
+                               candidate_id=candidate_id, candle_ref=candle_ref,
+                               motivo=codigo, detalhe=detalhe, run_id=run_id)
         chave = (codigo, detalhe)
         if self.ultimo_motivo.get(simbolo) == chave:
             return
         self.ultimo_motivo[simbolo] = chave
         self.publicar("oportunidade", {"id": cycle_id, "simbolo": simbolo,
                                        "instante": _agora_iso(),
+                                       "run_id": run_id or getattr(self, "run_id_atual", cycle_id),
+                                       "candle_ref": candle_ref,
+                                       "candidate_id": candidate_id,
                                        "motivo": codigo, "estado": detalhe})
 
     def _coletar_janela(self, simbolo, id_analise):
@@ -1191,13 +1533,24 @@ class Orquestrador:
                                      "fase": self.fase, "quando": _agora_iso()})
             self.descarregar()
         inicio = time.time()
+        self._evento_funil("fetch_attempt", simbolo, history_days=30, fetch_kind="history")
         janela = self.fonte.janela_m1(simbolo, dias=30, lote=LOTE_DOWNLOAD,
                                       cancelado=self._cancelado_scan, progresso=progresso)
         duracao = round(time.time() - inicio, 2)
         if janela is None:
             motivo = "cancelado" if self._cancelado_scan() else "indisponível"
+            self._evento_funil("fetch_error", simbolo, motivo="HISTORY_FETCH_FAILED",
+                               duracao_ms=round(duracao * 1000), history_days=30)
+            self._evento_funil("history_insufficient", simbolo,
+                               motivo="HISTORY_FETCH_FAILED", history_days=30)
             self.logger.info("download de histórico não concluído", simbolo=simbolo, motivo=motivo)
             return None
+        self._evento_funil("fetch_ok", simbolo, candle_ref=janela["fim"],
+                           duracao_ms=round(duracao * 1000),
+                           closed_m1_count=janela["recebidos"],
+                           gap_minutes=janela["minutos_lacuna"], history_days=30)
+        self._evento_funil("closed_m1_count", simbolo, candle_ref=janela["fim"],
+                           quantidade=janela["recebidos"], history_days=30)
         self.logger.info("download de histórico concluído", simbolo=simbolo,
                          candles=janela["recebidos"], lacunas=janela["lacunas"],
                          lotes=max(1, -(-janela["recebidos"] // LOTE_DOWNLOAD)), duracao_s=duracao)
@@ -1214,6 +1567,12 @@ class Orquestrador:
         agora = self.relogio()
         cache = self.dados_ativo.get(simbolo)
         vencida = cache is None or agora - cache["instante"] >= JANELA_TTL_S
+        if cache is not None and not vencida:
+            self._evento_funil("cache_hit", simbolo,
+                               candle_ref=(estado.candles[-1].get("time")
+                                           if estado.candles else None),
+                               cache_age_s=round(agora - cache["instante"], 1),
+                               cache_kind="memory")
         if vencida and self._pode_atualizar_janela(simbolo):
             janela = self._janela_com_cache(simbolo, id_analise)
             if janela is None:
@@ -1229,6 +1588,10 @@ class Orquestrador:
                 self._atualizar_cache(simbolo, janela, id_analise)
                 cache = self.dados_ativo.get(simbolo)
         if cache is None or cache.get("stats") is None:
+            self._evento_funil("history_insufficient", simbolo,
+                               candle_ref=(estado.candles[-1].get("time")
+                                           if estado.candles else None),
+                               motivo="STATISTICS_UNAVAILABLE")
             self.publicar("calc", {"id": id_analise, "simbolo": simbolo, "instante": _agora_iso(),
                                    "etapa": "dados", "mensagem": "Estatísticas aguardando atualização da janela",
                                    "amostra": None, "padroes_testados": None,
@@ -1236,10 +1599,23 @@ class Orquestrador:
             return
         stats = cache["stats"]
         custo_pct = cache["custo_pct"]
+        stage = "history_sufficient" if stats.get("disponivel") else "history_insufficient"
+        self._evento_funil(stage, simbolo,
+                           candle_ref=(estado.candles[-1].get("time")
+                                       if estado.candles else None),
+                           closed_m1_count=stats.get("candles_janela_completa",
+                                                    stats.get("candles")),
+                           window_days=stats.get("dias_janela_completa", stats.get("dias")),
+                           training_days=stats.get("dias"),
+                           gap_minutes=stats.get("minutos_lacuna"),
+                           motivo=None if stats.get("disponivel") else
+                           stats.get("motivo", "STATISTICS_UNAVAILABLE"))
         ativos_repo = self.repositorio.padroes_ativos(simbolo)
         self.publicar("calc", {"id": id_analise, "simbolo": simbolo, "instante": _agora_iso(),
                                "etapa": "calculado", "mensagem": "Estatísticas locais prontas (Python; cálculo não consome tokens)",
-                               "amostra": {"candles": stats.get("candles"), "dias": stats.get("dias"),
+                                "amostra": {"candles": stats.get("candles"), "dias": stats.get("dias"),
+                                            "candles_janela": stats.get("candles_janela_completa"),
+                                            "dias_janela": stats.get("dias_janela_completa"),
                                            "lacunas": stats.get("lacunas"),
                                            "retorno_janela_pct": stats.get("retorno_janela_pct")},
                                "padroes_testados": len(ativos_repo),
@@ -1273,12 +1649,20 @@ class Orquestrador:
         armazenados = self.cache_m1.carregar(simbolo)
         if armazenados:
             ultimo = armazenados[-1]["time"]
+            self._evento_funil("fetch_attempt", simbolo, candle_ref=ultimo,
+                               fetch_kind="incremental")
             novos = self.fonte.incremento_m1(simbolo, desde=ultimo)
             if novos is not None:
                 combinados, info = self.cache_m1.anexar(simbolo, novos)
                 if not info["recarregar"] and len(combinados) >= 2:
                     self.contadores_ciclo["cache_incremental"] = \
                         self.contadores_ciclo.get("cache_incremental", 0) + 1
+                    self._evento_funil("fetch_ok", simbolo, candle_ref=combinados[-1]["time"],
+                                       fetch_kind="incremental", appended=info["anexados"],
+                                       closed_m1_count=len(combinados))
+                    self._evento_funil("cache_hit", simbolo, candle_ref=combinados[-1]["time"],
+                                       cache_kind="incremental", appended=info["anexados"],
+                                       closed_m1_count=len(combinados))
                     self.logger.info("cache incremental aplicado", simbolo=simbolo,
                                      anexados=info["anexados"], candles=len(combinados),
                                      lacunas=info["lacunas"])
@@ -1311,13 +1695,24 @@ class Orquestrador:
                          registrar=False, fase="CALCULANDO")
         descoberta, _ = janela_descoberta(janela["candles"])
         recorte = {**janela, "candles": descoberta, "fim": descoberta[-1]["time"]}
-        spread = self.fonte.cotacao(simbolo)
-        spread_fracao = (spread[1] - spread[0]) if spread else 0.0
-        stats = estatisticas(recorte, spread_fracao)
-        custo_pct = stats.get("custo_spread_pct") or 0.0
+        cotacao = self.fonte.cotacao(simbolo)
+        if cotacao is None:
+            raise RuntimeError("Cotação atual indisponível; validação de custos suspensa")
+        bid, ask, _ = cotacao
+        preco_atual = (bid + ask) / 2
+        spread_abs = ask - bid
+        if not (0 < preco_atual and math.isfinite(spread_abs) and spread_abs >= 0):
+            raise RuntimeError("Bid/ask inválidos; validação de custos suspensa")
+        stats = estatisticas(recorte, 0.0)
+        custo_pct = round(spread_abs / preco_atual * 100, 4)
+        stats["custo_spread_pct"] = custo_pct
+        dias_janela = round((janela["candles"][-1]["time"] -
+                             janela["candles"][0]["time"]) / 86400, 2)
+        stats["dias_janela_completa"] = dias_janela
+        stats["candles_janela_completa"] = len(janela["candles"])
         # Descoberta DeepSeek desativada; Python local é a única fonte de candidatos.
         janela_info = {"inicio": janela["inicio"], "fim": janela["fim"],
-                       "dias": stats.get("dias"), "candles": janela["recebidos"]}
+                       "dias": dias_janela, "candles": janela["recebidos"]}
         # Revalida padrões ativos com a janela recém-baixada (cronologia preservada).
         self._estado_set("ANALISANDO", f"Ciclo {self.ciclo} · VALIDANDO {simbolo}",
                          registrar=False, fase="VALIDANDO")
@@ -1363,33 +1758,95 @@ class Orquestrador:
         Cada regra candidata passa pela validação independente padrão; só
         vira `validado` com amostra e taxa fora da amostra suficientes.
         """
+        inicio_candidatos = time.monotonic()
         try:
             regras = candidatos.regras_candidatas(stats, janela["candles"])
         except (ValueError, TypeError, KeyError) as exc:
+            self._evento_funil("candidate_rejected", simbolo,
+                               candle_ref=(janela["candles"][-1].get("time")
+                                           if janela.get("candles") else None),
+                               motivo="CANDIDATE_GENERATION_ERROR",
+                               detalhe=str(exc)[:120])
             self.logger.aviso("falha ao gerar candidatos locais", simbolo=simbolo,
                               detalhe=str(exc)[:120])
             return
+        candle_ref = janela["candles"][-1].get("time") if janela.get("candles") else None
+        duracao_geracao_ms = max(0, round((time.monotonic() - inicio_candidatos) * 1000))
+        dias_janela = stats.get("dias_janela_completa", stats.get("dias"))
+        if not regras:
+            self._evento_funil("candidate_rejected", simbolo, candle_ref=candle_ref,
+                               motivo="SEM_SETUP" if stats.get("disponivel") else "HISTORY_INSUFFICIENT",
+                               disponivel=stats.get("disponivel"),
+                               closed_m1_count=len(janela.get("candles", [])),
+                               custo_spread_pct=custo_pct,
+                               window_days=dias_janela)
         janela_info = {"inicio": janela["inicio"], "fim": janela["fim"],
-                       "dias": stats.get("dias"), "candles": janela["recebidos"]}
+                       "dias": dias_janela, "candles": janela["recebidos"]}
         for regra in regras:
+            inicio_validacao = time.monotonic()
             validacao = padroes.validar(regra, janela["candles"], custo_pct)
+            duracao_validacao_ms = max(0, round((time.monotonic() - inicio_validacao) * 1000))
             registro = self.repositorio.registrar(simbolo, regra, validacao, "local",
                                                   janela_info)
+            candidate_id = registro["id"]
+            self._evento_funil("candidate_generated", simbolo,
+                               candidate_id=candidate_id, candle_ref=candle_ref,
+                               direcao=regra["direcao"], horizonte_minutos=regra["horizonte_minutos"],
+                               duracao_ms=duracao_geracao_ms)
             self.contadores_ciclo["candidatos_locais"] = \
                 self.contadores_ciclo.get("candidatos_locais", 0) + 1
             self.publicar("calc", {"id": id_analise, "simbolo": simbolo,
+                                   "run_id": getattr(self, "run_id_atual", id_analise),
                                    "instante": _agora_iso(), "etapa": "validacao_local",
-                                   "padrao": registro["id"],
+                                   "padrao": registro["id"], "candidate_id": registro["id"],
+                                   "candle_ref": candle_ref,
                                    "status_consulta": "CANDIDATO LOCAL (Python)",
-                                       "hipotese": self._texto_hipotese(regra),
-                                       "validacao": f"{validacao['status']}: {validacao['motivo']}",
-                                       "resultado": self._texto_validacao(validacao)})
+                                        "reason_code": validacao.get("reason_code"),
+                                        "hipotese": self._texto_hipotese(regra),
+                                        "validacao": f"{validacao['status']}: {validacao['motivo']}",
+                                        "resultado": self._texto_validacao(validacao)})
             if validacao["status"] == "validado":
+                self._evento_funil("quant_validated", simbolo,
+                                   candidate_id=candidate_id, candle_ref=candle_ref,
+                                   motivo="QUANT_VALIDATED",
+                                   sample_size=validacao["total"]["eventos"],
+                                   oos_n=validacao["oos"]["eventos"],
+                                   oos_rate=validacao["oos"]["taxa"],
+                                   expected_net_return=validacao["total"]["media_pct"],
+                                   cost_spread_pct=custo_pct,
+                                   commission_pct=None, slippage_pct=None,
+                                   cost_basis="spread_only",
+                                   window_days=dias_janela,
+                                   training_days=stats.get("dias"),
+                                   validation_validity_days=padroes.VALIDADE_DIAS,
+                                   validation_remaining_days=padroes.VALIDADE_DIAS,
+                                   duracao_ms=duracao_validacao_ms)
                 self.contadores_ciclo["locais_validados"] = \
                     self.contadores_ciclo.get("locais_validados", 0) + 1
                 self.logger.info("candidato local validado", simbolo=simbolo,
                                  padrao=registro["id"], analysis_id=id_analise)
             if validacao["status"] == "rejeitado":
+                reason_code = validacao.get("reason_code", "QUANT_REJECTED")
+                evidencias = {"sample_size": validacao["total"]["eventos"],
+                              "reason_codes": validacao.get("reason_codes", [reason_code]),
+                              "in_sample_n": validacao["amostra"]["eventos"],
+                              "in_sample_rate": validacao["amostra"]["taxa"],
+                              "oos_n": validacao["oos"]["eventos"],
+                              "oos_rate": validacao["oos"]["taxa"],
+                              "expected_net_return": validacao["total"]["media_pct"],
+                              "cost_spread_pct": custo_pct,
+                              "commission_pct": None, "slippage_pct": None,
+                              "cost_basis": "spread_only",
+                              "window_days": dias_janela,
+                              "training_days": stats.get("dias")}
+                self._evento_funil("candidate_rejected", simbolo,
+                                   candidate_id=candidate_id, candle_ref=candle_ref,
+                                   motivo=reason_code, duracao_ms=duracao_validacao_ms,
+                                   **evidencias)
+                self._evento_funil("quant_rejected", simbolo,
+                                   candidate_id=candidate_id, candle_ref=candle_ref,
+                                   motivo=reason_code, duracao_ms=duracao_validacao_ms,
+                                   **evidencias)
                 self.contadores_ciclo["rejeitado_validacao"] = \
                     self.contadores_ciclo.get("rejeitado_validacao", 0) + 1
 
@@ -1416,6 +1873,26 @@ class Orquestrador:
         self.contadores_ciclo["validados_ativos"] = \
             self.contadores_ciclo.get("validados_ativos", 0) + len(validados)
         instante_candle = estado.candles[-1]["time"] if estado.candles else None
+        run_id = getattr(self, "run_id_atual", id_analise)
+        for padrao in validados:
+            chave_validado = (run_id, simbolo, padrao["id"])
+            if chave_validado in self.quant_validated_ids:
+                continue
+            self._evento_funil("quant_validated", simbolo,
+                               candidate_id=padrao["id"], candle_ref=instante_candle,
+                               motivo="QUANT_VALIDATED",
+                               sample_size=(padrao.get("eventos") or {}).get("eventos"),
+                               oos_n=(padrao.get("fora_amostra") or {}).get("eventos"),
+                               oos_rate=(padrao.get("fora_amostra") or {}).get("taxa"),
+                               expected_net_return=(padrao.get("eventos") or {}).get("media_pct"),
+                               cost_spread_pct=padrao.get("custo_spread_pct"),
+                               commission_pct=padrao.get("commission_pct"),
+                               slippage_pct=padrao.get("slippage_pct"),
+                               cost_basis=padrao.get("cost_basis", "spread_only"),
+                               window_days=padrao.get("janela_dias"),
+                               validation_remaining_days=max(0, round(
+                                   padroes.VALIDADE_DIAS - (self.relogio() -
+                                   padrao.get("validado_em", self.relogio())) / 86400, 2)))
         if len(self.avaliados) > MAX_AVALIADOS:
             self.avaliados.clear()
         condicao_presente = False
@@ -1442,14 +1919,19 @@ class Orquestrador:
             if self.avaliados.get(chave) == instante_candle:
                 self.contadores_ciclo["candle_ja_avaliado"] = \
                     self.contadores_ciclo.get("candle_ja_avaliado", 0) + 1
+                self._evento_funil("queue_deduped", simbolo,
+                                   candidate_id=padrao["id"],
+                                   request_id=f"{getattr(self, 'run_id_atual', id_analise)}:{simbolo}:{padrao['id']}:{instante_candle}",
+                                   candle_ref=instante_candle,
+                                   motivo="CANDIDATE_ALREADY_EVALUATED")
                 continue
-            if instante_candle is not None:
-                self.avaliados[chave] = instante_candle
             candles_condicao = self._candles_para_condicao(padrao, estado)
             if candles_condicao is None:
                 self.contadores_ciclo["stale_snapshot"] = \
                     self.contadores_ciclo.get("stale_snapshot", 0) + 1
                 continue
+            if instante_candle is not None:
+                self.avaliados[chave] = instante_candle
             if not padroes.condicao_atual(padrao, candles_condicao):
                 continue
             condicao_presente = True
@@ -1494,15 +1976,33 @@ class Orquestrador:
             pre = risk.bloqueio_spread(estado, self.book.limits)
             if pre:
                 contabilizar("pre_bloqueado")
-                self._publicar_motivo(simbolo, id_analise, "SPREAD_TOO_HIGH", pre)
+                self._evento_funil("ineligible_for_jev", simbolo,
+                                   candidate_id=padrao["id"], candle_ref=instante_candle,
+                                   motivo="SPREAD_TOO_HIGH", spread=estado.ask - estado.bid,
+                                   cost_spread_pct=padrao.get("custo_spread_pct"))
+                self._publicar_motivo(simbolo, id_analise, "SPREAD_TOO_HIGH", pre,
+                                      candle_ref=instante_candle, candidate_id=padrao["id"])
                 return "pre_bloqueado"
+            self._evento_funil("eligible_for_jev", simbolo,
+                               candidate_id=padrao["id"], candle_ref=instante_candle,
+                               motivo="QUANT_VALIDATED",
+                               sample_size=padrao.get("eventos", {}).get("eventos"),
+                               oos_n=padrao.get("fora_amostra", {}).get("eventos"),
+                               oos_rate=padrao.get("fora_amostra", {}).get("taxa"),
+                               expected_net_return=padrao.get("eventos", {}).get("media_pct"),
+                               cost_spread_pct=padrao.get("custo_spread_pct"),
+                                   validation_remaining_days=max(0, round(
+                                   padroes.VALIDADE_DIAS - (self.relogio() -
+                                   padrao.get("validado_em", self.relogio())) / 86400, 2)))
+            if self.ciclo_ativo and not self.jev_configurado:
+                self._publicar_motivo(simbolo, id_analise, "IA_INDISPONIVEL",
+                                      "JEv/OpenRouter não configurado; candidato não enfileirado",
+                                      candle_ref=instante_candle, candidate_id=padrao["id"])
+                continue
             if self.relogio() < self.proxima_tentativa_jev:
-                self.publicar("decisao", {"id": id_analise, "simbolo": simbolo, "instante": _agora_iso(),
-                                          "padrao": padrao["id"], "candle_ref": instante_candle,
-                                          "direcao": regra["direcao"], "decisao": "HOLD",
-                                          "oportunidade": texto,
-                                          "justificativa": "JEv indisponível; nova tentativa após recuo",
-                                          "risco": "-", "execucao": "adiada"})
+                self._publicar_motivo(simbolo, id_analise, "ERRO_API",
+                                      "JEv em recuo após falha; sem chamada neste candle",
+                                      candle_ref=instante_candle, candidate_id=padrao["id"])
                 continue
             instante_despacho = _agora_iso()
             self.logger.info("oportunidade detectada; consultando JEv", simbolo=simbolo,
@@ -1523,13 +2023,25 @@ class Orquestrador:
                 "aviso": "Estatística histórica reproduzida localmente; não é garantia de retorno"}
             if self.ciclo_ativo:
                 request_id = f"{contrato['run_id']}:{simbolo}:{padrao['id']}:{instante_candle}"
+                if request_id in self.pendentes_jev:
+                    self._evento_funil("queue_deduped", simbolo,
+                                       candidate_id=padrao["id"], request_id=request_id,
+                                       candle_ref=instante_candle, motivo="REQUEST_ALREADY_PENDING")
+                    continue
+                self._evento_funil("queue_enqueue_attempt", simbolo,
+                                   candidate_id=padrao["id"], request_id=request_id,
+                                   candle_ref=instante_candle)
                 registro_base = {"id": id_analise, "simbolo": simbolo,
                                  "instante": _agora_iso(), "padrao": padrao["id"],
                                  "candle_ref": instante_candle,
                                  "direcao": regra["direcao"], "oportunidade": texto}
+                meta = {"run_id": contrato["run_id"], "symbol": simbolo,
+                        "candidate_id": padrao["id"], "candle_ref": instante_candle}
+                enqueued_at = self.relogio()
                 contexto = {"id": id_analise, "simbolo": simbolo,
                             "estado": estado, "padrao": padrao["id"],
                             "identificador": identificador, "candle_ref": instante_candle,
+                            "request_id": request_id, "enqueued_at": enqueued_at,
                             "run_id": contrato["run_id"],
                             "contadores": self.contadores_ciclo,
                             "python_validated_at": contrato["python_validated_at"],
@@ -1537,63 +2049,76 @@ class Orquestrador:
                             "latencia_detecao_ms": max(0, round((self.relogio() - t_deteccao) * 1000)),
                             "registro_base": registro_base}
                 self.pendentes_jev[request_id] = contexto
-                if not self._enfileirar_jev(request_id, estado):
+                if not self._enfileirar_jev(request_id, estado, meta):
                     self.pendentes_jev.pop(request_id, None)
-                    self.contadores_ciclo["jev_fila_cheia"] = \
-                        self.contadores_ciclo.get("jev_fila_cheia", 0) + 1
-                    self.publicar("decisao", {**registro_base, "decisao": "HOLD",
-                                              "justificativa": "Fila JEv cheia; oportunidade não foi enviada",
-                                              "risco": "-", "execucao": "adiada",
-                                              "run_id": contexto["run_id"],
-                                              "jev_dispatched_at": instante_despacho,
-                                              "latencia_detecao_ms": contexto["latencia_detecao_ms"]})
+                    self._evento_funil("queue_full", simbolo, candidate_id=padrao["id"],
+                                       request_id=request_id, candle_ref=instante_candle,
+                                       motivo="QUEUE_FULL")
+                    self._publicar_motivo(simbolo, id_analise, "FILA_BLOQUEADA",
+                                          "Fila JEv cheia; oportunidade não foi enviada",
+                                          candle_ref=instante_candle, candidate_id=padrao["id"])
                     continue
+                self._evento_funil("queue_enqueued", simbolo,
+                                   candidate_id=padrao["id"], request_id=request_id,
+                                   candle_ref=instante_candle)
                 self.logger.info("oportunidade despachada ao worker JEv",
                                  simbolo=simbolo, padrao=padrao["id"],
                                  run_id=contrato["run_id"], request_id=request_id,
                                  latencia_detecao_ms=contexto["latencia_detecao_ms"])
                 continue
-            inicio_jev = self.relogio()  # despacho imediato, na mesma passagem
+            inicio_jev = self.relogio()  # modo síncrono de compatibilidade/teste
+            self._evento_funil("jev_request_started", simbolo, candidate_id=padrao["id"],
+                               candle_ref=instante_candle)
             try:
                 decisao = jev.decide(estado)
             except RuntimeError as exc:
                 contabilizar("ia_indisponivel")
                 self.proxima_tentativa_jev = self.relogio() + TENTATIVA_JEV_S
-                self.publicar("decisao", {"id": id_analise, "simbolo": simbolo, "instante": _agora_iso(),
-                                          "padrao": padrao["id"], "candle_ref": instante_candle,
-                                          "direcao": regra["direcao"], "decisao": "HOLD",
-                                          "oportunidade": texto, "justificativa": str(exc),
-                                          "risco": "-", "execucao": "adiada",
-                                          "run_id": contrato["run_id"],
-                                          "jev_dispatched_at": instante_despacho,
-                                          "latencia_detecao_ms": max(0, round((self.relogio() - t_deteccao) * 1000)),
-                                          "latencia_ms": max(0, round((self.relogio() - inicio_jev) * 1000))})
+                self._evento_funil("jev_http_error", simbolo, candidate_id=padrao["id"],
+                                   candle_ref=instante_candle, motivo="JEV_CLIENT_ERROR",
+                                   duracao_ms=max(0, round((self.relogio() - inicio_jev) * 1000)))
+                self._evento_funil("ineligible_for_jev", simbolo,
+                                   candidate_id=padrao["id"], candle_ref=instante_candle,
+                                   motivo="IA_INDISPONIVEL", error_code="JEV_CLIENT_ERROR")
+                self._publicar_motivo(simbolo, id_analise, "ERRO_API",
+                                      "JEv indisponível; falha técnica, sem decisão de mercado",
+                                      candle_ref=instante_candle, candidate_id=padrao["id"])
                 self.logger.aviso("JEv indisponível", simbolo=simbolo, detalhe=str(exc)[:160])
                 continue
+            self._evento_funil("jev_http_success", simbolo, candidate_id=padrao["id"],
+                               candle_ref=instante_candle,
+                               duracao_ms=max(0, round((self.relogio() - inicio_jev) * 1000)))
+            self._evento_funil("jev_response_received", simbolo,
+                               candidate_id=padrao["id"], candle_ref=instante_candle)
             self.ultimos["decisao"] = agora
             latencia_jev_ms = max(0, round((self.relogio() - inicio_jev) * 1000))
             self.logger.info("decisão JEv recebida", simbolo=simbolo, acao=decisao.action,
                              probabilidade=round(decisao.probability, 2),
                              confianca=round(decisao.confidence, 2), analysis_id=id_analise)
             atualizado = self.fonte.revalidar(estado)
-            if atualizado is None:
-                self.publicar("decisao", {"id": id_analise, "simbolo": simbolo, "instante": _agora_iso(),
-                                          "padrao": padrao["id"], "candle_ref": instante_candle,
-                                          "direcao": regra["direcao"], "decisao": "NAO",
-                                          "oportunidade": texto,
-                                          "justificativa": "Sem cotação recente após JEv",
-                                          "risco": "-", "execucao": "nenhuma",
-                                           "run_id": contrato["run_id"],
-                                           "python_validated_at": contrato["python_validated_at"],
-                                           "jev_dispatched_at": instante_despacho,
-                                           "latencia_detecao_ms": max(0, round((self.relogio() - t_deteccao) * 1000)),
-                                           "latencia_ms": latencia_jev_ms})
+            if (atualizado is None or not atualizado.candles
+                    or atualizado.candles[-1].get("time") != instante_candle):
+                self._evento_funil("response_discarded_stale", simbolo,
+                                   candidate_id=padrao["id"], candle_ref=instante_candle,
+                                   motivo="CLOSED_M1_CHANGED")
+                self._publicar_motivo(simbolo, id_analise, "RESPONSE_DISCARDED_STALE",
+                                      "candle M1 mudou durante a espera da resposta JEv",
+                                      candle_ref=instante_candle, candidate_id=padrao["id"])
                 continue
+            self._evento_funil("response_accepted", simbolo, candidate_id=padrao["id"],
+                               candle_ref=instante_candle, duracao_ms=latencia_jev_ms)
             estado = atualizado
             gate = risk.check(decisao, self.book, self.book.limits, estado)
             acao = decisao.action
+            decision_stage = {"BUY": "decision_buy", "SELL": "decision_sell",
+                              "HOLD": "decision_hold", "AVOID": "decision_no"}.get(acao)
+            if decision_stage:
+                self._evento_funil(decision_stage, simbolo, candidate_id=padrao["id"],
+                                   candle_ref=instante_candle)
             # Resposta do JEv normalizada: SIM (BUY/SELL), NAO (AVOID) ou HOLD.
             if acao == "HOLD":
+                self._evento_funil("paper_not_opened", simbolo, candidate_id=padrao["id"],
+                                   candle_ref=instante_candle, motivo="JEv_HOLD")
                 contabilizar("jev_hold")
                 expira = agora + HOLD_TTL_S
                 self.holds[(simbolo, identificador)] = expira
@@ -1616,6 +2141,8 @@ class Orquestrador:
                 motivos.append("hold")
                 continue
             if acao == "AVOID":
+                self._evento_funil("paper_not_opened", simbolo, candidate_id=padrao["id"],
+                                   candle_ref=instante_candle, motivo="JEv_AVOID")
                 contabilizar("jev_nao")
                 self.publicar("decisao", {"id": id_analise, "simbolo": simbolo, "instante": _agora_iso(),
                                           "padrao": padrao["id"], "candle_ref": instante_candle,
@@ -1636,6 +2163,8 @@ class Orquestrador:
             contabilizar("jev_sim")
             if gate.verdict == "EXECUTE":
                 contabilizar("executadas")
+                self._evento_funil("paper_opened", simbolo, candidate_id=padrao["id"],
+                                   candle_ref=instante_candle)
                 self.book.execute(decisao, estado, gate)
                 self.book.update(self.fonte)
                 self._persistir()
@@ -1660,6 +2189,10 @@ class Orquestrador:
                                  padrao=padrao["id"], candle_ref=instante_candle)
                 return "executada"
             contabilizar("risco_bloqueado")
+            self._evento_funil("risk_veto", simbolo, candidate_id=padrao["id"],
+                               candle_ref=instante_candle, motivo=gate.reason or "RISK_VETO")
+            self._evento_funil("paper_not_opened", simbolo, candidate_id=padrao["id"],
+                               candle_ref=instante_candle, motivo=gate.reason or "RISK_VETO")
             self.publicar("decisao", {"id": id_analise, "simbolo": simbolo, "instante": _agora_iso(),
                                       "padrao": padrao["id"], "candle_ref": instante_candle,
                                       "direcao": acao, "decisao": "SIM",
@@ -1720,9 +2253,11 @@ class Orquestrador:
     def _texto_validacao(validacao):
         total, oos = validacao["total"], validacao["oos"]
         if total["eventos"] == 0:
-            return "sem ocorrências"
+            return f"sem ocorrências | custo {validacao.get('custo_pct', 0)}%"
         return (f"eventos {total['eventos']}, taxa {total['taxa']:.0%}, média {total['media_pct']}% | "
-                f"OOS {oos['eventos']}, taxa {oos['taxa']:.0%}, média {oos['media_pct']}%")
+                f"OOS {oos['eventos']}, taxa {oos['taxa']:.0%}, média {oos['media_pct']}% | "
+                f"custo/spread {validacao.get('custo_pct', 0)}% | "
+                f"motivo {validacao.get('reason_code', validacao.get('motivo', '-'))}")
 
     def resumo(self):
         """Instantâneo seguro para a UI, sem segredos."""

@@ -203,7 +203,7 @@ class TestOrquestrador(unittest.TestCase):
         """Ciclos locais n?o enfileiram nem consultam o cliente legado."""
         with tempfile.TemporaryDirectory() as pasta:
             orch, _ = self._orquestrador(pasta)
-            with patch("jev_bot.orquestrador.deepseek.analisar",
+            with patch("jev_bot.deepseek.analisar",
                        side_effect=AssertionError("DeepSeek desativado")) as analisar:
                 orch._executar_ciclo("c1")
             analisar.assert_not_called()
@@ -388,7 +388,7 @@ class TestOrquestrador(unittest.TestCase):
             orch.eventos = []
             with patch("jev_bot.orquestrador.FonteMT5", return_value=ContextoFonte()), \
                     patch("jev_bot.orquestrador.jev.configuracao", return_value=("chave", "endpoint")), \
-                    patch("jev_bot.orquestrador.deepseek.configuracao_chat",
+                    patch("jev_bot.deepseek.configuracao_chat",
                           side_effect=RuntimeError("sem chave no teste")), \
                     patch.object(Orquestrador, "_proximo_alvo",
                                  lambda self, agora: (agora + 1.0, "teste rápido")):

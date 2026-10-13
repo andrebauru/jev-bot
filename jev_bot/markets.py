@@ -268,10 +268,22 @@ class FonteMT5:
             yield estado
 
     def revalidar(self, estado):
-        """Revalida entrada após JEV sem repetir a coleta de todos os candles."""
+        """Revalida cotação, contrato e candle M1 fechado após a resposta JEv.
+
+        Consulta apenas a última barra fechada. Se o broker não confirmar o
+        mesmo candle de referência usado no despacho, falha fechada para não
+        aprovar uma resposta referente a um snapshot vencido.
+        """
         info = self.api.symbol_info(estado.symbol)
         tick = self.cotacao(estado.symbol)
         if info is None or tick is None or (self.fim_de_semana() and not self.eh_cripto(info)):
+            return None
+        barras = self.api.copy_rates_from_pos(estado.symbol, self.api.TIMEFRAME_M1, 1, 1)
+        if barras is None or len(barras) != 1:
+            return None
+        fechada = self._validar_barras(barras)
+        if (not fechada or not estado.candles
+                or fechada[-1]["time"] != estado.candles[-1]["time"]):
             return None
         valores = self._contrato(info, tick, estado.stop_distance)
         if valores is None:

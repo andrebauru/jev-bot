@@ -3,6 +3,7 @@
 import json
 import math
 import os
+import socket
 import time
 from dataclasses import asdict
 from urllib.error import HTTPError, URLError
@@ -12,6 +13,16 @@ from urllib.request import Request, urlopen
 from .types import ACTIONS, Decision, MarketState
 from .configuracao import carregar_ambiente
 from .risk import Limits
+
+
+class JevError(RuntimeError):
+    """Erro externo tipado, sem credenciais ou corpo de resposta sensível."""
+
+    def __init__(self, code, stage, http_success=False):
+        self.code = code
+        self.stage = stage
+        self.http_success = http_success
+        super().__init__(code)
 
 
 def configuracao():
@@ -71,9 +82,12 @@ def decide(state: MarketState, engine="jev", limites=None) -> Decision:
     req = Request(endpoint, data=body, headers={
         "content-type": "application/json", "authorization": f"Bearer {chave}",
     })
+    http_success = False
     try:
         with urlopen(req, timeout=15) as resposta:
-            data = json.loads(resposta.read(1_000_000).decode())
+            corpo = resposta.read(1_000_000).decode()
+        http_success = True
+        data = json.loads(corpo)
         ans = data["answers"]["action"]
         acao = ans["choice"]
         if ans["type"] != "choice" or acao not in ACTIONS:
@@ -88,9 +102,17 @@ def decide(state: MarketState, engine="jev", limites=None) -> Decision:
                                     for v in (probabilidade, confianca)):
             raise ValueError("Resposta inválida")
     except HTTPError as exc:
-        raise RuntimeError(f"Jev/OpenRouter HTTP {exc.code}; confira chave, saldo e acesso ao modelo.") from None
-    except (URLError, ValueError, KeyError, TypeError, AttributeError, TimeoutError):
-        raise RuntimeError("JEV indisponível ou resposta inválida; execução bloqueada.") from None
+        code = exc.code
+        exc.close()
+        raise JevError(f"HTTP_{code}", "http_error") from None
+    except (TimeoutError, socket.timeout):
+        raise JevError("JEv_TIMEOUT", "timeout") from None
+    except URLError as exc:
+        if isinstance(getattr(exc, "reason", None), (TimeoutError, socket.timeout)):
+            raise JevError("JEv_TIMEOUT", "timeout") from None
+        raise JevError("JEv_NETWORK_ERROR", "http_error") from None
+    except (ValueError, KeyError, TypeError, AttributeError):
+        raise JevError("JEv_PARSE_ERROR", "parse_error", http_success=http_success) from None
     return Decision(state.symbol, acao, probabilidade, confianca, "jev", {
         "engine": "openrouter-jev", "modelo": modelo,
         "latencia_ms": round((time.monotonic() - inicio) * 1000),
