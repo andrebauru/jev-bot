@@ -126,7 +126,8 @@ class TestQualidadeMatematica(unittest.TestCase):
             self.assertIn("taxa", resultado["estabilidade"][chave])
         soma = (resultado["estabilidade"]["oos_primeira_metade"]["eventos"]
                 + resultado["estabilidade"]["oos_segunda_metade"]["eventos"])
-        self.assertEqual(soma, resultado["oos"]["eventos"])
+        self.assertEqual(soma + resultado["estabilidade"]["eventos_purgados_na_metade"],
+                         resultado["oos"]["eventos"])
 
     def test_sem_extrapolacao_alem_da_janela(self):
         """Eventos sem i + horizonte dentro da janela nao sao contados."""
@@ -138,6 +139,43 @@ class TestQualidadeMatematica(unittest.TestCase):
         indices = indices_condicao("quedas_consecutivas", {"n": 3}, candles)
         utilizaveis = [i for i in indices if i + 30 < len(candles)]
         self.assertLessEqual(resultado["total"]["eventos"], len(utilizaveis))
+
+    def test_horizonte_de_treino_nao_vaza_para_oos(self):
+        """Label de treino termina antes do corte; OOS é purgado por horizonte."""
+        candles = candles_deterministicos(1000)
+        for candle in candles:
+            centro = candle["close"]
+            candle["high"], candle["low"] = centro * 1.001, centro * .999
+            candle["open"] = centro
+        capturados = []
+        original = padroes._resultado
+
+        def observar(indices, *args, **kwargs):
+            capturados.append(list(indices))
+            return original(indices, *args, **kwargs)
+
+        with patch("jev_bot.padroes._resultado", side_effect=observar):
+            padroes.validar({"tipo_regra": "amplitude_1min_pct", "parametros": {"pct": .05},
+                             "direcao": "BUY", "horizonte_minutos": 5}, candles, .01)
+        corte = int(len(candles) * .7)
+        train, oos, oos_1, oos_2 = capturados[1:]
+        self.assertTrue(train)
+        self.assertTrue(oos)
+        self.assertLess(max(train) + 5, corte)
+        self.assertGreaterEqual(min(oos), corte)
+        meio = corte + (len(candles) - corte) // 2
+        self.assertTrue(all(i + 5 < meio for i in oos_1))
+        self.assertTrue(all(i >= meio for i in oos_2))
+
+    def test_multiplas_hipoteses_reduzem_limite_wilson_oos(self):
+        candles = candles_deterministicos(6003)
+        regra = {"tipo_regra": "quedas_consecutivas", "parametros": {"n": 3},
+                 "direcao": "BUY", "horizonte_minutos": 5}
+        simples = padroes.validar(regra, candles, .02, familias_testadas=1)
+        multiplas = padroes.validar(regra, candles, .02, familias_testadas=12)
+        self.assertLess(multiplas["estabilidade"]["wilson_inferior_oos_ajustado"],
+                        simples["estabilidade"]["wilson_inferior_oos_ajustado"])
+        self.assertEqual(multiplas["familias_testadas"], 12)
 
     def test_candle_em_formacao_nunca_e_usado(self):
         """Janela/incremento partem de start_pos=1 (candle fechado)."""

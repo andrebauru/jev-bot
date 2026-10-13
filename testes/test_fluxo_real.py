@@ -103,9 +103,8 @@ class TestFluxoReal(unittest.TestCase):
             self.assertLess(ordem.index("jev:TESTE"), ordem.index("fetch:SEGUNDO"),
                             "JEv deve ser despachado na passagem de TESTE antes de buscar o próximo ativo")
             # (a) padrão local sem ocorrências é rejeitado e registrado.
-            status = {p["chave"].split("|")[0]: p["status"]
-                      for p in orch.repositorio.carregar("TESTE")["padroes"]}
-            self.assertIn("rejeitado", status.values())
+            registros_padrao = orch.repositorio.carregar("TESTE")["padroes"]
+            self.assertTrue(any(p["status"] == "rejeitado" for p in registros_padrao))
             # (b) hipótese validada e entrada paper executada.
             fills = orch.book.fills
             self.assertEqual(len(fills), 1)

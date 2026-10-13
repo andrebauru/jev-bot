@@ -22,6 +22,7 @@ import os
 import tempfile
 import time
 from pathlib import Path
+from statistics import NormalDist
 
 from . import motor_matematico
 
@@ -30,6 +31,8 @@ ALGORITMO_VERSAO = "regras-v2.1"  # semântica de regras + validação (off-by-o
 MIN_EVENTOS = 40        # ocorrências mínimas na janela inteira
 MIN_EVENTOS_OOS = 12    # ocorrências mínimas fora da amostra
 MIN_TAXA = 0.55         # taxa de acerto mínima, dentro e fora da amostra
+ALPHA_TESTES = 0.05
+MIN_EVENTOS_OOS_SUBPERIODO = 6
 VALIDADE_DIAS = 7       # validação mais antiga que isso expira
 MAX_PADROES_ATIVO = 40
 
@@ -45,6 +48,32 @@ REGRAS = {
                            "desc": "amplitude do último candle M1 >= pct% do preço"},
     "movimento_pct": {"params": {"pct": (0.05, 5.0), "minutos": (5, 240)},
                       "desc": "movimento de pct% em minutos, na direção da condição"},
+    "rompimento_alta": {"params": {"janela": (20, 240)},
+                        "desc": "fechamento M1 acima do extremo anterior"},
+    "rompimento_baixa": {"params": {"janela": (20, 240)},
+                         "desc": "fechamento M1 abaixo do extremo anterior"},
+    "aceleracao_alta": {"params": {"janela": (2, 10), "limiar_pct": (0.000001, 50.0)},
+                        "desc": "aceleração positiva do retorno vs bloco M1 anterior"},
+    "aceleracao_baixa": {"params": {"janela": (2, 10), "limiar_pct": (0.000001, 50.0)},
+                         "desc": "aceleração negativa do retorno vs bloco M1 anterior"},
+    "reversao_queda": {"params": {"janela": (5, 240), "pct": (0.000001, 50.0)},
+                       "desc": "reversão empírica após queda relativa ao topo anterior"},
+    "reversao_alta": {"params": {"janela": (5, 240), "pct": (0.000001, 50.0)},
+                      "desc": "retração empírica após alta relativa ao fundo anterior"},
+    "impulso_pausa_alta": {"params": {"pausas": (1, 4), "impulso_pct": (0.000001, 50.0),
+                                       "pausa_pct": (0.000001, 50.0),
+                                       "retrace_ratio": (0.1, 0.9)},
+                            "desc": "impulso M1 positivo seguido de pausa curta"},
+    "impulso_pausa_baixa": {"params": {"pausas": (1, 4), "impulso_pct": (0.000001, 50.0),
+                                        "pausa_pct": (0.000001, 50.0),
+                                        "retrace_ratio": (0.1, 0.9)},
+                             "desc": "impulso M1 negativo seguido de pausa curta"},
+    "expansao_amplitude_alta": {"params": {"pct": (0.000001, 50.0),
+                                               "compressao_pct": (0.000001, 50.0)},
+                                "desc": "expansão empírica de amplitude em candle M1 positivo"},
+    "expansao_amplitude_baixa": {"params": {"pct": (0.000001, 50.0),
+                                                "compressao_pct": (0.000001, 50.0)},
+                                 "desc": "expansão empírica de amplitude em candle M1 negativo"},
 }
 DIRECOES = ("BUY", "SELL")
 
@@ -90,7 +119,7 @@ def normalizar_hipotese(hipotese):
         valor = float(bruto)
         if not minimo <= valor <= maximo:
             raise ErroRegra(f"parâmetro {nome}={valor:g} fora de [{minimo}, {maximo}]")
-        limpos[nome] = int(valor) if nome in ("n", "minutos") else valor
+        limpos[nome] = int(valor) if nome in ("n", "minutos", "janela", "pausas") else valor
     direcao = str(hipotese.get("direcao", "")).strip().upper()
     if direcao not in DIRECOES:
         raise ErroRegra("direcao deve ser BUY ou SELL")
@@ -116,6 +145,22 @@ def _closes(candles):
 def _amplitudes(candles):
     return [(float(c["high"]) / float(c["low"]) - 1) * 100 if float(c["low"]) > 0 else 0.0
             for c in candles]
+
+
+def _extremos_anteriores(valores, janela, maximo=True):
+    """Extremo dos `janela` itens anteriores a cada índice, sem lookahead."""
+    from collections import deque
+    fila, saida = deque(), [None] * len(valores)
+    for i, valor in enumerate(valores):
+        while fila and fila[0] < i - janela:
+            fila.popleft()
+        if i >= janela and fila:
+            saida[i] = valores[fila[0]]
+        while fila and ((valores[fila[-1]] <= valor) if maximo
+                        else (valores[fila[-1]] >= valor)):
+            fila.pop()
+        fila.append(i)
+    return saida
 
 
 def indices_condicao(tipo, parametros, candles):
@@ -150,6 +195,81 @@ def indices_condicao(tipo, parametros, candles):
         m = int(parametros["minutos"])
         pct = float(parametros["pct"])
         return [i for i in range(m, n) if abs(closes[i] / closes[i - m] - 1) * 100 >= pct]
+    if tipo in ("rompimento_alta", "rompimento_baixa"):
+        janela = int(parametros["janela"])
+        extremos = _extremos_anteriores(
+            [float(c["high"] if tipo == "rompimento_alta" else c["low"]) for c in candles],
+            janela, maximo=(tipo == "rompimento_alta"))
+        return [i for i in range(janela, n)
+                if extremos[i] is not None and
+                (closes[i] > extremos[i] if tipo == "rompimento_alta"
+                 else closes[i] < extremos[i])]
+    if tipo in ("reversao_queda", "reversao_alta"):
+        janela, pct = int(parametros["janela"]), float(parametros["pct"])
+        maximo = tipo == "reversao_queda"
+        extremos = _extremos_anteriores(closes, janela, maximo=maximo)
+        if maximo:
+            return [i for i in range(janela, n) if extremos[i] is not None
+                    and closes[i] <= extremos[i] * (1 - pct / 100)]
+        return [i for i in range(janela, n) if extremos[i] is not None
+                and closes[i] >= extremos[i] * (1 + pct / 100)]
+    if tipo in ("aceleracao_alta", "aceleracao_baixa"):
+        janela = int(parametros["janela"])
+        limiar = float(parametros["limiar_pct"])
+        retornos = [0.0] + [math.log(closes[i] / closes[i - 1]) * 100
+                            for i in range(1, n)]
+        prefixo = [0.0]
+        for retorno in retornos:
+            prefixo.append(prefixo[-1] + retorno)
+        sinal = 1 if tipo == "aceleracao_alta" else -1
+        saida = []
+        for i in range(2 * janela, n):
+            atual = prefixo[i + 1] - prefixo[i + 1 - janela]
+            anterior = prefixo[i + 1 - janela] - prefixo[i + 1 - 2 * janela]
+            if sinal * (atual - anterior) >= limiar:
+                saida.append(i)
+        return saida
+    if tipo in ("impulso_pausa_alta", "impulso_pausa_baixa"):
+        pausas = int(parametros["pausas"])
+        impulso_min = float(parametros["impulso_pct"])
+        pausa_max = float(parametros["pausa_pct"])
+        retrace_ratio = float(parametros["retrace_ratio"])
+        alta = tipo == "impulso_pausa_alta"
+        saida = []
+        for i in range(pausas + 1, n):
+            impulso = i - pausas
+            move = (closes[impulso] / closes[impulso - 1] - 1) * 100
+            if (move < impulso_min if alta else move > -impulso_min):
+                continue
+            if any(abs((closes[j] / closes[j - 1] - 1) * 100) > pausa_max
+                   for j in range(impulso + 1, i + 1)):
+                continue
+            amplitude = closes[impulso] - closes[impulso - 1]
+            if alta:
+                piso_perm = closes[impulso] - abs(amplitude) * retrace_ratio
+                valido = min(float(candles[j]["low"])
+                             for j in range(impulso + 1, i + 1)) >= piso_perm
+            else:
+                teto_perm = closes[impulso] + abs(amplitude) * retrace_ratio
+                valido = max(float(candles[j]["high"])
+                             for j in range(impulso + 1, i + 1)) <= teto_perm
+            if valido:
+                saida.append(i)
+        return saida
+    if tipo in ("expansao_amplitude_alta", "expansao_amplitude_baixa"):
+        pct = float(parametros["pct"])
+        compressao = float(parametros["compressao_pct"])
+        amplitudes = _amplitudes(candles)
+        prefixo = [0.0]
+        for amplitude in amplitudes:
+            prefixo.append(prefixo[-1] + amplitude)
+        alta = tipo == "expansao_amplitude_alta"
+        janela_compressao = 5
+        return [i for i in range(janela_compressao, n)
+                if amplitudes[i] >= pct and
+                (prefixo[i] - prefixo[i-janela_compressao]) / janela_compressao <= compressao and
+                (float(candles[i]["close"]) > float(candles[i]["open"])
+                 if alta else float(candles[i]["close"]) < float(candles[i]["open"]))]
     raise ErroRegra(f"tipo_regra desconhecido: {tipo}")
 
 
@@ -161,6 +281,15 @@ def condicao_atual(padrao, candles):
     return bool(indices) and indices[-1] == len(candles) - 1
 
 
+def _eventos_nao_sobrepostos(indices, horizonte):
+    """Purga eventos cujo resultado/horizonte se superpõe al evento anterior."""
+    saida = []
+    for indice in indices:
+        if not saida or indice - saida[-1] > horizonte:
+            saida.append(indice)
+    return saida
+
+
 def _resultado(indices, direcao, horizonte, candles, custo_pct):
     """Resultado de cada ocorrência líquida de custo, no horizonte fixado."""
     closes = _closes(candles)
@@ -170,7 +299,8 @@ def _resultado(indices, direcao, horizonte, candles, custo_pct):
         if j >= len(closes):
             break  # sem futuro observado: não extrapola
         entrada, saida = closes[i], closes[j]
-        bruto = (saida / entrada - 1) if direcao == "BUY" else (entrada / saida - 1)
+        bruto = ((saida / entrada - 1) if direcao == "BUY"
+                 else (entrada - saida) / entrada)
         liquidos.append(bruto * 100 - custo_pct)
     if not liquidos:
         return {"eventos": 0, "acertos": 0, "taxa": None, "media_pct": None,
@@ -218,33 +348,50 @@ def wilson_inferior(acertos, n, z=1.96):
     return (centro - margem) / denominador
 
 
-def validar(regra, candles, custo_pct):
+def validar(regra, candles, custo_pct, familias_testadas=1):
     """Reproduz a regra em Python e decide candidato/validado/rejeitado.
 
     `custo_pct` é o custo de ida e volta em % do preço (spread observado).
     O corte fora da amostra é cronológico: os últimos 30% dos eventos
     jamais participam da decisão de descoberta, apenas da verificação.
     """
+    if isinstance(familias_testadas, bool) or not isinstance(familias_testadas, int):
+        raise ValueError("familias_testadas deve ser inteiro positivo")
+    familias_testadas = max(1, familias_testadas)
+    alpha_ajustado = ALPHA_TESTES / familias_testadas
+    z_ajustado = NormalDist().inv_cdf(1 - alpha_ajustado)
     tipo = regra["tipo_regra"]
     horizonte = regra["horizonte_minutos"]
     brutos = indices_condicao(tipo, regra["parametros"], candles)
-    # Eventos sobrepostos: eventos dependentes (a menos de h candles) contam
-    # uma vez; evita que sequências correlacionadas inflem a amostra.
-    indices = []
-    for i in brutos:
-        if not indices or i - indices[-1] > horizonte:
-            indices.append(i)
+    # Amostra total descritiva: eventos sobrepostos contam uma vez.
+    indices = _eventos_nao_sobrepostos(brutos, horizonte)
     total = _resultado(indices, regra["direcao"], horizonte, candles, custo_pct)
     corte = int(len(candles) * motor_matematico.CORTE_OOS)
-    dentro = [i for i in indices if i < corte]
-    fora = [i for i in indices if i >= corte]
+    # Purga no corte: evento de treino só pode usar preço de saída ainda
+    # dentro do treino. OOS é reamostrado independentemente, sem evento de
+    # treino anterior suprimir um evento próximo no lado de teste.
+    dentro = _eventos_nao_sobrepostos(
+        [i for i in brutos if i + horizonte < corte], horizonte)
+    fora = _eventos_nao_sobrepostos(
+        [i for i in brutos if i >= corte and i + horizonte < len(candles)], horizonte)
     amostra = _resultado(dentro, regra["direcao"], horizonte, candles, custo_pct)
     oos = _resultado(fora, regra["direcao"], horizonte, candles, custo_pct)
-    # Estabilidade por subperíodo: metades cronológicas do fora-da-amostra.
-    meio = len(fora) // 2
-    oos_1 = _resultado(fora[:meio], regra["direcao"], horizonte, candles, custo_pct)
-    oos_2 = _resultado(fora[meio:], regra["direcao"], horizonte, candles, custo_pct)
-    estabilidade = {"oos_primeira_metade": oos_1, "oos_segunda_metade": oos_2}
+    # Estabilidade por subperíodo usa um corte temporal e purga o horizonte
+    # que cruza a metade do OOS; não divide por ranking/acertos.
+    meio_tempo = corte + (len(candles) - corte) // 2
+    fora_1 = _eventos_nao_sobrepostos(
+        [i for i in fora if i + horizonte < meio_tempo], horizonte)
+    fora_2 = _eventos_nao_sobrepostos(
+        [i for i in fora if i >= meio_tempo], horizonte)
+    oos_1 = _resultado(fora_1, regra["direcao"], horizonte, candles, custo_pct)
+    oos_2 = _resultado(fora_2, regra["direcao"], horizonte, candles, custo_pct)
+    purgados_metade = sum(i < meio_tempo and i + horizonte >= meio_tempo for i in fora)
+    oos_wilson_ajustado = wilson_inferior(oos["acertos"], oos["eventos"], z=z_ajustado)
+    estabilidade = {"oos_primeira_metade": oos_1, "oos_segunda_metade": oos_2,
+                    "eventos_purgados_na_metade": purgados_metade,
+                    "wilson_inferior_oos_ajustado": round(oos_wilson_ajustado, 4),
+                    "familias_testadas": familias_testadas,
+                    "alpha_ajustado": round(alpha_ajustado, 6)}
     if total["eventos"] == 0:
         return {"status": "rejeitado", "motivo": "Sem ocorrências na janela",
                 "reason_code": "NO_OCCURRENCES",
@@ -252,6 +399,7 @@ def validar(regra, candles, custo_pct):
                 "total": total, "amostra": amostra, "oos": oos,
                 "estabilidade": estabilidade, "custo_pct": custo_pct,
                 "cost_basis": "spread_only",
+                "familias_testadas": familias_testadas,
                 "wilson_inferior": None}
     if total["eventos"] < MIN_EVENTOS or oos["eventos"] < MIN_EVENTOS_OOS:
         return {"status": "rejeitado", "motivo": "Amostra insuficiente",
@@ -260,8 +408,11 @@ def validar(regra, candles, custo_pct):
                 "total": total, "amostra": amostra, "oos": oos,
                 "estabilidade": estabilidade, "custo_pct": custo_pct,
                 "cost_basis": "spread_only",
+                "familias_testadas": familias_testadas,
                 "wilson_inferior": round(wilson_inferior(total["acertos"], total["eventos"]), 4)}
-    aprovado = (amostra["taxa"] >= MIN_TAXA and oos["taxa"] >= MIN_TAXA and total["media_pct"] > 0)
+    aprovado_base = (amostra["taxa"] >= MIN_TAXA and oos["taxa"] >= MIN_TAXA
+                     and amostra["media_pct"] > 0 and oos["media_pct"] > 0)
+    aprovado = aprovado_base
     if aprovado:
         motivo = "Evidência dentro e fora da amostra"
         reason_code = "QUANT_VALIDATED"
@@ -273,16 +424,36 @@ def validar(regra, candles, custo_pct):
             reason_codes.append("IN_SAMPLE_RATE_BELOW_MIN")
         if oos["taxa"] < MIN_TAXA:
             reason_codes.append("OOS_RATE_BELOW_MIN")
-        if total["media_pct"] <= 0:
+        if amostra["media_pct"] is not None and amostra["media_pct"] <= 0:
             reason_codes.append("COST_EXCEEDS_GROSS_EDGE"
-                                if total["media_pct"] + custo_pct > 0
-                                else "EXPECTED_NET_RETURN_NONPOSITIVE")
+                                if amostra["media_pct"] + custo_pct > 0
+                                else "IN_SAMPLE_EXPECTANCY_NONPOSITIVE")
+        if oos["media_pct"] is not None and oos["media_pct"] <= 0:
+            reason_codes.append("COST_EXCEEDS_GROSS_EDGE"
+                                if oos["media_pct"] + custo_pct > 0
+                                else "OOS_EXPECTANCY_NONPOSITIVE")
         reason_code = reason_codes[0] if reason_codes else "QUANT_VALIDATION_FAILED"
+    if familias_testadas > 1 and aprovado_base:
+        controles = []
+        if (oos_1["eventos"] < MIN_EVENTOS_OOS_SUBPERIODO
+                or oos_2["eventos"] < MIN_EVENTOS_OOS_SUBPERIODO):
+            controles.append("OOS_SUBPERIOD_SAMPLE_INSUFFICIENT")
+        elif oos_1["taxa"] < MIN_TAXA or oos_2["taxa"] < MIN_TAXA:
+            controles.append("OOS_SUBPERIOD_UNSTABLE")
+        if oos_wilson_ajustado <= 0.5:
+            controles.append("OOS_MULTIPLE_TEST_CONTROL")
+        if controles:
+            aprovado = False
+            motivo = "Estabilidade/OOS insuficiente após controle de múltiplas hipóteses"
+            reason_codes = controles
+            reason_code = controles[0]
+    reason_codes = list(dict.fromkeys(reason_codes))
     return {"status": "validado" if aprovado else "rejeitado", "motivo": motivo,
             "reason_code": reason_code,
             "reason_codes": reason_codes,
             "total": total, "amostra": amostra, "oos": oos, "estabilidade": estabilidade,
             "custo_pct": custo_pct, "cost_basis": "spread_only",
+            "familias_testadas": familias_testadas,
             "wilson_inferior": round(wilson_inferior(total["acertos"], total["eventos"]), 4)}
 
 
@@ -311,7 +482,8 @@ def contrato_oportunidade(padrao, candles, analysis_id, risk_context, agora=None
     eventos = padrao.get("eventos") or {}
     fora = padrao.get("fora_amostra") or {}
     evidencia = {
-        "pattern_id": padrao["id"], "chave": padrao.get("chave"),
+        "pattern_id": padrao["id"], "strategy_id": padrao.get("strategy_id", regra["tipo"]),
+        "chave": padrao.get("chave"),
         "algoritmo_versao": padrao.get("algoritmo_versao", ALGORITMO_VERSAO),
         "janela": [padrao.get("janela_inicio"), padrao.get("janela_fim")],
         "eventos": eventos, "fora_amostra": fora,
@@ -471,6 +643,7 @@ class RepositorioPadroes:
             registro["justificativa"] = regra.get("justificativa", "") or registro.get("justificativa", "")
         registro.update({
             "status": validacao["status"], "motivo_status": validacao["motivo"],
+            "strategy_id": regra.get("strategy_id", tipo),
             "janela_inicio": janela_info["inicio"], "janela_fim": janela_info["fim"],
             "janela_dias": janela_info.get("dias"), "amostra_candles": janela_info.get("candles"),
             "eventos": validacao["total"], "amostra": validacao["amostra"],

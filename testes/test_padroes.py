@@ -5,7 +5,7 @@ import tempfile
 from pathlib import Path
 import unittest
 
-from apoio import candles_sinteticos, janela
+from apoio import candles_deterministicos, candles_sinteticos, janela
 from jev_bot import padroes
 
 
@@ -55,6 +55,13 @@ class TestPadroes(unittest.TestCase):
         self.assertEqual(rejeitado["status"], "rejeitado")
         self.assertIn("amostra", rejeitado["motivo"].casefold())
 
+    def test_retorno_buy_sell_usa_mesmo_preco_de_entrada_como_base(self):
+        candles = [{"time": 0, "close": 100.0}, {"time": 60, "close": 110.0}]
+        self.assertAlmostEqual(padroes._resultado([0], "BUY", 1, candles, 0)["media_pct"], 10.0)
+        self.assertAlmostEqual(padroes._resultado([0], "SELL", 1, candles, 0)["media_pct"], -10.0)
+        candles[1]["close"] = 90.0
+        self.assertAlmostEqual(padroes._resultado([0], "SELL", 1, candles, 0)["media_pct"], 10.0)
+
     def test_repositorio_deduplica_persiste_e_expira(self):
         with tempfile.TemporaryDirectory() as pasta:
             repo = padroes.RepositorioPadroes(Path(pasta), relogio=lambda: 1_000_000)
@@ -93,6 +100,74 @@ class TestPadroes(unittest.TestCase):
             self.assertEqual(len(repo.validados("TESTE")), 0)
             self.assertEqual(repo.aplicar_revisoes(
                 "TESTE", [{"id": "inexistente", "acao": "expirar", "motivo": ""}]), [])
+
+
+class TestNovasFamiliasM1(unittest.TestCase):
+    """Famílias adicionais são dimensionais, reproduzíveis e causais."""
+
+    @staticmethod
+    def _candles(closes, spans=None):
+        spans = spans or [.1] * len(closes)
+        return [{"time": i * 60, "open": close,
+                 "high": close + spans[i] / 2, "low": close - spans[i] / 2,
+                 "close": close, "tick_volume": 1}
+                for i, close in enumerate(closes)]
+
+    def test_sinais_pos_dir_em_fechamentos_e_sem_lookahead(self):
+        alta_rompimento = self._candles([100.0] * 10 + [101.0], [.1] * 10 + [.4])
+        reversao = self._candles([100.0] * 10 + [94.0])
+        aceleracao = self._candles(
+            [100, 100.1, 100.2, 100.3, 100.4, 100.5, 101.1, 101.7,
+             102.3, 102.9, 103.5])
+        impulso = self._candles([100, 100.1, 101.2, 101.25, 101.27])
+        expansao = self._candles([100] * 5 + [101], [.1] * 5 + [1.8])
+        expansao[-1]["open"] = 100.1
+        casos = (
+            ("rompimento_alta", {"janela": 5}, alta_rompimento),
+            ("reversao_queda", {"janela": 5, "pct": 5}, reversao),
+            ("aceleracao_alta", {"janela": 5, "limiar_pct": .1}, aceleracao),
+            ("impulso_pausa_alta", {"pausas": 2, "impulso_pct": .5,
+                                     "pausa_pct": .2, "retrace_ratio": .5}, impulso),
+            ("expansao_amplitude_alta", {"pct": 1, "compressao_pct": .2}, expansao),
+        )
+        for tipo, parametros, candles in casos:
+            with self.subTest(estrategia=tipo):
+                indices = padroes.indices_condicao(tipo, parametros, candles)
+                self.assertTrue(indices)
+                self.assertEqual(indices[-1], len(candles) - 1)
+                candle_futuro = {"time": len(candles) * 60, "open": 1,
+                                 "high": 10000, "low": .1, "close": 9000,
+                                 "tick_volume": 1}
+                estendidos = padroes.indices_condicao(tipo, parametros,
+                                                      candles + [candle_futuro])
+                self.assertEqual([i for i in estendidos if i < len(candles)], indices)
+                escalados = [{**c, **{chave: c[chave] * 1000
+                                      for chave in ("open", "high", "low", "close")}}
+                             for c in candles]
+                self.assertEqual(padroes.indices_condicao(tipo, parametros, escalados), indices)
+
+    def test_familias_tem_limite_e_ids_estaveis(self):
+        from jev_bot import candidatos, motor_matematico
+        candles = candles_deterministicos()
+        discovery, _ = motor_matematico.janela_descoberta(candles)
+        stats = motor_matematico.estatisticas(janela(discovery), 0.02)
+        regras = candidatos.regras_candidatas(stats, candles)
+        self.assertLessEqual(len(regras), candidatos.MAX_LOCAL_HYPOTHESES)
+        self.assertTrue(all(regra.get("strategy_id") for regra in regras))
+        ids = [padroes.id_regra(padroes.chave_regra(
+            r["tipo_regra"], r["parametros"], r["direcao"], r["horizonte_minutos"]))
+            for r in regras]
+        self.assertEqual(len(ids), len(set(ids)))
+
+        rompimento = self._candles([100.0] * 64 + [101.0], [.1] * 64 + [.4])
+        stats_contruidos = {
+            "disponivel": True,
+            "movimento_1min": {"p75_abs_pct": .02, "p95_abs_pct": .1,
+                               "p99_abs_pct": .3, "desvio_pct": .02},
+            "amplitude_1min": {"mediana_pct": .1, "p95_pct": .5},
+        }
+        novas = candidatos.regras_candidatas(stats_contruidos, rompimento)
+        self.assertIn("range_breakout", {r["strategy_id"] for r in novas})
 
 
 if __name__ == "__main__":

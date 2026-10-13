@@ -144,6 +144,7 @@ class FonteMT5:
         if candles is None:
             return None
         candles = [c for c in candles if c["time"] > desde]
+        candles = [c for c in candles if c["time"] + 60 <= self.relogio()]
         if not candles:
             return None
         candles.sort(key=lambda c: c["time"])
@@ -182,6 +183,9 @@ class FonteMT5:
         # Ordem cronológica estrita: descarta repetições ou regressões do broker.
         coletados.sort(key=lambda c: c["time"])
         coletados = [c for i, c in enumerate(coletados) if i == 0 or c["time"] > coletados[i - 1]["time"]]
+        # Filtra adicionalmente por relógio UTC local: alguns terminais podem
+        # incluir a barra M1 corrente mesmo quando se solicitou start_pos=1.
+        coletados = [c for c in coletados if c["time"] + 60 <= self.relogio()]
         if len(coletados) < 2:
             return None
         lacunas = [int((b["time"] - a["time"]) / 60 - 1) for a, b in zip(coletados, coletados[1:])]

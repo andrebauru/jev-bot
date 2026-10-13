@@ -65,6 +65,15 @@ class TestDownloadHistorico(unittest.TestCase):
         self.assertEqual(janela["recebidos"], 1000)
         self.assertEqual(janela["solicitados"], 30 * 1440)
 
+    def test_exclui_barra_corrente_mesmo_se_mt5_a_retornar(self):
+        """Barra cujo minuto ainda não fechou é removida por timestamp UTC."""
+        api = ApiHistorico(total=5000, fim=T0)
+        fonte = FonteMT5(api=api, ajuste_horas=0, relogio=lambda: T0 + 30)
+        janela = fonte.janela_m1("TESTE", dias=1, lote=1440)
+        self.assertIsNotNone(janela)
+        self.assertEqual(janela["recebidos"], 1439)
+        self.assertLessEqual(janela["candles"][-1]["time"] + 60, T0 + 30)
+
     def test_progresso_por_lote(self):
         """O callback de progresso recebe contagem cumulativa por lote."""
         api = ApiHistorico(total=5000)

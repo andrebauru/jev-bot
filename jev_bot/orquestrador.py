@@ -1261,6 +1261,7 @@ class Orquestrador:
         id_ciclo = f"ciclo{self.ciclo}"
         run_id = __import__("uuid").uuid4().hex[:8]
         resultado_ciclo = "CONCLUIDO"
+        jev_pendentes = 0
         self.logger.info("ciclo iniciado", ciclo=self.ciclo, analysis_id=id_ciclo,
                          run_id=run_id)
         self._estado_set("ANALISANDO", f"Ciclo {self.ciclo}", fase="VARRENDO")
@@ -1471,14 +1472,16 @@ class Orquestrador:
                                                       if estado.candles else None))
             except (RuntimeError, ValueError, KeyError) as exc:
                 self.contadores_ciclo["erros"] = self.contadores_ciclo.get("erros", 0) + 1
+                codigo_erro = ("COST_UNKNOWN" if "COST_UNKNOWN" in str(exc)
+                               else "SEM_ELEGIBILIDADE")
                 if not fetch_completed:
                     self._evento_funil("fetch_error", simbolo, motivo="MT5_STATE_ERROR",
                                        detalhe=str(exc)[:120],
                                        duracao_ms=round((time.monotonic() - inicio_fetch) * 1000))
                 else:
-                    self._evento_funil("ineligible_for_jev", simbolo, motivo="PIPELINE_ERROR",
+                    self._evento_funil("ineligible_for_jev", simbolo, motivo=codigo_erro,
                                        detalhe=str(exc)[:120])
-                self._publicar_motivo(simbolo, id_ciclo, "ERRO", str(exc)[:160])
+                self._publicar_motivo(simbolo, id_ciclo, codigo_erro, str(exc)[:160])
                 self.logger.erro("falha na análise", simbolo=simbolo, detalhe=str(exc)[:160])
             finally:
                 self.em_analise.discard(simbolo)
@@ -1697,12 +1700,12 @@ class Orquestrador:
         recorte = {**janela, "candles": descoberta, "fim": descoberta[-1]["time"]}
         cotacao = self.fonte.cotacao(simbolo)
         if cotacao is None:
-            raise RuntimeError("Cotação atual indisponível; validação de custos suspensa")
+            raise RuntimeError("COST_UNKNOWN: cotação atual indisponível; validação de custos suspensa")
         bid, ask, _ = cotacao
         preco_atual = (bid + ask) / 2
         spread_abs = ask - bid
         if not (0 < preco_atual and math.isfinite(spread_abs) and spread_abs >= 0):
-            raise RuntimeError("Bid/ask inválidos; validação de custos suspensa")
+            raise RuntimeError("COST_UNKNOWN: bid/ask inválidos; validação de custos suspensa")
         stats = estatisticas(recorte, 0.0)
         custo_pct = round(spread_abs / preco_atual * 100, 4)
         stats["custo_spread_pct"] = custo_pct
@@ -1720,8 +1723,10 @@ class Orquestrador:
             interna = registro["regra"]
             regra = {"tipo_regra": interna["tipo"], "parametros": interna["parametros"],
                      "direcao": interna["direcao"], "horizonte_minutos": interna["horizonte_minutos"],
-                     "justificativa": registro.get("justificativa", "")}
-            validacao = padroes.validar(regra, janela["candles"], custo_pct)
+                     "justificativa": registro.get("justificativa", ""),
+                     "strategy_id": registro.get("strategy_id", interna["tipo"])}
+            validacao = padroes.validar(regra, janela["candles"], custo_pct,
+                                       familias_testadas=candidatos.MAX_LOCAL_HYPOTHESES)
             atualizado = self.repositorio.registrar(simbolo, regra, validacao,
                                                     registro.get("origem", "local"), janela_info)
             trades_padrao = [tr for tr in self.book.trades
@@ -1784,19 +1789,22 @@ class Orquestrador:
                        "dias": dias_janela, "candles": janela["recebidos"]}
         for regra in regras:
             inicio_validacao = time.monotonic()
-            validacao = padroes.validar(regra, janela["candles"], custo_pct)
+            validacao = padroes.validar(regra, janela["candles"], custo_pct,
+                                       familias_testadas=max(1, len(regras)))
             duracao_validacao_ms = max(0, round((time.monotonic() - inicio_validacao) * 1000))
             registro = self.repositorio.registrar(simbolo, regra, validacao, "local",
                                                   janela_info)
             candidate_id = registro["id"]
             self._evento_funil("candidate_generated", simbolo,
                                candidate_id=candidate_id, candle_ref=candle_ref,
+                               strategy_id=registro.get("strategy_id", regra["tipo_regra"]),
                                direcao=regra["direcao"], horizonte_minutos=regra["horizonte_minutos"],
                                duracao_ms=duracao_geracao_ms)
             self.contadores_ciclo["candidatos_locais"] = \
                 self.contadores_ciclo.get("candidatos_locais", 0) + 1
             self.publicar("calc", {"id": id_analise, "simbolo": simbolo,
                                    "run_id": getattr(self, "run_id_atual", id_analise),
+                                   "strategy_id": registro.get("strategy_id", regra["tipo_regra"]),
                                    "instante": _agora_iso(), "etapa": "validacao_local",
                                    "padrao": registro["id"], "candidate_id": registro["id"],
                                    "candle_ref": candle_ref,
@@ -1817,10 +1825,13 @@ class Orquestrador:
                                    commission_pct=None, slippage_pct=None,
                                    cost_basis="spread_only",
                                    window_days=dias_janela,
-                                   training_days=stats.get("dias"),
-                                   validation_validity_days=padroes.VALIDADE_DIAS,
-                                   validation_remaining_days=padroes.VALIDADE_DIAS,
-                                   duracao_ms=duracao_validacao_ms)
+                                    training_days=stats.get("dias"),
+                                    validation_validity_days=padroes.VALIDADE_DIAS,
+                                    validation_remaining_days=padroes.VALIDADE_DIAS,
+                                    familias_testadas=validacao.get("familias_testadas", 1),
+                                    oos_wilson_lower_adjusted=validacao["estabilidade"].get(
+                                        "wilson_inferior_oos_ajustado"),
+                                    duracao_ms=duracao_validacao_ms)
                 self.contadores_ciclo["locais_validados"] = \
                     self.contadores_ciclo.get("locais_validados", 0) + 1
                 self.logger.info("candidato local validado", simbolo=simbolo,
@@ -1834,6 +1845,13 @@ class Orquestrador:
                               "oos_n": validacao["oos"]["eventos"],
                               "oos_rate": validacao["oos"]["taxa"],
                               "expected_net_return": validacao["total"]["media_pct"],
+                              "familias_testadas": validacao.get("familias_testadas", 1),
+                              "oos_wilson_lower_adjusted": validacao["estabilidade"].get(
+                                  "wilson_inferior_oos_ajustado"),
+                              "oos_primeira_metade": validacao["estabilidade"][
+                                  "oos_primeira_metade"],
+                              "oos_segunda_metade": validacao["estabilidade"][
+                                  "oos_segunda_metade"],
                               "cost_spread_pct": custo_pct,
                               "commission_pct": None, "slippage_pct": None,
                               "cost_basis": "spread_only",

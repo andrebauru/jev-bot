@@ -32,6 +32,12 @@ class TestRegrasCandidatas(unittest.TestCase):
             janela(descoberta), 0.02)
         regras = candidatos.regras_candidatas(stats, descoberta)
         self.assertTrue(regras, "o padrão determinístico deve gerar candidato")
+        self.assertLessEqual(len(regras), candidatos.MAX_LOCAL_HYPOTHESES)
+        self.assertTrue(all(regra.get("strategy_id") for regra in regras))
+        base_operacional = [r for r in candidatos.regras_candidatas_baseline(stats, descoberta)
+                            if r["tipo_regra"] not in ("queda_pct", "alta_pct")]
+        self.assertGreaterEqual(len(regras), len(base_operacional))
+        self.assertFalse(any(r["tipo_regra"] in ("queda_pct", "alta_pct") for r in regras))
         # Último candle fecha em 3 quedas: candidato de quedas consecutivas.
         sequencias = [r for r in regras if r["tipo_regra"] == "quedas_consecutivas"]
         self.assertTrue(sequencias)

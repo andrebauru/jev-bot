@@ -105,11 +105,15 @@ def estatisticas(janela, spread=0.0):
     # Distribuição dos movimentos de 1 minuto.
     positivos = [m for m in mov if m > 0]
     negativos = [m for m in mov if m < 0]
+    abs_mov = [abs(m) for m in mov]
     media_mov = sum(mov) / len(mov)
     base["movimento_1min"] = {
         "n": len(mov), "media_pct": _arredonda(media_mov),
         "mediana_pct": _arredonda(percentil(mov, .5)),
         "p90_pct": _arredonda(percentil(mov, .9)), "p99_pct": _arredonda(percentil(mov, .99)),
+        "p75_abs_pct": _arredonda(percentil(abs_mov, .75)),
+        "p95_abs_pct": _arredonda(percentil(abs_mov, .95)),
+        "p99_abs_pct": _arredonda(percentil(abs_mov, .99)),
         "desvio_pct": _arredonda(math.sqrt(sum((m - media_mov) ** 2 for m in mov) / len(mov))),
         "max_alta_pct": _arredonda(max(mov)), "max_baixa_pct": _arredonda(min(mov)),
         "altas": len(positivos), "baixas": len(negativos),
@@ -120,7 +124,9 @@ def estatisticas(janela, spread=0.0):
     amplitudes = [(c["high"] / c["low"] - 1) * 100 for c in candles if c["low"] > 0]
     base["amplitude_1min"] = {
         "n": len(amplitudes), "mediana_pct": _arredonda(percentil(amplitudes, .5)),
-        "p90_pct": _arredonda(percentil(amplitudes, .9)), "p99_pct": _arredonda(percentil(amplitudes, .99)),
+        "p90_pct": _arredonda(percentil(amplitudes, .9)),
+        "p95_pct": _arredonda(percentil(amplitudes, .95)),
+        "p99_pct": _arredonda(percentil(amplitudes, .99)),
     }
     for limiar in (0.1, 0.25, 0.5, 1.0):
         base[f"freq_abs_{limiar}"] = _arredonda(sum(abs(m) >= limiar for m in mov) / len(mov))

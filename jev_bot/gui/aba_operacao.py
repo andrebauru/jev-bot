@@ -481,7 +481,7 @@ class AbaOperacao(QWidget):
                               VERDE if r.get("motivo") in ("PAPER_EXECUTED", "DECISION_SIM")
                               else VERMELHO if r.get("motivo") in (
                                   "NO_SETUP", "SEM_SETUP", "RISK_BLOCK", "VETO_RISCO",
-                                  "ERRO", "ERRO_API", "FILA_BLOQUEADA")
+                                  "ERRO", "ERRO_API", "COST_UNKNOWN", "FILA_BLOQUEADA")
                               else None))
             elif canal == "decisao":
                 decisao = str(r.get("decisao") or "-")
