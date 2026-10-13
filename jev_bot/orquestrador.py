@@ -1983,8 +1983,10 @@ class Orquestrador:
                 self._publicar_motivo(simbolo, id_analise, "SPREAD_TOO_HIGH", pre,
                                       candle_ref=instante_candle, candidate_id=padrao["id"])
                 return "pre_bloqueado"
+            request_id = f"{contrato['run_id']}:{simbolo}:{padrao['id']}:{instante_candle}"
             self._evento_funil("eligible_for_jev", simbolo,
                                candidate_id=padrao["id"], candle_ref=instante_candle,
+                               request_id=request_id,
                                motivo="QUANT_VALIDATED",
                                sample_size=padrao.get("eventos", {}).get("eventos"),
                                oos_n=padrao.get("fora_amostra", {}).get("eventos"),
@@ -2022,7 +2024,6 @@ class Orquestrador:
                 "eventos": padrao["eventos"], "fora_amostra": padrao["fora_amostra"],
                 "aviso": "Estatística histórica reproduzida localmente; não é garantia de retorno"}
             if self.ciclo_ativo:
-                request_id = f"{contrato['run_id']}:{simbolo}:{padrao['id']}:{instante_candle}"
                 if request_id in self.pendentes_jev:
                     self._evento_funil("queue_deduped", simbolo,
                                        candidate_id=padrao["id"], request_id=request_id,

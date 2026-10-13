@@ -273,20 +273,17 @@ pelo modelo não representa uma probabilidade comprovada de lucro no mercado.
 ## Verificação
 
 ```powershell
-python tests.py
-python -X utf8 testes_novos.py
-python -m compileall -q jev_bot
-python -m jev_bot scan
+python -X utf8 -m unittest discover -s testes
+python -m compileall -q jev_bot testes
 ```
 
-Os testes usam doubles isolados de MT5/JEV/DeepSeek para verificar risco,
-cotação antiga/futura, cache de inativos antes dos candles, stops com gap,
-persistência, pausa, concorrência e consulta sem execução. `testes_novos.py`
-cobre o motor matemático de 30 dias, as regras de padrões e a validação
-fora da amostra, o schema e o orçamento do DeepSeek, o orquestrador
-(cadência, PARADO POR RISCO, emergência, fila de comandos) e uma fumaça
-da interface offscreen. Esses doubles não são fontes disponíveis no
-programa. A verificação MT5 real é separada dos testes unitários;
+Os testes em `testes/` usam doubles isolados de MT5 e JEv para verificar risco,
+candles e cache, regras/OOS, despacho assíncrono, expiração de snapshot,
+backpressure, persistência, pausa, emergência e GUI offscreen. Os transports
+HTTP são mockados/guardados; nenhuma chamada paga ou ordem real ocorre na
+suíte. O cliente DeepSeek permanece como módulo legado sem referência
+operacional. Os doubles não substituem dados reais do MT5. A verificação MT5
+somente leitura é separada dos testes unitários;
 `verificar_janela30d.py` (somente leitura) confere a janela de 30 dias e
 `verificar_gui_offscreen.py` exercita a interface com motor simulado.
 
