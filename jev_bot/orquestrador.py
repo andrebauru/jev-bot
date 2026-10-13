@@ -33,6 +33,7 @@ from __future__ import annotations
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
+import copy
 import json
 import queue
 import threading
@@ -136,6 +137,10 @@ class Orquestrador:
         self.evento_emergencia = threading.Event()
         self.evento_ciclo_cancelado = threading.Event()
         self.acoes = queue.Queue()
+        self.fila_jev = queue.Queue(maxsize=128)
+        self.resultados_jev = queue.Queue()
+        self.pendentes_jev = {}
+        self.worker_jev = None
         self.fonte = None
         self.book = None
         self.repositorio = None
@@ -497,6 +502,7 @@ class Orquestrador:
         agora = self.relogio()
         while not self.encerrar.is_set():
             self._processar_acoes()
+            self._processar_resultados_jev()
             self._monitorar()
             self.descarregar()
             if self.pausado or self.parado_risco or self.emergencia_ativa:
@@ -512,6 +518,137 @@ class Orquestrador:
             self.encerrar.wait(min(0.5, restante))
             agora = self.relogio()
         return True
+
+    def _worker_jev_loop(self):
+        """Thread único de rede JEv; nunca toca na carteira, GUI ou scanner."""
+        while not self.encerrar.is_set():
+            try:
+                request_id, estado = self.fila_jev.get(timeout=0.25)
+            except queue.Empty:
+                continue
+            if request_id is None:
+                return
+            inicio = time.monotonic()
+            try:
+                decisao = jev.decide(estado)
+                erro = None
+            except Exception as exc:  # a thread só devolve resultado ao orquestrador
+                decisao, erro = None, str(exc)[:240]
+            self.resultados_jev.put((request_id, decisao, erro,
+                                     max(0, round((time.monotonic() - inicio) * 1000))))
+
+    def _enfileirar_jev(self, request_id, estado):
+        """Despacha sem bloquear; um consumidor serializa as chamadas de rede."""
+        try:
+            self.fila_jev.put_nowait((request_id, copy.deepcopy(estado)))
+        except queue.Full:
+            return False
+        if self.worker_jev is None or not self.worker_jev.is_alive():
+            self.worker_jev = threading.Thread(target=self._worker_jev_loop,
+                                               name="JEvNetworkWorker", daemon=True)
+            self.worker_jev.start()
+        return True
+
+    def _processar_resultados_jev(self):
+        """Aplica respostas na thread do orquestrador, com candle e risco atuais."""
+        while True:
+            try:
+                request_id, decisao, erro, latencia_ms = self.resultados_jev.get_nowait()
+            except queue.Empty:
+                return
+            contexto = self.pendentes_jev.pop(request_id, None)
+            if contexto is None:
+                continue
+            self._finalizar_decisao_jev(contexto, decisao, erro, latencia_ms)
+
+    def _finalizar_decisao_jev(self, contexto, decisao, erro, latencia_ms):
+        """Finaliza política, validação temporal e paper exclusivamente no motor."""
+        simbolo = contexto["simbolo"]
+        if erro:
+            self.contadores_ciclo["ia_indisponivel"] = \
+                self.contadores_ciclo.get("ia_indisponivel", 0) + 1
+            self.proxima_tentativa_jev = self.relogio() + TENTATIVA_JEV_S
+            self.publicar("decisao", {**contexto["registro_base"], "decisao": "HOLD",
+                                      "justificativa": erro, "risco": "-", "execucao": "adiada",
+                                      "run_id": contexto["run_id"],
+                                      "python_validated_at": contexto["python_validated_at"],
+                                      "jev_dispatched_at": contexto["jev_dispatched_at"],
+                                      "latencia_detecao_ms": contexto["latencia_detecao_ms"],
+                                      "latencia_ms": latencia_ms})
+            self.logger.aviso("JEv indisponível", simbolo=simbolo, detalhe=erro[:160])
+            return
+
+        atualizado = self.fonte.revalidar(contexto["estado"])
+        if (atualizado is None or not atualizado.candles
+                or atualizado.candles[-1].get("time") != contexto["candle_ref"]):
+            self.contadores_ciclo["stale_jev_response"] = \
+                self.contadores_ciclo.get("stale_jev_response", 0) + 1
+            self.logger.info("resposta JEv descartada: candle vencido", simbolo=simbolo,
+                             run_id=contexto["run_id"], candle_ref=contexto["candle_ref"])
+            return
+
+        self.ultimos["decisao"] = self.relogio()
+        self.logger.info("decisão JEv recebida", simbolo=simbolo, acao=decisao.action,
+                         probabilidade=round(decisao.probability, 2),
+                         confianca=round(decisao.confidence, 2),
+                         analysis_id=contexto["id"], run_id=contexto["run_id"])
+        gate = risk.check(decisao, self.book, self.book.limits, atualizado)
+        acao = decisao.action
+        base = contexto["registro_base"]
+        metadata = {"run_id": contexto["run_id"],
+                    "python_validated_at": contexto["python_validated_at"],
+                    "jev_dispatched_at": contexto["jev_dispatched_at"],
+                    "latencia_detecao_ms": contexto["latencia_detecao_ms"],
+                    "latencia_ms": latencia_ms}
+        if acao == "HOLD":
+            self.contadores_ciclo["jev_hold"] = self.contadores_ciclo.get("jev_hold", 0) + 1
+            expira = self.relogio() + HOLD_TTL_S
+            self.holds[(simbolo, contexto["identificador"])] = expira
+            self.publicar("decisao", {**base, "decisao": "HOLD",
+                                      "justificativa": f"JEv HOLD p={decisao.probability:.0%} "
+                                                       f"c={decisao.confidence:.0%}; oportunidade adiada",
+                                      "risco": gate.reason or "aguardando", "policy": "PENDING",
+                                      "paper": "NOT_OPENED",
+                                      "execucao": f"adiada por até {HOLD_TTL_S // 60}min, depois descartada",
+                                      **metadata})
+            return
+        if acao == "AVOID":
+            self.contadores_ciclo["jev_nao"] = self.contadores_ciclo.get("jev_nao", 0) + 1
+            self.publicar("decisao", {**base, "decisao": "NAO",
+                                      "justificativa": f"JEv AVOID p={decisao.probability:.0%} "
+                                                       f"c={decisao.confidence:.0%}; candidata descartada",
+                                      "risco": gate.reason or "-", "execucao": "nenhuma",
+                                      "policy": "VETO", "paper": "NOT_OPENED", **metadata})
+            return
+        self.contadores_ciclo["jev_sim"] = self.contadores_ciclo.get("jev_sim", 0) + 1
+        if gate.verdict == "EXECUTE":
+            self.contadores_ciclo["executadas"] = self.contadores_ciclo.get("executadas", 0) + 1
+            self.book.execute(decisao, atualizado, gate)
+            self.book.update(self.fonte)
+            self._persistir()
+            self.ultimos["trade"] = self.relogio()
+            self.publicar("decisao", {**base, "decisao": "SIM", "direcao": acao,
+                                      "justificativa": f"JEv SIM p={decisao.probability:.0%} "
+                                                       f"c={decisao.confidence:.0%}; padrão validado",
+                                      "risco": f"autorizado; risco {gate.risk_amount:.2f} {self.book.currency}",
+                                      "policy": "ALLOW", "paper": "OPENED",
+                                      "execucao": f"paper aberto: {gate.volume:g} lote(s) a {gate.entry:.8g}; stop {gate.stop:.8g}; alvo {gate.target:.8g}",
+                                      **metadata})
+            self.publicar("trades", list(reversed(self.book.trades[-500:])))
+            self.logger.info("entrada paper aberta", simbolo=simbolo, volume=gate.volume,
+                             entrada=round(gate.entry, 8), analysis_id=contexto["id"],
+                             padrao=contexto["padrao"], candle_ref=contexto["candle_ref"])
+            return
+        self.contadores_ciclo["risco_bloqueado"] = \
+            self.contadores_ciclo.get("risco_bloqueado", 0) + 1
+        self.publicar("decisao", {**base, "decisao": "SIM", "direcao": acao,
+                                  "justificativa": f"JEv SIM p={decisao.probability:.0%} "
+                                                   f"c={decisao.confidence:.0%}; recusado pelo risco",
+                                  "risco": f"não autorizado: {gate.reason}",
+                                  "policy": "VETO", "paper": "NOT_OPENED",
+                                  "execucao": "nenhuma", **metadata})
+        self.logger.info("entrada recusada pelo gate de risco", simbolo=simbolo,
+                         motivo=gate.reason or "-")
 
     # ------------------------------------------------------------- comandos
     def _processar_acoes(self):
@@ -934,6 +1071,7 @@ class Orquestrador:
         self.contadores_ciclo["candidatos"] = len(ordem)
         processados = set()
         for simbolo in ordem:
+            self._processar_resultados_jev()
             if self._cancelado_ciclo() or self.pausado or self.parado_risco:
                 break
             self._processar_acoes()
@@ -1349,6 +1487,37 @@ class Orquestrador:
                 "horizonte_minutos": regra["horizonte_minutos"],
                 "eventos": padrao["eventos"], "fora_amostra": padrao["fora_amostra"],
                 "aviso": "Estatística histórica reproduzida localmente; não é garantia de retorno"}
+            if self.ciclo_ativo:
+                request_id = f"{contrato['run_id']}:{simbolo}:{padrao['id']}:{instante_candle}"
+                registro_base = {"id": id_analise, "simbolo": simbolo,
+                                 "instante": _agora_iso(), "padrao": padrao["id"],
+                                 "candle_ref": instante_candle,
+                                 "direcao": regra["direcao"], "oportunidade": texto}
+                contexto = {"id": id_analise, "simbolo": simbolo,
+                            "estado": estado, "padrao": padrao["id"],
+                            "identificador": identificador, "candle_ref": instante_candle,
+                            "run_id": contrato["run_id"],
+                            "python_validated_at": contrato["python_validated_at"],
+                            "jev_dispatched_at": instante_despacho,
+                            "latencia_detecao_ms": max(0, round((self.relogio() - t_deteccao) * 1000)),
+                            "registro_base": registro_base}
+                self.pendentes_jev[request_id] = contexto
+                if not self._enfileirar_jev(request_id, estado):
+                    self.pendentes_jev.pop(request_id, None)
+                    self.contadores_ciclo["jev_fila_cheia"] = \
+                        self.contadores_ciclo.get("jev_fila_cheia", 0) + 1
+                    self.publicar("decisao", {**registro_base, "decisao": "HOLD",
+                                              "justificativa": "Fila JEv cheia; oportunidade não foi enviada",
+                                              "risco": "-", "execucao": "adiada",
+                                              "run_id": contexto["run_id"],
+                                              "jev_dispatched_at": instante_despacho,
+                                              "latencia_detecao_ms": contexto["latencia_detecao_ms"]})
+                    continue
+                self.logger.info("oportunidade despachada ao worker JEv",
+                                 simbolo=simbolo, padrao=padrao["id"],
+                                 run_id=contrato["run_id"], request_id=request_id,
+                                 latencia_detecao_ms=contexto["latencia_detecao_ms"])
+                continue
             inicio_jev = self.relogio()  # despacho imediato, na mesma passagem
             try:
                 decisao = jev.decide(estado)

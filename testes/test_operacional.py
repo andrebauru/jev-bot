@@ -297,6 +297,11 @@ class TestCiclosMulti(unittest.TestCase):
                     candle.candles[-1]["time"] = estado.candles[-1]["time"] + numero * 60
                     orch.fonte.estados = lambda candle=candle: iter([candle])
                     orch._ciclo()
+                limite = time.monotonic() + 2
+                while orch.pendentes_jev and time.monotonic() < limite:
+                    orch._processar_resultados_jev()
+                    time.sleep(.005)
+                orch._processar_resultados_jev()
             c1, c2, c3 = [r["ciclo"] for canal, r in orch.eventos
                            if canal == "resumo"]
             self.assertEqual((c1, c2, c3), (1, 2, 3))
@@ -317,6 +322,48 @@ class TestCiclosMulti(unittest.TestCase):
                 self.assertTrue(decisao["jev_dispatched_at"])
                 self.assertGreaterEqual(decisao["latencia_detecao_ms"], 0)
                 self.assertGreaterEqual(decisao["latencia_ms"], 0)
+
+    def test_timeout_de_jev_nao_bloqueia_proximo_simbolo(self):
+        """O worker de rede espera; o scanner percorre o ativo seguinte."""
+        with tempfile.TemporaryDirectory() as pasta:
+            orch, estado = self._orquestrador(pasta)
+            mercados.salvar({"selecao": {"C": {
+                "TESTE": {"monitorar": True, "operar": True},
+                "SEGUNDO": {"monitorar": True, "operar": True}}}}, orch.caminho_selecao)
+            orch._registrar_selecao()
+            segundo = estado_mt5("SEGUNDO", closes=[c["close"] for c in
+                                                      candles_deterministicos()[-100:]])
+            ordem = []
+
+            def estados(simbolo=None):
+                ordem.append(f"fetch:{simbolo}")
+                return iter([estado if simbolo == "TESTE" else segundo]
+                            if simbolo in ("TESTE", "SEGUNDO") else [])
+
+            orch.fonte.estados = estados
+            orch.fonte.janela_m1 = lambda simbolo, **_kwargs: (
+                janela(candles_deterministicos()) if simbolo == "TESTE" else None)
+            import threading
+            terminou = threading.Event()
+
+            def jev_lento(_estado):
+                time.sleep(.35)
+                terminou.set()
+                return Decision("TESTE", "HOLD", .5, .5)
+
+            inicio = time.monotonic()
+            with patch("jev_bot.orquestrador.jev.decide", side_effect=jev_lento):
+                orch._ciclo()
+                duracao_ciclo = time.monotonic() - inicio
+                self.assertLess(duracao_ciclo, .30)
+                self.assertIn("fetch:SEGUNDO", ordem)
+                self.assertFalse(terminou.is_set(), "o ciclo não esperou a resposta de rede")
+                self.assertEqual(len(orch.book.fills), 0)
+                self.assertTrue(terminou.wait(2))
+                orch._processar_resultados_jev()
+            holds = [r for canal, r in orch.eventos
+                     if canal == "decisao" and r.get("decisao") == "HOLD"]
+            self.assertTrue(holds)
 
     def test_jev_timeout_resulta_sem_decisao(self):
         """JEv timeout: SEM_DECISAO; novo candle → JEv funciona."""

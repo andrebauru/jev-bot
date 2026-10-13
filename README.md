@@ -36,7 +36,7 @@ não envia ordens reais. Para outro terminal, informe `--terminal` antes do coma
 | `jev_bot/motor_matematico.py` | Estatísticas locais da janela M1 de 30 dias: movimentos, retornos condicionais, recuperação, retração, tempos e custos; corte cronológico 70/30 |
 | `jev_bot/deepseek.py` | Cliente legado preservado; não é chamado pelo fluxo operacional (zero chamadas) |
 | `jev_bot/padroes.py` | Tipos de regra reproduzíveis, validação local (dentro/fora da amostra) e repositório JSON por ativo |
-| `jev_bot/orquestrador.py` | Cadência 1/15min, scanner Python local → JEv → risco → paper, PARADO POR RISCO e emergência; orçamento e continuidade incremental |
+| `jev_bot/orquestrador.py` | Cadência 1/15min, scanner Python local e despacho JEv não bloqueante → risco → paper; resultados aplicados no thread do motor |
 | `jev_bot/logs.py` | Logs em `logs/` com rotação (10 MB × 5), limpeza > 14 dias e mascaramento de segredos |
 | `jev_bot/mercados.py` | Seleção Monitorar/Operar por símbolo, persistida atomicamente em `data/mercados.json` |
 | `jev_bot/cache_m1.py` | Cache incremental de candles M1 por símbolo (JSON atômico, recorte de 30 dias, invalidação por lacuna/corrupção) |
