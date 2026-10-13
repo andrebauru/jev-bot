@@ -7,7 +7,7 @@ probabilidade de lucro ou previsão; resultados descrevem o histórico.
 
 A janela é móvel: a cada atualização, candles fora dos últimos 30 dias
 deixam de ser usados por qualquer decisão. Um corte cronológico separa
-70% iniciais (descoberta, enviados ao DeepSeek) dos 30% finais
+70% iniciais (geração local de regras) dos 30% finais
 (validação fora da amostra, nunca enviados à API).
 """
 

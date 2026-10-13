@@ -265,7 +265,7 @@ def validar(regra, candles, custo_pct):
 
 
 # ---------------------------------------------------------------------------
-# Contrato DeepSeek → JEv (payload versionado e validado por esquema)
+# Contrato Python quantitativo → JEv (payload versionado e validado por esquema)
 # ---------------------------------------------------------------------------
 
 SCHEMA_CONTRATO = 1

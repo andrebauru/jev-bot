@@ -5,7 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 import unittest
 
-from PySide6.QtWidgets import QLineEdit
+from PySide6.QtWidgets import QLabel, QLineEdit
 
 from jev_bot import configuracao
 
@@ -46,12 +46,10 @@ class TestGui(unittest.TestCase):
                                     "amostra": {"candles": 21600, "solicitados": 43200},
                                     "padroes_testados": None, "resultado": None, "erro": None}])
         self.assertIn("21600/43200", abas.progresso_download.text())
-        abas.receber_lote("deepseek", [{"id": "c1", "simbolo": "BTCUSD",
-                                        "instante": "2026-01-01T00:00:00+00:00",
-                                        "padrao": "a1b2", "status_consulta": "hipótese recebida",
-                                        "hipotese": "quedas_consecutivas(n=3) → BUY",
-                                        "validacao": "validado: ok",
-                                        "resultado": "eventos 40, taxa 60% | OOS 12, taxa 58%"}])
+        abas.receber_lote("oportunidade", [{"id": "c1", "simbolo": "BTCUSD",
+                                            "instante": "2026-01-01T00:00:00+00:00",
+                                            "motivo": "NO_SETUP",
+                                            "estado": "sem padrão elegível"}])
         abas.receber_lote("decisao", [{"id": "c1", "simbolo": "BTCUSD",
                                        "instante": "2026-01-01T00:00:00+00:00",
                                        "padrao": "abc123", "candle_ref": 1,
@@ -59,10 +57,9 @@ class TestGui(unittest.TestCase):
                                        "oportunidade": "quedas", "justificativa": "j",
                                        "risco": "autorizado", "execucao": "paper aberto"}])
         self.assertEqual(abas.lista_calc.topLevelItemCount(), 2)
-        self.assertEqual(abas.lista_deepseek.topLevelItemCount(), 1)
+        self.assertEqual(abas.lista_oportunidade.topLevelItemCount(), 1)
         self.assertEqual(abas.lista_decisao.topLevelItemCount(), 1)
-        self.assertEqual(abas.lista_decisao.topLevelItem(0).text(5), "SIM")
-        self.assertEqual(abas.lista_decisao.topLevelItem(0).text(4), "BUY")
+        self.assertEqual(abas.lista_decisao.topLevelItem(0).text(2), "SIM")
         # Resumo de ciclo vai ao painel de status, não à lista de decisões.
         abas.receber_lote("resumo", [{"id": "c1", "ciclo": 1,
                                       "instante": "2026-01-01T00:00:00+00:00",
@@ -110,7 +107,7 @@ class TestGui(unittest.TestCase):
                                    "liberar_risco", "aplicar_limites", "cancelar_ciclo")})
         abas.receber_lote("decisao", [
             {"id": "c1", "simbolo": "BTCUSD", "instante": "2026-01-01T00:00:00+00:00",
-             "oportunidade": "quedas(n=3) → BUY", "decisao": "SIM (BUY)",
+             "oportunidade": "quedas(n=3) → BUY", "decisao": "SIM",
              "justificativa": "padrão validado", "risco": "gate EXECUTE",
              "execucao": "paper aberto"},
             {"id": "c1", "simbolo": "", "instante": "2026-01-01T00:00:00+00:00",
@@ -118,9 +115,9 @@ class TestGui(unittest.TestCase):
              "justificativa": "sem_padrao=80; rejeitado_validacao=10; executadas=1",
              "risco": "pendentes: 0", "execucao": "duração 12.3s"},
         ])
-        self.assertIn("2 itens", abas.painel_decisao.contagem.text())
+        self.assertIn("1 itens", abas.painel_decisao.contagem.text())
         self.assertIn("00:00:00", abas.painel_decisao.ultimo.text())
-        self.assertEqual(abas.lista_decisao.topLevelItemCount(), 2)
+        self.assertEqual(abas.lista_decisao.topLevelItemCount(), 1)
 
     def test_grafico_copia_como_imagem_no_clipboard(self):
         """COPIAR COMO IMAGEM coloca o gráfico visível na área de transferência."""
@@ -163,10 +160,38 @@ class TestGui(unittest.TestCase):
         self.assertEqual(janela.abas.count(), 3)
         self.assertFalse(janela.motor.isRunning())
         janela._receber_pacote({"metricas": {"estado": "PRONTO", "detalhe": "", "jev_ok": True,
-                                             "deepseek_ok": True, "orcamento": {},
+                                             "deepseek_calls": 0,
                                              "monitorados": 1, "operaveis": 1}})
         self.assertEqual(janela.label_jev.text(), "JEv: ok")
+        self.assertTrue(any("DeepSeek: desativado (0 chamadas)" in label.text()
+                            for label in janela.statusBar().findChildren(QLabel)))
         janela.orquestrador.parar()
+
+    def test_splitters_redimensionaveis_em_janela_normal_e_reduzida(self):
+        """Conteúdo de operação mantém listas utilizáveis em dimensões variadas."""
+        from PySide6.QtWidgets import QWidget, QVBoxLayout, QSplitter
+        from jev_bot.gui.aba_operacao import AbaOperacao
+        aba = AbaOperacao(acoes={k: (lambda: None) for k in
+                                 ("iniciar", "pausar", "retomar", "emergencia",
+                                  "liberar_risco", "aplicar_limites", "cancelar_ciclo")})
+        janela = QWidget()
+        layout = QVBoxLayout(janela)
+        layout.addWidget(aba)
+        janela.show()
+        for largura, altura in ((1366, 768), (1920, 1080), (720, 480)):
+            janela.resize(largura, altura)
+            self.app.processEvents()
+            self.assertIsInstance(aba.divisor_principal, QSplitter)
+            self.assertIsInstance(aba.divisor_oportunidades, QSplitter)
+            self.assertEqual(aba.divisor_principal.count(), 2)
+            self.assertGreater(aba.lista_oportunidade.height(), 0)
+            self.assertGreater(aba.lista_decisao.height(), 0)
+            self.assertGreater(aba.tabela.height(), 0)
+        self.assertEqual(aba.lista_decisao.columnCount(), 5)
+        self.assertFalse(hasattr(aba, "painel_deepseek"))
+        aba.divisor_principal.setSizes([500, 180])
+        aba.salvar_layout()
+        janela.close()
 
     def test_salvar_variaveis_preserva_e_substitui(self):
         with tempfile.TemporaryDirectory() as pasta:

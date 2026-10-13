@@ -11,7 +11,7 @@ descoberta (apos_quedas/apos_altas, recuperação/retração). Cada candidato:
   inventa valores;
 - passa pela MESMA validação independente de `padroes.validar` (fora da
   amostra cronológica, eventos não sobrepostos, custo de spread), inclusive
-  quando o orçamento de DeepSeek está esgotado.
+  quando serviços externos estão indisponíveis.
 
 Não é um atalho para abrir posições: é o mesmo rigor estatístico, aplicado
 sem esperar uma nova sessão de aprendizagem. Limiares nunca são afrouxados.

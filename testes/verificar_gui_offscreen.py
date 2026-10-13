@@ -117,7 +117,7 @@ try:
         registrar(f"chip: {janela.aba_operacao.chip_estado.text()} | lista calc: "
                   f"{janela.aba_operacao.lista_calc.topLevelItemCount()} linhas | "
                   f"trades na tabela: {janela.aba_operacao.tabela.rowCount()}")
-        registrar(f"barra: {janela.label_jev.text()} | {janela.label_deepseek.text()}")
+        registrar(f"barra: {janela.label_jev.text()} | Python Quantitativo local | DeepSeek desativado (0 chamadas)")
         # PAUSAR pela UI e aguardar a INTERFACE refletir o estado (chip/botão).
         janela.aba_operacao._clicar_pausar()
         limite_pausa = time.time() + 10

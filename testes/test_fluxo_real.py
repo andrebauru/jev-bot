@@ -1,7 +1,7 @@
 """Fluxo real de ponta a ponta com dados sintéticos determinísticos.
 
-Cobertura do prompt de auditoria: (a) hipótese do DeepSeek rejeitada pela
-validação local; (b) hipótese validada, elegível por Operar, aprovada pelo
+    Cobertura do fluxo local: (a) padrão local rejeitado pela validação;
+    (b) padrão validado, elegível por Operar, aprovado pelo
 JEv (mock) e executada em paper — comprovando a chegada à terceira lista.
 Também cobre motivos resumidos de não encaminhamento, orçamento de tempo
 com continuidade incremental e cache incremental M1 (hit/miss).
@@ -70,20 +70,38 @@ class TestFluxoReal(unittest.TestCase):
         """(a) rejeitada na lista 2; (b) validada → JEv → paper → lista 3."""
         with tempfile.TemporaryDirectory() as pasta:
             orch = self._orquestrador(pasta)
+            candles = candles_deterministicos()
+            for regra in self._hipoteses():
+                validacao = padroes.validar(regra, candles, 0.02)
+                orch.repositorio.registrar("TESTE", regra, validacao, "local",
+                                           janela(candles))
+            mercados.salvar({"selecao": {"Crypto": {
+                "TESTE": {"monitorar": True, "operar": True},
+                "SEGUNDO": {"monitorar": True, "operar": True}}}}, orch.caminho_selecao)
+            orch._registrar_selecao()
+            estados = {"TESTE": estado_mt5("TESTE", closes=[c["close"] for c in candles[-100:]]),
+                       "SEGUNDO": estado_mt5("SEGUNDO", closes=[c["close"] for c in candles[-100:]])}
+            ordem = []
+
+            def estados_incrementais(simbolo=None):
+                ordem.append(f"fetch:{simbolo}")
+                atual = estados.get(simbolo)
+                return iter([atual] if atual is not None else [])
+
+            orch.fonte.estados = estados_incrementais
+            orch.fonte.janela_m1 = lambda simbolo, **_kwargs: (
+                janela(candles) if simbolo == "TESTE" else None)
             decisao = Decision("TESTE", "BUY", .9, .9)
             with patch("jev_bot.orquestrador.deepseek.analisar",
-                       return_value=(self._hipoteses(), [], {"tokens": 42}, 0)) as chamada_ds, \
-                    patch("jev_bot.orquestrador.jev.decide",
-                          return_value=decisao) as chamada_jev:
+                       side_effect=AssertionError("DeepSeek desativado")) as chamada_ds, \
+                     patch("jev_bot.orquestrador.jev.decide",
+                           side_effect=lambda estado: (ordem.append(f"jev:{estado.symbol}") or decisao)) as chamada_jev:
                 orch._executar_ciclo("c1")
-            chamada_ds.assert_called_once()
+            chamada_ds.assert_not_called()
             chamada_jev.assert_called_once()
-            # (a) hipótese rejeitada por validação local (na lista DeepSeek).
-            rejeicoes = [r for c, r in orch.eventos if c == "deepseek"
-                         and "rejeitado" in r.get("validacao", "")]
-            self.assertTrue(rejeicoes)
-            self.assertTrue(any("Sem ocorrências" in r["validacao"] for r in rejeicoes),
-                            "a hipótese sem ocorrências deve constar como rejeitada")
+            self.assertLess(ordem.index("jev:TESTE"), ordem.index("fetch:SEGUNDO"),
+                            "JEv deve ser despachado na passagem de TESTE antes de buscar o próximo ativo")
+            # (a) padrão local sem ocorrências é rejeitado e registrado.
             status = {p["chave"].split("|")[0]: p["status"]
                       for p in orch.repositorio.carregar("TESTE")["padroes"]}
             self.assertIn("rejeitado", status.values())
@@ -97,12 +115,17 @@ class TestFluxoReal(unittest.TestCase):
             self.assertEqual(len(sims), 1)
             self.assertIn("paper aberto", sims[0]["execucao"])
             self.assertIn(sims[0]["decisao"], ("SIM", "NAO", "HOLD"))
+            self.assertTrue(sims[0]["run_id"])
+            self.assertTrue(sims[0]["python_validated_at"])
+            self.assertTrue(sims[0]["jev_dispatched_at"])
+            self.assertGreaterEqual(sims[0]["latencia_detecao_ms"], 0)
+            self.assertGreaterEqual(sims[0]["latencia_ms"], 0)
             # Motivos resumidos: rejeição estatística distinta de erro técnico.
             resumos = [r for c, r in orch.eventos if c == "resumo"]
             self.assertTrue(resumos)
             self.assertIn("executadas=1", resumos[0]["motivos"])
             self.assertIn("enviados_jev=1", resumos[0]["motivos"])
-            # Chegada comprovada na TERCEIRA LISTA da interface.
+            # Chegada comprovada na lista exclusiva de decisões JEv.
             self._comprovar_terceira_lista(decisoes)
 
     def _comprovar_terceira_lista(self, decisoes):
@@ -116,14 +139,14 @@ class TestFluxoReal(unittest.TestCase):
                                   ("iniciar", "pausar", "retomar", "emergencia",
                                    "liberar_risco", "aplicar_limites", "cancelar_ciclo")})
         abas.receber_lote("decisao", decisoes)
-        linhas = [[abas.lista_decisao.topLevelItem(i).text(c) for c in range(8)]
+        linhas = [[abas.lista_decisao.topLevelItem(i).text(c) for c in range(5)]
                   for i in range(abas.lista_decisao.topLevelItemCount())]
-        decisoes_col = [linha[5] for linha in linhas]
+        decisoes_col = [linha[2] for linha in linhas]
         self.assertIn("SIM", decisoes_col, f"decisão SIM ausente: {decisoes_col}")
         self.assertNotIn("RESUMO", decisoes_col,
                          "resumo não pode ocupar a lista de decisões")
         for linha in linhas:
-            self.assertEqual(linha[1], "TESTE")  # ativo correto por decisão
+            self.assertEqual(linha[0], "TESTE")  # ativo correto por decisão
         # Resumo de motivos vai para o painel de status (canal próprio).
         abas.receber_lote("resumo", [{"id": "c1", "ciclo": 1,
                                       "instante": "2026-01-01T00:00:00+00:00",

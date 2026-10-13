@@ -51,10 +51,10 @@ class TestCoalescedor(unittest.TestCase):
         with tempfile.TemporaryDirectory() as pasta:
             orch = _orquestrador(pasta)
             for i in range(300):
-                orch.publicar("deepseek", {"i": i})
+                orch.publicar("oportunidade", {"i": i})
             orch.descarregar()
             self.assertEqual(len(orch._entregas), 1)
-            self.assertEqual(len(orch._entregas[0]["deepseek"]), Coalescedor.TETOS["deepseek"])
+            self.assertEqual(len(orch._entregas[0]["oportunidade"]), Coalescedor.TETOS["oportunidade"])
             orch.descarregar()
             self.assertEqual(len(orch._entregas), 1)  # nada pendente
 

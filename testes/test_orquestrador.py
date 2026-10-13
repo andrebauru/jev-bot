@@ -13,8 +13,8 @@ from apoio import (FonteFake, LoggerSilencioso, candles_sinteticos, estado_mt5,
                    janela)
 from jev_bot import deepseek, mercados, padroes
 from jev_bot.execution.paper import Book, Fill
-from jev_bot.orquestrador import (DEEPSEEK_POR_CICLO, JANELA_TTL_S, LOTE_DOWNLOAD,
-                                  Orquestrador, TENTATIVA_JEV_S)
+from jev_bot.orquestrador import (JANELA_TTL_S, LOTE_DOWNLOAD, Orquestrador,
+                                  TENTATIVA_JEV_S)
 from jev_bot.motor_matematico import estatisticas
 from jev_bot.types import Decision
 
@@ -199,28 +199,16 @@ class TestOrquestrador(unittest.TestCase):
                 orch._oportunidade(estado2, "id2")
             self.assertGreater(orch.proxima_tentativa_jev, orch.relogio() + TENTATIVA_JEV_S - 1)
 
-    def test_deepseek_etapa_registra_e_orca_porco(self):
+    def test_deepseek_nao_participa_do_fluxo_operacional(self):
+        """Ciclos locais n?o enfileiram nem consultam o cliente legado."""
         with tempfile.TemporaryDirectory() as pasta:
-            candles = candles_sinteticos(20000, seed=2)
-            stats = estatisticas({**janela(candles), "candles": candles[:int(len(candles) * .7)]}, 0.02)
-            orch, relogio = self._orquestrador(pasta)
-            cache = {"instante": 0, "stats": stats, "custo_pct": .02,
-                     "inicio_janela": candles[0]["time"], "fim_janela": candles[-1]["time"]}
-            hipotese = {"tipo_regra": "quedas_consecutivas", "parametros": {"n": 2},
-                        "direcao": "BUY", "horizonte_minutos": 5, "justificativa": "x"}
+            orch, _ = self._orquestrador(pasta)
             with patch("jev_bot.orquestrador.deepseek.analisar",
-                       return_value=([hipotese], [], {"tokens": 10}, 0)) as chamada:
-                feitas = orch._etapa_deepseek("TESTE", candles, cache, stats, "id")
-            self.assertTrue(feitas)
-            chamada.assert_called_once()
-            self.assertEqual(len(orch.repositorio.carregar("TESTE")["padroes"]), 1)
-            self.assertEqual(orch.orcamento.consumo()["tokens_dia"], 10)
-            orch.orcamento = deepseek.Orcamento(orch.pasta_dados, 1, 1, relogio=lambda: relogio[0])
-            orch.orcamento.registrar(2)
-            with patch("jev_bot.orquestrador.deepseek.analisar") as chamada2:
-                feitas = orch._etapa_deepseek("TESTE", candles, cache, stats, "id2")
-            self.assertFalse(feitas)
-            chamada2.assert_not_called()
+                       side_effect=AssertionError("DeepSeek desativado")) as analisar:
+                orch._executar_ciclo("c1")
+            analisar.assert_not_called()
+            self.assertEqual(orch.resumo()["deepseek_calls"], 0)
+            self.assertFalse(hasattr(orch, "fila_deepseek"))
 
     def test_janela_cache_ttl_e_memoria_limitada(self):
         """Refresh respeita TTL e o cache mantém só a cauda, nunca a janela cheia."""

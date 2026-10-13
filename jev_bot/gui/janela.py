@@ -20,9 +20,9 @@ class JanelaPrincipal(QMainWindow):
 
     def __init__(self, terminal=None, offset_horas=None, banco=None, caminho_selecao=None):
         super().__init__()
-        self.setWindowTitle("JEv Bot — paper trading com descoberta de padrões")
+        self.setWindowTitle("JEv Bot — paper trading quantitativo local")
         self.resize(1280, 800)
-        self.setMinimumSize(960, 600)
+        self.setMinimumSize(720, 480)
         self.setWindowState(self.windowState() | Qt.WindowMaximized)
 
         self.motor = MotorTrabalhador(terminal=terminal, offset_horas=offset_horas,
@@ -50,11 +50,8 @@ class JanelaPrincipal(QMainWindow):
 
         barra = QStatusBar()
         self.label_jev = QLabel("JEv: verificando")
-        self.label_deepseek = QLabel("DeepSeek: verificando")
-        self.label_orcamento = QLabel("")
         barra.addWidget(self.label_jev)
-        barra.addWidget(self.label_deepseek)
-        barra.addWidget(self.label_orcamento)
+        barra.addWidget(QLabel("Python Quantitativo: local | DeepSeek: desativado (0 chamadas)"))
         barra.addPermanentWidget(QLabel("modo PAPER TRADING — sem ordens reais"))
         self.setStatusBar(barra)
 
@@ -75,6 +72,7 @@ class JanelaPrincipal(QMainWindow):
         if resposta != QMessageBox.Yes:
             evento.ignore()
             return
+        self.aba_operacao.salvar_layout()
         self.orquestrador.parar()
         if not self.motor.wait(15000):
             QMessageBox.warning(self, "Encerramento", "O motor não encerrou em 15s; "
@@ -83,7 +81,7 @@ class JanelaPrincipal(QMainWindow):
 
     def _receber_pacote(self, pacote):
         """Roteia o pacote coalescido: listas por canal e registros únicos."""
-        for canal in ("calc", "deepseek", "decisao", "log", "resumo"):
+        for canal in ("calc", "oportunidade", "decisao", "log", "resumo"):
             registros = pacote.get(canal)
             if registros:
                 self.aba_operacao.receber_lote(canal, registros)
@@ -92,13 +90,6 @@ class JanelaPrincipal(QMainWindow):
             self.aba_operacao.receber_metricas(m)
             self.aba_resumo.receber_metricas(m)
             self.label_jev.setText(f"JEv: {'ok' if m.get('jev_ok') else 'não configurado'}")
-            self.label_deepseek.setText(f"DeepSeek: {'ok' if m.get('deepseek_ok') else 'não configurado'}")
-            orcamento = m.get("orcamento") or {}
-            if orcamento:
-                self.label_orcamento.setText(
-                    f" | tokens DeepSeek hoje {orcamento.get('tokens_dia', 0)}/{orcamento.get('tokens_limite', 0)}"
-                    f" | chamadas/h {orcamento.get('chamadas_hora', 0)}/{orcamento.get('chamadas_limite', 0)}"
-                    f" | mercados: {m.get('monitorados', 0)} monitorados, {m.get('operaveis', 0)} p/ operar")
         if "estado" in pacote:
             self.aba_operacao.receber_estado(pacote["estado"])
         if "trades" in pacote:

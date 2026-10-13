@@ -123,110 +123,36 @@ class TestPrioridadeOperar(unittest.TestCase):
             self.assertLess(ultima_operavel, primeira_monitor)
 
 
-class TestDeepSeekAssincrono(unittest.TestCase):
-    """Descoberta fora da rota de decisão: fila pós-varredura, por evento."""
+class TestDeepSeekDesativado(unittest.TestCase):
+    """A rota do scanner ? local e nunca despacha/enfileira DeepSeek."""
 
-    def setUp(self):
-        """Bloqueia o transporte de rede das IAs (nenhum token pago)."""
-        for alvo in ("jev_bot.deepseek.urlopen", "jev_bot.jev.urlopen"):
-            guarda = patch(alvo, side_effect=AssertionError("rede bloqueada em teste"))
-            guarda.start()
-            self.addCleanup(guarda.stop)
-
-    def _orquestrador(self, pasta):
-        arquivo = Path(pasta) / "mercados.json"
-        mercados.salvar({"selecao": {"C": {"TESTE": {"monitorar": True,
-                                                     "operar": True}}}}, arquivo)
-        orch = Orquestrador(banco=Path(pasta) / "db.json",
-                            pasta_dados=Path(pasta) / "padroes",
-                            caminho_selecao=arquivo, relogio=time.time)
-        orch.logger = LoggerSilencioso()
-        orch.book = Book.load(Path(pasta) / "db.json", "USD")
-        orch.book.active = True
-        orch.repositorio = padroes.RepositorioPadroes(Path(pasta) / "padroes",
-                                                      relogio=time.time)
-        orch.orcamento = Mock()
-        orch.orcamento.consumo.return_value = {}
-        orch.orcamento.permitir.return_value = (True, "")
-        orch.deepseek_configurado = True
-        orch.eventos = []
-        orch.publicar = lambda canal, registro: orch.eventos.append((canal, registro))
-        candles = candles_deterministicos()
-        orch.fonte = FonteFake(estados=[estado_mt5(closes=[c["close"] for c in candles[-100:]])],
-                               cotacoes={"TESTE": (99.995, 100.005, time.time())},
-                               janelas={"TESTE": janela(candles)})
-        orch.fonte.janela_m1 = Mock(return_value=janela(candles))
-        orch.fonte.incremento_m1 = Mock(return_value=None)
-        return orch
-
-    def test_decisao_avaliada_antes_da_fila_deepseek(self):
-        """No ciclo, a avaliação de oportunidades roda antes da descoberta."""
+    def test_ciclo_nao_consulta_ou_enfileira_deepseek(self):
         with tempfile.TemporaryDirectory() as pasta:
-            orch = self._orquestrador(pasta)
-            patch_jev = patch("jev_bot.orquestrador.jev.decide", return_value=Decision("TESTE", "HOLD", .5, .5))
-            patch_jev.start()
-            self.addCleanup(patch_jev.stop)
-            patch_jev = patch("jev_bot.orquestrador.jev.decide", return_value=Decision("TESTE", "HOLD", .5, .5))
-            patch_jev.start()
-            self.addCleanup(patch_jev.stop)
-            ordem = []
-            original_op = orch._oportunidade
-            original_ds = orch._etapa_deepseek
-
-            def op(estado, id_analise):
-                ordem.append("oportunidade")
-                return original_op(estado, id_analise)
-
-            def ds(*_a, **_k):
-                ordem.append("deepseek")
-                return False
-
-            orch._oportunidade = op
-            orch._etapa_deepseek = ds
-            orch._executar_ciclo("c1")
-            self.assertIn("oportunidade", ordem)
-            self.assertIn("deepseek", ordem)
-            self.assertLess(ordem.index("oportunidade"), ordem.index("deepseek"),
-                            "descoberta deve rodar após as decisões do ciclo")
-
-    def test_mudanca_relevante_aciona_fila_sem_ttl(self):
-        """Mudança estatisticamente relevante agenda a descoberta antes do TTL."""
-        with tempfile.TemporaryDirectory() as pasta:
-            orch = self._orquestrador(pasta)
-            patch_jev = patch("jev_bot.orquestrador.jev.decide", return_value=Decision("TESTE", "HOLD", .5, .5))
-            patch_jev.start()
-            self.addCleanup(patch_jev.stop)
-            patch_jev = patch("jev_bot.orquestrador.jev.decide", return_value=Decision("TESTE", "HOLD", .5, .5))
-            patch_jev.start()
-            self.addCleanup(patch_jev.stop)
-            orch.ultimo_deepseek["TESTE"] = time.time()  # TTL longe de vencer
-            hipoteses = [{"tipo_regra": "quedas_consecutivas", "parametros": {"n": 2},
-                          "direcao": "BUY", "horizonte_minutos": 5, "justificativa": "x"}]
-            with patch("jev_bot.orquestrador.candidatos.mudanca_relevante",
-                       return_value=True), \
-                    patch("jev_bot.orquestrador.deepseek.analisar",
-                          return_value=(hipoteses, [], {"tokens": 10}, 0)) as analisar:
+            arquivo = Path(pasta) / "mercados.json"
+            mercados.salvar({"selecao": {"C": {"TESTE": {
+                "monitorar": True, "operar": True}}}}, arquivo)
+            orch = Orquestrador(banco=Path(pasta) / "db.json",
+                                pasta_dados=Path(pasta) / "padroes",
+                                caminho_selecao=arquivo, relogio=time.time)
+            orch.logger = LoggerSilencioso()
+            orch.book = Book.load(Path(pasta) / "db.json", "USD")
+            orch.book.active = True
+            orch.repositorio = padroes.RepositorioPadroes(Path(pasta) / "padroes",
+                                                          relogio=time.time)
+            orch.eventos = []
+            orch.publicar = lambda canal, registro: orch.eventos.append((canal, registro))
+            candles = candles_deterministicos()
+            orch.fonte = FonteFake(estados=[estado_mt5(
+                "TESTE", closes=[c["close"] for c in candles[-100:]])],
+                cotacoes={"TESTE": (99.995, 100.005, time.time())},
+                janelas={"TESTE": janela(candles)})
+            with patch("jev_bot.orquestrador.deepseek.analisar",
+                       side_effect=AssertionError("DeepSeek deve permanecer desativado")) as analisar:
                 orch._executar_ciclo("c1")
-            analisar.assert_called()  # descoberta executada na fila pós-varredura
-            self.assertGreaterEqual(orch.contadores_ciclo.get("deepseek_enviados", 0), 1,
-                                    "mudança relevante deve agendar descoberta apesar do TTL")
-
-    def test_ruido_nao_aciona_e_ttl_cobre(self):
-        """Sem mudança relevante e dentro do TTL: fila vazia (sem gasto)."""
-        with tempfile.TemporaryDirectory() as pasta:
-            orch = self._orquestrador(pasta)
-            patch_jev = patch("jev_bot.orquestrador.jev.decide", return_value=Decision("TESTE", "HOLD", .5, .5))
-            patch_jev.start()
-            self.addCleanup(patch_jev.stop)
-            patch_jev = patch("jev_bot.orquestrador.jev.decide", return_value=Decision("TESTE", "HOLD", .5, .5))
-            patch_jev.start()
-            self.addCleanup(patch_jev.stop)
-            orch.ultimo_deepseek["TESTE"] = time.time()  # TTL longe de vencer
-            with patch("jev_bot.orquestrador.candidatos.mudanca_relevante",
-                       return_value=False):
-                orch._executar_ciclo("c1")
-            self.assertEqual(orch.fila_deepseek, [])
-            self.assertIsNone(orch.contadores_ciclo.get("deepseek_enviados"))
+            analisar.assert_not_called()
+            self.assertFalse(hasattr(orch, "fila_deepseek"))
+            self.assertEqual(orch.resumo()["deepseek_calls"], 0)
+            self.assertFalse(any(c == "deepseek" for c, _ in orch.eventos))
 
 
 class TestDecisionTipada(unittest.TestCase):
@@ -354,21 +280,43 @@ class TestCiclosMulti(unittest.TestCase):
         return orch, estado_mt5(closes=closes)
 
     def test_tres_ciclos_ids_crescentes(self):
-        """Ciclo 1 → 2 → 3 com IDs crescentes e estados coerentes."""
+        """Ciclos 1→2→3 registram run_id, despacho, latência e contadores."""
         with tempfile.TemporaryDirectory() as pasta:
-            orch, _ = self._orquestrador(pasta)
+            orch, estado = self._orquestrador(pasta)
+            chamadas = []
+
+            def decidir(_estado):
+                chamadas.append(_estado.symbol)
+                return Decision("TESTE", "HOLD", .5, .5)
+
             with patch("jev_bot.orquestrador.jev.decide",
-                       return_value=Decision("TESTE", "HOLD", .5, .5)):
-                orch._ciclo()
-                c1 = orch.ciclo
-                orch._ciclo()
-                c2 = orch.ciclo
-                orch._ciclo()
-                c3 = orch.ciclo
+                       side_effect=decidir):
+                for numero in range(3):
+                    candle = estado_mt5(closes=[c["close"] for c in
+                                                candles_deterministicos()[-100:]])
+                    candle.candles[-1]["time"] = estado.candles[-1]["time"] + numero * 60
+                    orch.fonte.estados = lambda candle=candle: iter([candle])
+                    orch._ciclo()
+            c1, c2, c3 = [r["ciclo"] for canal, r in orch.eventos
+                           if canal == "resumo"]
             self.assertEqual((c1, c2, c3), (1, 2, 3))
             estados = [r.get("estado") for c, r in orch.eventos if c == "estado"]
             self.assertGreaterEqual(estados.count("ANALISANDO"), 2)
             self.assertEqual(len(orch.book.fills), 0)  # HOLD não executa
+            resumos = [r for canal, r in orch.eventos if canal == "resumo"]
+            decisoes = [r for canal, r in orch.eventos
+                        if canal == "decisao" and r.get("decisao") == "HOLD"]
+            self.assertEqual(len(chamadas), 3)
+            self.assertEqual(len({r["run_id"] for r in resumos}), 3)
+            self.assertEqual(len(decisoes), 3)
+            for resumo, decisao in zip(resumos, decisoes):
+                self.assertEqual(resumo["resultado"], "CONCLUIDO")
+                self.assertEqual(resumo["funil"]["deepseek_calls"], 0)
+                self.assertEqual(decisao["run_id"], resumo["run_id"])
+                self.assertTrue(decisao["python_validated_at"])
+                self.assertTrue(decisao["jev_dispatched_at"])
+                self.assertGreaterEqual(decisao["latencia_detecao_ms"], 0)
+                self.assertGreaterEqual(decisao["latencia_ms"], 0)
 
     def test_jev_timeout_resulta_sem_decisao(self):
         """JEv timeout: SEM_DECISAO; novo candle → JEv funciona."""

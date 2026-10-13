@@ -43,7 +43,7 @@ class AbaConfiguracao(QWidget):
         raiz.setContentsMargins(10, 8, 10, 8)
 
         # ---------------------------------------------------------- OpenRouter
-        grupo_or = QGroupBox("OpenRouter (decisão JEv e descoberta DeepSeek)")
+        grupo_or = QGroupBox("OpenRouter (decisão JEv; configuração DeepSeek legada e inativa)")
         layout_or = QVBoxLayout(grupo_or)
         linha_chave = QHBoxLayout()
         rotulo_chave = QLabel("API key:")
@@ -55,10 +55,11 @@ class AbaConfiguracao(QWidget):
         linha_chave.addWidget(self.campo_chave, 1)
         layout_or.addLayout(linha_chave)
         linha_modelo = QHBoxLayout()
-        rotulo_modelo = QLabel("Modelo DeepSeek:")
+        rotulo_modelo = QLabel("Modelo DeepSeek legado (não utilizado):")
         rotulo_modelo.setStyleSheet("color:#8ea3c8;")
         self.campo_modelo = QLineEdit(configuracao.modelo_deepseek())
-        self.campo_modelo.setPlaceholderText("ex.: deepseek/deepseek-chat (verificado pelo teste)")
+        self.campo_modelo.setPlaceholderText("configuração preservada; sem chamadas DeepSeek")
+        self.campo_modelo.setToolTip("Valor legado preservado para compatibilidade; não participa do fluxo operacional.")
         linha_modelo.addWidget(rotulo_modelo)
         linha_modelo.addWidget(self.campo_modelo, 1)
         layout_or.addLayout(linha_modelo)
@@ -69,6 +70,8 @@ class AbaConfiguracao(QWidget):
         linha_botoes = QHBoxLayout()
         self.btn_testar_or = QPushButton("TESTAR CONEXÃO")
         self.btn_testar_or.clicked.connect(self._testar_openrouter)
+        self.btn_testar_or.setEnabled(False)
+        self.btn_testar_or.setToolTip("Teste DeepSeek desativado: o bot não consulta esse serviço.")
         self.btn_salvar_or = QPushButton("SALVAR")
         self.btn_salvar_or.setObjectName("btnAplicar")
         self.btn_salvar_or.clicked.connect(self._salvar_openrouter)
@@ -181,12 +184,7 @@ class AbaConfiguracao(QWidget):
 
     # ------------------------------------------------------------- OpenRouter
     def _testar_openrouter(self):
-        self.btn_testar_or.setEnabled(False)
-        self.status_or.setText("Testando conexão com o OpenRouter...")
-        chave = self.campo_chave.text().strip() or None
-        modelo = self.campo_modelo.text().strip() or None
-        threading.Thread(target=lambda: self.testes.resultado_openrouter.emit(
-            cfg_gui.testar_openrouter(chave=chave, modelo=modelo)), daemon=True).start()
+        self.status_or.setText("Consulta DeepSeek desativada; nenhuma chamada de rede foi feita.")
 
     def _res_openrouter(self, dados):
         self.btn_testar_or.setEnabled(True)
@@ -202,7 +200,7 @@ class AbaConfiguracao(QWidget):
         modelo = self.campo_modelo.text().strip()
         if not modelo:
             self.status_or.setStyleSheet("color:#ef4444;")
-            self.status_or.setText("Informe o identificador exato do modelo DeepSeek da sua conta.")
+            self.status_or.setText("A configuração legada DeepSeek não é necessária para o JEv.")
             return
         if chave:
             mensagem = cfg_gui.salvar_chave_openrouter(chave)

@@ -2,8 +2,9 @@
 
 # jev-bot
 
-Bot de análise com dados reais do MetaTrader 5, decisões externas JEV e
-execução exclusivamente paper. O fluxo separa aquisição de dados, decisão,
+Bot de análise quantitativa Python com dados reais do MetaTrader 5, decisão JEv e
+execução exclusivamente paper. DeepSeek permanece desativado e não participa
+do scanner, aprendizado, validação ou decisão. O fluxo separa aquisição de dados, decisão,
 gerenciamento de risco e registro de operações. A decisão do modelo não
 dispensa os limites da carteira.
 
@@ -33,9 +34,9 @@ não envia ordens reais. Para outro terminal, informe `--terminal` antes do coma
 | --- | --- |
 | `jev_bot/markets.py` | Conexão ao terminal MT5, catálogo, candles M1 (100 candles e janela de 30 dias), cotações e cálculo de contrato |
 | `jev_bot/motor_matematico.py` | Estatísticas locais da janela M1 de 30 dias: movimentos, retornos condicionais, recuperação, retração, tempos e custos; corte cronológico 70/30 |
-| `jev_bot/deepseek.py` | Descoberta de padrões pelo DeepSeek via OpenRouter: schema rígido, timeout, retry controlado e orçamento de tokens |
+| `jev_bot/deepseek.py` | Cliente legado preservado; não é chamado pelo fluxo operacional (zero chamadas) |
 | `jev_bot/padroes.py` | Tipos de regra reproduzíveis, validação local (dentro/fora da amostra) e repositório JSON por ativo |
-| `jev_bot/orquestrador.py` | Cadência 1/15min, pipeline Python → DeepSeek → JEv → risco → paper, PARADO POR RISCO e emergência; orçamento de tempo e continuidade incremental |
+| `jev_bot/orquestrador.py` | Cadência 1/15min, scanner Python local → JEv → risco → paper, PARADO POR RISCO e emergência; orçamento e continuidade incremental |
 | `jev_bot/logs.py` | Logs em `logs/` com rotação (10 MB × 5), limpeza > 14 dias e mascaramento de segredos |
 | `jev_bot/mercados.py` | Seleção Monitorar/Operar por símbolo, persistida atomicamente em `data/mercados.json` |
 | `jev_bot/cache_m1.py` | Cache incremental de candles M1 por símbolo (JSON atômico, recorte de 30 dias, invalidação por lacuna/corrupção) |
@@ -129,7 +130,7 @@ python -m jev_bot --once --plain dashboard
 python -m jev_bot stop
 ```
 
-Ao abrir dashboard/run com Jev configurado, a carteira inicia automaticamente ativa, com capital paper de **10.000 na moeda da conta MT5**.
+Ao abrir dashboard/run com JEv configurado, a carteira inicia automaticamente ativa, com capital paper de **10.000 na moeda da conta MT5**.
 O saldo real da conta não é utilizado como capital paper. `start` não limpa
 perdas, posições ou limites. `stop` cria um sinal de pausa observado antes da
 próxima entrada; posições permanecem registradas. Para acompanhar stops,
@@ -163,7 +164,9 @@ de conta, login, servidor e credenciais não são exibidos ou gravados no banco.
 O progresso mostra catálogo, candidatos do dia, quantidade verificada, dados
 recebidos, inativos e históricos indisponíveis. Cada ativo tem etapas e motivo
 de SIM/NÃO. Uma falha JEV não encerra o universo inteiro; o painel aguarda
-60 segundos antes de tentar o serviço novamente.
+60 segundos antes de tentar o serviço novamente. O scanner baixa símbolos
+selecionados progressivamente, prioriza Operar e não enfileira trabalho
+DeepSeek; o resumo de ciclo publica `deepseek_calls=0`.
 
 O intervalo padrão entre scans completos é **15 segundos**. Entre eles,
 o painel consulta cotações reais em rodízio a cada meio segundo, mostra

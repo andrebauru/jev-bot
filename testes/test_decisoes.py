@@ -210,8 +210,8 @@ class TestDecisoesOperacionais(unittest.TestCase):
                 orch._executar_ciclo("c1")
             chamada_jev.assert_called()  # padrão local validado chegou ao JEv
             self.assertGreaterEqual(orch.contadores_ciclo.get("executadas", 0), 1)
-            locais = [r for c, r in orch.eventos if c == "deepseek"
-                      and r.get("status_consulta") == "CANDIDATO LOCAL (Python)"]
+            locais = [r for c, r in orch.eventos if c == "calc"
+                      and r.get("etapa") == "validacao_local"]
             self.assertTrue(locais, "candidatos locais devem ser gerados sem IA")
             self.assertGreaterEqual(orch.contadores_ciclo.get("candidatos_locais", 0), 1)
             self.assertTrue(any(c == "resumo" for c, _ in orch.eventos))
@@ -303,12 +303,12 @@ class TestGuiDecisoes(unittest.TestCase):
         ]
         aba.receber_lote("decisao", registros)
         self.assertEqual(aba.lista_decisao.topLevelItemCount(), 3)
-        ativos = [aba.lista_decisao.topLevelItem(i).text(1) for i in range(3)]
-        decisoes = [aba.lista_decisao.topLevelItem(i).text(5) for i in range(3)]
+        ativos = [aba.lista_decisao.topLevelItem(i).text(0) for i in range(3)]
+        decisoes = [aba.lista_decisao.topLevelItem(i).text(2) for i in range(3)]
         self.assertEqual(set(ativos), {"BTCUSD", "ETHUSD", "SOLUSD"})
         self.assertEqual(set(decisoes), {"SIM", "NAO", "HOLD"})
-        self.assertEqual(aba.lista_decisao.headerItem().text(0), "analysis_id")
-        self.assertEqual(aba.lista_decisao.headerItem().text(3), "pattern_id")
+        self.assertEqual(aba.lista_decisao.headerItem().text(0), "Ativo")
+        self.assertEqual(aba.lista_decisao.headerItem().text(4), "Latência")
 
     def test_resumo_no_status_e_vazio_contextual(self):
         aba = self._aba()

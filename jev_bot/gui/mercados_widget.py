@@ -80,7 +80,7 @@ class PainelMercados(QWidget):
         colunas.addLayout(rodape)
 
         self.regra = QLabel("Operar exige Monitorar: desmarcar Monitorar desmarca Operar. "
-                            "Somente símbolos do catálogo real; o histórico e a análise DeepSeek "
+                            "Somente símbolos do catálogo real; o histórico e a análise quantitativa local "
                             "ocorrem apenas para Monitorar, e somente Operar chega à decisão do JEv "
                             "(limites de risco prevalecem).")
         self.regra.setStyleSheet("color:#8ea3c8;")

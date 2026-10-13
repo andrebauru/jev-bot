@@ -4,11 +4,11 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QSettings
 from PySide6.QtGui import QBrush, QColor
 from PySide6.QtWidgets import (QDoubleSpinBox, QGroupBox, QHBoxLayout,
                                QLabel, QMessageBox, QPushButton, QSplitter,
-                               QTableWidget, QTableWidgetItem, QTreeWidget,
+                               QTabWidget, QTableWidget, QTableWidgetItem, QTreeWidget,
                                QTreeWidgetItem, QVBoxLayout, QWidget)
 
 VERDE, VERMELHO, AMBAR, CINZA = "#22c55e", "#ef4444", "#f59e0b", "#8ea3c8"
@@ -111,6 +111,8 @@ class ListaAnalise(QTreeWidget):
     def adicionar(self, valores, cor=None):
         """Insere no topo com teto de linhas; timestamps visíveis."""
         item = QTreeWidgetItem([str(v) if v is not None else "-" for v in valores])
+        for coluna, valor in enumerate(valores):
+            item.setToolTip(coluna, str(valor) if valor is not None else "-")
         if cor:
             item.setForeground(1, QBrush(QColor(cor)))
         self.insertTopLevelItem(0, item)
@@ -128,6 +130,8 @@ class ListaAnalise(QTreeWidget):
         novos = []
         for valores, cor in itens:
             item = QTreeWidgetItem([str(v) if v is not None else "-" for v in valores])
+            for coluna, valor in enumerate(valores):
+                item.setToolTip(coluna, str(valor) if valor is not None else "-")
             if cor:
                 item.setForeground(1, QBrush(QColor(cor)))
             novos.append(item)
@@ -231,23 +235,34 @@ class AbaOperacao(QWidget):
         divisor.setChildrenCollapsible(False)
         self.lista_calc = ListaAnalise(["ID", "Ativo", "Horário (UTC)", "Etapa",
                                         "Amostra", "Padrões", "Resultado", "Erro"])
-        self.lista_deepseek = ListaAnalise(["ID", "Ativo", "Horário (UTC)", "Padrão",
-                                            "Consulta", "Hipótese", "Validação local", "Resultado"])
-        self.lista_decisao = ListaAnalise(["analysis_id", "Ativo", "Horário (UTC)",
-                                           "pattern_id", "Direção", "Decisão",
-                                           "Justificativa", "Risco / Paper"])
+        self.lista_oportunidade = ListaAnalise(["Ativo", "Horário (UTC)", "Estado matemático",
+                                                "Motivo", "ID ciclo"])
+        self.lista_decisao = ListaAnalise(["Ativo", "Horário (UTC)", "Decisão",
+                                           "Motivo", "Latência"])
         self.painel_calc = PainelAnalise("CÁLCULOS MATEMÁTICOS (Python)", self.lista_calc)
-        self.painel_deepseek = PainelAnalise("ANÁLISE DEEPSEEK (padrões candidatos)",
-                                             self.lista_deepseek)
+        self.painel_oportunidade = PainelAnalise("OPORTUNIDADES — PYTHON QUANTITATIVO",
+                                                 self.lista_oportunidade)
         self.painel_decisao = PainelAnalise("DECISÃO JEv (SIM/NÃO e motivo)",
                                             self.lista_decisao)
-        self.paineis = {"calc": self.painel_calc, "deepseek": self.painel_deepseek,
+        self.paineis = {"calc": self.painel_calc, "oportunidade": self.painel_oportunidade,
                         "decisao": self.painel_decisao}
-        for indice, painel in enumerate((self.painel_calc, self.painel_deepseek,
-                                         self.painel_decisao)):
-            divisor.addWidget(painel)
-            divisor.setStretchFactor(indice, 1)
-        divisor.setHandleWidth(4)
+        self.abas_fluxo = QTabWidget()
+        pagina_oportunidades = QWidget()
+        layout_oportunidades = QVBoxLayout(pagina_oportunidades)
+        layout_oportunidades.setContentsMargins(4, 4, 4, 4)
+        self.divisor_oportunidades = QSplitter(Qt.Vertical)
+        self.divisor_oportunidades.setChildrenCollapsible(False)
+        self.divisor_oportunidades.addWidget(self.painel_oportunidade)
+        self.divisor_oportunidades.addWidget(self.painel_calc)
+        self.divisor_oportunidades.setStretchFactor(0, 2)
+        self.divisor_oportunidades.setStretchFactor(1, 1)
+        self.divisor_oportunidades.setSizes([420, 210])
+        layout_oportunidades.addWidget(self.divisor_oportunidades)
+        self.abas_fluxo.addTab(pagina_oportunidades, "Oportunidades / cálculos")
+        self.abas_fluxo.addTab(self.painel_decisao, "Decisões JEv")
+        divisor.addWidget(self.abas_fluxo)
+        divisor.setStretchFactor(0, 3)
+        divisor.setHandleWidth(5)
 
         grupo_historico = QGroupBox("Histórico de trades (persistido em db.json)")
         layout_historico = QVBoxLayout(grupo_historico)
@@ -261,8 +276,23 @@ class AbaOperacao(QWidget):
         self.tabela.horizontalHeader().setStretchLastSection(True)
         layout_historico.addWidget(self.tabela)
         divisor.addWidget(grupo_historico)
-        divisor.setStretchFactor(3, 2)
+        divisor.setStretchFactor(1, 2)
+        divisor.setSizes([570, 220])
+        self.divisor_principal = divisor
+        self._settings = QSettings("JEvBot", "JEvBot")
+        estado_divisor = self._settings.value("operacao/splitter_principal")
+        if estado_divisor:
+            divisor.restoreState(estado_divisor)
+        estado_oportunidades = self._settings.value("operacao/splitter_oportunidades")
+        if estado_oportunidades:
+            self.divisor_oportunidades.restoreState(estado_oportunidades)
         raiz.addWidget(divisor, 1)
+
+    def salvar_layout(self):
+        """Persiste as proporções escolhidas pelo usuário nos splitters."""
+        self._settings.setValue("operacao/splitter_principal", self.divisor_principal.saveState())
+        self._settings.setValue("operacao/splitter_oportunidades",
+                                self.divisor_oportunidades.saveState())
 
     # ------------------------------------------------------------- construção
     def _spin(self, layout, titulo):
@@ -402,29 +432,32 @@ class AbaOperacao(QWidget):
                      r.get("resultado") or r.get("mensagem") or "-",
                      r.get("erro") or ""],
                     VERMELHO if r.get("etapa") == "erro" else None))
-            elif canal == "deepseek":
-                itens.append((
-                    [r.get("id"), r.get("simbolo") or "-", _fmt_horario(r.get("instante")),
-                     r.get("padrao") or "-", r.get("status_consulta") or "-",
-                     r.get("hipotese") or "-", r.get("validacao") or "-", r.get("resultado") or "-"],
-                    VERDE if "validado" in str(r.get("validacao", "")).lower()
-                    else VERMELHO if "rejeitado" in str(r.get("validacao", "")).lower() else None))
+            elif canal == "oportunidade":
+                itens.append(([r.get("simbolo") or "-", _fmt_horario(r.get("instante")),
+                               r.get("estado") or "-", r.get("motivo") or "-", r.get("id") or "-"],
+                              VERDE if r.get("motivo") in ("PAPER_EXECUTED", "DECISION_SIM")
+                              else VERMELHO if r.get("motivo") in ("NO_SETUP", "RISK_BLOCK", "ERRO")
+                              else None))
             elif canal == "decisao":
                 decisao = str(r.get("decisao") or "-")
                 cor = (VERDE if decisao == "SIM" else VERMELHO if decisao in ("NAO", "NÃO")
                        else AMBAR if decisao == "HOLD" else CINZA)
+                if decisao not in ("SIM", "NAO", "NÃO", "HOLD"):
+                    continue  # nunca exibe estado pendente como decisão do JEv
+                latencia = []
+                if r.get("latencia_detecao_ms") is not None:
+                    latencia.append(f"despacho {r['latencia_detecao_ms']} ms")
+                if r.get("latencia_ms") is not None:
+                    latencia.append(f"JEv {r['latencia_ms']} ms")
                 itens.append((
-                    [r.get("id"), r.get("simbolo") or "-", _fmt_horario(r.get("instante")),
-                     r.get("padrao") or "-", r.get("direcao") or "-", decisao,
-                     r.get("justificativa") or "-",
-                     f"{r.get('risco') or '-'} | {r.get('execucao') or '-'}"], cor))
+                    [r.get("simbolo") or "-", _fmt_horario(r.get("instante")), decisao,
+                     r.get("justificativa") or "-", " / ".join(latencia) or "-"], cor))
             elif canal == "resumo":
                 oportunidades = r.get("oportunidades", 0)
                 funil = " → ".join(f"{etapa.split('_')[0]}:{qtd}" for etapa, qtd
                                    in (r.get("funil") or {}).items())
                 tempos = r.get("tempos") or {}
-                nomes = {"decisao": "decisão", "deepseek": "DeepSeek",
-                         "oportunidade": "oportunidade", "trade": "trade"}
+                nomes = {"decisao": "decisão", "oportunidade": "oportunidade", "trade": "trade"}
                 desde = " | ".join(f"{nomes[chave]} há {valor}s"
                                    for chave, valor in tempos.items() if valor is not None)
                 texto = (f"Ciclo {r.get('ciclo', '?')}: {oportunidades} oportunidade(s) "
@@ -444,13 +477,14 @@ class AbaOperacao(QWidget):
                        "info": CINZA}.get(r.get("nivel"), CINZA)
                 itens.append((["log", "", _fmt_horario(r.get("instante")),
                                r.get("nivel", ""), "", "", r.get("mensagem", "")], cor))
-        lista = {"calc": self.lista_calc, "deepseek": self.lista_deepseek,
+        lista = {"calc": self.lista_calc, "oportunidade": self.lista_oportunidade,
                  "decisao": self.lista_decisao}.get(canal)
         if lista is not None and itens:
             lista.adicionar_lote(itens)
             painel = self.paineis.get(canal)
             if painel is not None:
-                painel.atualizar(lista.topLevelItemCount(), itens[0][0][2])
+                indice_horario = 1 if canal in ("oportunidade", "decisao") else 2
+                painel.atualizar(lista.topLevelItemCount(), itens[0][0][indice_horario])
 
     def receber_evento(self, canal, r):
         """Compatibilidade: um registro avulso entra como lote de um item."""
