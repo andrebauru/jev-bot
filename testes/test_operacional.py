@@ -302,13 +302,16 @@ class TestCiclosMulti(unittest.TestCase):
                     orch._processar_resultados_jev()
                     time.sleep(.005)
                 orch._processar_resultados_jev()
-            c1, c2, c3 = [r["ciclo"] for canal, r in orch.eventos
-                           if canal == "resumo"]
+            resumos_por_run = {}
+            for canal, registro in orch.eventos:
+                if canal == "resumo":
+                    resumos_por_run[registro["run_id"]] = registro
+            resumos = list(resumos_por_run.values())
+            c1, c2, c3 = [r["ciclo"] for r in resumos]
             self.assertEqual((c1, c2, c3), (1, 2, 3))
             estados = [r.get("estado") for c, r in orch.eventos if c == "estado"]
             self.assertGreaterEqual(estados.count("ANALISANDO"), 2)
             self.assertEqual(len(orch.book.fills), 0)  # HOLD não executa
-            resumos = [r for canal, r in orch.eventos if canal == "resumo"]
             decisoes = [r for canal, r in orch.eventos
                         if canal == "decisao" and r.get("decisao") == "HOLD"]
             self.assertEqual(len(chamadas), 3)
@@ -317,6 +320,9 @@ class TestCiclosMulti(unittest.TestCase):
             for resumo, decisao in zip(resumos, decisoes):
                 self.assertEqual(resumo["resultado"], "CONCLUIDO")
                 self.assertEqual(resumo["funil"]["deepseek_calls"], 0)
+                self.assertEqual(resumo["funil"]["jev_hold"], 1)
+                self.assertEqual(resumo["funil"].get("aguardando_decisao", 0), 0)
+                self.assertEqual(resumo["jev_pendentes"], 0)
                 self.assertEqual(decisao["run_id"], resumo["run_id"])
                 self.assertTrue(decisao["python_validated_at"])
                 self.assertTrue(decisao["jev_dispatched_at"])

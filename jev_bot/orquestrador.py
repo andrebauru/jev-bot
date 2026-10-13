@@ -141,6 +141,7 @@ class Orquestrador:
         self.resultados_jev = queue.Queue()
         self.pendentes_jev = {}
         self.worker_jev = None
+        self.resumos_emitidos = {}
         self.fonte = None
         self.book = None
         self.repositorio = None
@@ -559,16 +560,41 @@ class Orquestrador:
             contexto = self.pendentes_jev.pop(request_id, None)
             if contexto is None:
                 continue
-            self._finalizar_decisao_jev(contexto, decisao, erro, latencia_ms)
+            contadores_atuais = self.contadores_ciclo
+            self.contadores_ciclo = contexto["contadores"]
+            try:
+                self._finalizar_decisao_jev(contexto, decisao, erro, latencia_ms)
+            finally:
+                contexto["contadores"]["aguardando_decisao"] = max(
+                    0, contexto["contadores"].get("aguardando_decisao", 0) - 1)
+                self.contadores_ciclo = contadores_atuais
+            self._atualizar_resumo_jev(contexto["run_id"], contexto["contadores"])
+
+    def _atualizar_resumo_jev(self, run_id, contadores):
+        """Publica contadores finais do run_id quando a rede termina em background."""
+        resumo = self.resumos_emitidos.get(run_id)
+        if resumo is None:
+            return
+        em_fila = sum(c.get("run_id") == run_id for c in self.pendentes_jev.values())
+        funil = {chave: valor for chave, valor in contadores.items()
+                 if valor and chave != "deepseek_calls"}
+        funil["deepseek_calls"] = 0
+        resumo["funil"] = funil
+        resumo["jev_pendentes"] = em_fila
+        resumo["motivos"] = "; ".join(f"{k}={v}" for k, v in sorted(contadores.items()))
+        if resumo.get("resultado") == "PARCIAL" and not em_fila and not resumo.get("pendentes"):
+            resumo["resultado"] = "CONCLUIDO"
+        self.publicar("resumo", dict(resumo))
 
     def _finalizar_decisao_jev(self, contexto, decisao, erro, latencia_ms):
         """Finaliza política, validação temporal e paper exclusivamente no motor."""
         simbolo = contexto["simbolo"]
+        base = {**contexto["registro_base"], "instante": _agora_iso()}
         if erro:
             self.contadores_ciclo["ia_indisponivel"] = \
                 self.contadores_ciclo.get("ia_indisponivel", 0) + 1
             self.proxima_tentativa_jev = self.relogio() + TENTATIVA_JEV_S
-            self.publicar("decisao", {**contexto["registro_base"], "decisao": "HOLD",
+            self.publicar("decisao", {**base, "decisao": "HOLD",
                                       "justificativa": erro, "risco": "-", "execucao": "adiada",
                                       "run_id": contexto["run_id"],
                                       "python_validated_at": contexto["python_validated_at"],
@@ -594,7 +620,6 @@ class Orquestrador:
                          analysis_id=contexto["id"], run_id=contexto["run_id"])
         gate = risk.check(decisao, self.book, self.book.limits, atualizado)
         acao = decisao.action
-        base = contexto["registro_base"]
         metadata = {"run_id": contexto["run_id"],
                     "python_validated_at": contexto["python_validated_at"],
                     "jev_dispatched_at": contexto["jev_dispatched_at"],
@@ -976,6 +1001,10 @@ class Orquestrador:
                 resultado_ciclo = "CANCELADO"
             elif self.pendentes_ciclo:
                 resultado_ciclo = "PARCIAL"
+            jev_pendentes = sum(ctx.get("run_id") == run_id
+                                for ctx in self.pendentes_jev.values())
+            if jev_pendentes and resultado_ciclo == "CONCLUIDO":
+                resultado_ciclo = "PARCIAL"
         except RuntimeError as exc:
             resultado_ciclo = "ERRO"
             self.logger.erro("ciclo com erro", ciclo=self.ciclo, detalhe=str(exc)[:160])
@@ -989,12 +1018,12 @@ class Orquestrador:
                                       "mensagem": "Ciclo cancelado pelo operador; restante adiado para o próximo ciclo"})
             self.descarregar()
             instante_fim = _agora_iso()
-            self.publicar("resumo", {"id": id_ciclo, "ciclo": self.ciclo,
-                                      "run_id": run_id, "instante": instante_fim,
-                                      "inicio": instante_inicio, "fim": instante_fim,
-                                      "resultado": resultado_ciclo,
-                                     "oportunidades": self.contadores_ciclo.get("enviados_jev", 0),
-                                     "motivos": "; ".join(f"{k}={v}" for k, v in sorted(self.contadores_ciclo.items())) or "sem candidatos monitorados",
+            resumo_ciclo = {"id": id_ciclo, "ciclo": self.ciclo,
+                            "run_id": run_id, "instante": instante_fim,
+                            "inicio": instante_inicio, "fim": instante_fim,
+                            "resultado": resultado_ciclo,
+                                      "oportunidades": self.contadores_ciclo.get("enviados_jev", 0),
+                                      "motivos": "; ".join(f"{k}={v}" for k, v in sorted(self.contadores_ciclo.items())) or "sem candidatos monitorados",
                                      "funil": {**{e: self.contadores_ciclo[e] for e in (
                                          "candidatos", "candidatos_locais", "locais_validados",
                                          "rejeitado_validacao", "elegiveis", "enviados_jev",
@@ -1003,10 +1032,15 @@ class Orquestrador:
                                          "hold_aguardando", "hold_expirado", "erros")
                                          if self.contadores_ciclo.get(e)},
                                          "deepseek_calls": 0},
-                                     "tempos": {chave: (round(self.relogio() - valor, 1) if valor else None)
-                                                for chave, valor in self.ultimos.items()},
-                                     "pendentes": len(self.pendentes_ciclo),
-                                     "duracao_s": duracao, "resultado": resultado_ciclo})
+                                      "tempos": {chave: (round(self.relogio() - valor, 1) if valor else None)
+                                                 for chave, valor in self.ultimos.items()},
+                                      "pendentes": len(self.pendentes_ciclo),
+                                      "jev_pendentes": jev_pendentes,
+                                      "duracao_s": duracao}
+            self.resumos_emitidos[run_id] = resumo_ciclo
+            while len(self.resumos_emitidos) > 12:
+                self.resumos_emitidos.pop(next(iter(self.resumos_emitidos)))
+            self.publicar("resumo", dict(resumo_ciclo))
             self.logger.info("ciclo concluído", ciclo=self.ciclo, resultado=resultado_ciclo,
                              duracao_s=duracao, run_id=run_id)
 
@@ -1497,6 +1531,7 @@ class Orquestrador:
                             "estado": estado, "padrao": padrao["id"],
                             "identificador": identificador, "candle_ref": instante_candle,
                             "run_id": contrato["run_id"],
+                            "contadores": self.contadores_ciclo,
                             "python_validated_at": contrato["python_validated_at"],
                             "jev_dispatched_at": instante_despacho,
                             "latencia_detecao_ms": max(0, round((self.relogio() - t_deteccao) * 1000)),
