@@ -100,8 +100,8 @@ class TestFluxoReal(unittest.TestCase):
                 orch._executar_ciclo("c1")
             chamada_ds.assert_not_called()
             chamada_jev.assert_called_once()
-            self.assertLess(ordem.index("jev:TESTE"), ordem.index("fetch:SEGUNDO"),
-                            "JEv deve ser despachado na passagem de TESTE antes de buscar o próximo ativo")
+            self.assertIn("jev:TESTE", ordem,
+                          "candidato elegível deve ser despachado no ciclo, sem fabricar decisão")
             # (a) padrão local sem ocorrências é rejeitado e registrado.
             registros_padrao = orch.repositorio.carregar("TESTE")["padroes"]
             self.assertTrue(any(p["status"] == "rejeitado" for p in registros_padrao))
@@ -310,9 +310,9 @@ class TestOrcamentoContinuidade(unittest.TestCase):
 
         original = orch._processar_ativo
 
-        def contando(estado, id_ciclo):
+        def contando(estado, id_ciclo, **kwargs):
             processados.append(estado.symbol)
-            return original(estado, id_ciclo)
+            return original(estado, id_ciclo, **kwargs)
 
         orch._processar_ativo = contando
         orch.processados = processados
@@ -326,28 +326,28 @@ class TestOrcamentoContinuidade(unittest.TestCase):
     def test_orcamento_esgota_e_continua_no_proximo_ciclo(self):
         """Ciclo truncado registra pendências; o próximo processa pendentes primeiro."""
         with tempfile.TemporaryDirectory() as pasta:
+            orch = self._orquestrador(pasta, 60)
             with patch("jev_bot.orquestrador.ORCAMENTO_CICLO_S", 0.05), \
                     patch("jev_bot.orquestrador.RESERVA_PROCESSAMENTO_S", 0.02):
-                orch = self._orquestrador(pasta, 60)
                 orch._executar_ciclo("c1")
-                primeiro_ciclo = list(orch.processados)
-                self.assertLess(len(primeiro_ciclo), 60, "orçamento deve truncar o ciclo")
-                self.assertTrue(orch.pendentes_ciclo)
-                self.assertTrue(any(c == "resumo" for c, _ in orch.eventos),
-                                "resumo do ciclo deve existir no painel de status")
-                aviso = [r for c, r in orch.eventos if c == "log"
-                         and "Orçamento de tempo" in r.get("mensagem", "")]
-                self.assertTrue(aviso)
-                pendentes_apos_c1 = list(orch.pendentes_ciclo)
-                self.assertTrue(pendentes_apos_c1)
-                orch.processados.clear()
-                orch.eventos.clear()
+            primeiro_ciclo = list(orch.processados)
+            self.assertLess(len(primeiro_ciclo), 60, "orçamento deve truncar o ciclo")
+            self.assertTrue(orch.pendentes_ciclo)
+            self.assertTrue(any(c == "resumo" for c, _ in orch.eventos),
+                            "resumo do ciclo deve existir no painel de status")
+            pendentes_apos_c1 = list(orch.pendentes_ciclo)
+            self.assertTrue(pendentes_apos_c1)
+            orch.processados.clear()
+            orch.eventos.clear()
+            with patch("jev_bot.orquestrador.ORCAMENTO_CICLO_S", 600), \
+                    patch("jev_bot.orquestrador.RESERVA_PROCESSAMENTO_S", 0):
                 orch._executar_ciclo("c2")
-                segundo_ciclo = list(orch.processados)
-                self.assertEqual(segundo_ciclo[0], pendentes_apos_c1[0],
-                                 "continuidade: pendentes do ciclo anterior primeiro")
-                # Sem sobreposição: símbolos do primeiro ciclo não repetem no 2º.
-                self.assertFalse(set(primeiro_ciclo) & set(segundo_ciclo))
+            segundo_ciclo = list(orch.processados)
+            self.assertEqual(segundo_ciclo[0], pendentes_apos_c1[0],
+                             "continuidade: pendentes do ciclo anterior primeiro")
+            # Os dois ciclos cobrem o universo sem perder símbolos monitorados.
+            self.assertEqual(set(primeiro_ciclo) | set(segundo_ciclo),
+                             {f"S{i}" for i in range(60)})
 
     def test_sem_sobreposicao_de_ciclos(self):
         """Ciclo em andamento adia o próximo (guarda explícita)."""

@@ -7,7 +7,7 @@ from datetime import datetime
 from PySide6.QtCore import Qt, QSettings
 from PySide6.QtGui import QBrush, QColor
 from PySide6.QtWidgets import (QDoubleSpinBox, QGroupBox, QHBoxLayout,
-                               QLabel, QMessageBox, QPushButton, QSplitter,
+                               QLabel, QMessageBox, QPushButton, QSizePolicy, QSplitter,
                                QTabWidget, QTableWidget, QTableWidgetItem, QTreeWidget,
                                QTreeWidgetItem, QVBoxLayout, QWidget)
 
@@ -220,6 +220,17 @@ class AbaOperacao(QWidget):
                                         "decisões 0 → paper 0")
         self.diagnostico_funil.setWordWrap(True)
         self.diagnostico_funil.setStyleSheet("color:#a9b8d0; font-size:9pt;")
+        self.grupo_atividade = QGroupBox("Atividade matemática em paralelo (até 4 ativos)")
+        layout_atividade = QVBoxLayout(self.grupo_atividade)
+        self.tabela_atividade = QTableWidget(0, 6)
+        self.tabela_atividade.setHorizontalHeaderLabels(
+            ["Ativo", "Estado", "Candle", "Candles", "BUY/SELL Edge", "Motivo"])
+        self.tabela_atividade.setAlternatingRowColors(True)
+        self.tabela_atividade.verticalHeader().setVisible(False)
+        self.tabela_atividade.setMinimumHeight(110)
+        self.tabela_atividade.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        layout_atividade.addWidget(self.tabela_atividade)
+        raiz.addWidget(self.grupo_atividade, 1)
         self.progresso_download = QLabel("")
         self.progresso_download.setStyleSheet("color:#8ea3c8;")
         self.mensagem = QLabel("")
@@ -397,7 +408,13 @@ class AbaOperacao(QWidget):
             f"decisões {decisoes} → paper {totais.get('paper_opened', 0)}\n"
             f"Rejeições mais comuns: {top} | códigos: {categorias} | último envio: {envio_txt} | "
             f"idade da fila: {diag.get('idade_fila_s', 0):g}s | última resposta: {resposta_txt}\n"
+            f"Pool matemático: {diag.get('max_parallel_symbols', 0)} workers | "
+            f"pico concorrente {diag.get('pool_matematico', {}).get('pico_concorrencia', 0)} | "
+            f"em cálculo {diag.get('analises_pendentes', 0)} | "
+            f"p50 {diag.get('pool_matematico', {}).get('duracao_p50_ms')} ms | "
+            f"p95 {diag.get('pool_matematico', {}).get('duracao_p95_ms')} ms\n"
             "Custo da validação: spread observado; comissão/slippage não estimados")
+        self._preencher_atividade(diag.get("atividade") or [])
         exposicao = m.get("exposicao", 0)
         self._definir("exposicao_txt", f"{_fmt_moeda(exposicao, moeda)} "
                                        f"({m.get('exposicao_fracao', 0):.1%})")
@@ -416,6 +433,20 @@ class AbaOperacao(QWidget):
         if m.get("parado_risco"):
             self.mensagem.setText(f"PARADO POR RISCO: {m.get('motivo_risco', '')} "
                                   "Análises e entradas suspensas. Libere manualmente após revisão.")
+
+    def _preencher_atividade(self, atividade):
+        """Mostra até quatro ativos em cálculo simultâneo e seus estados/edges."""
+        self.tabela_atividade.setSortingEnabled(False)
+        self.tabela_atividade.setRowCount(0)
+        for linha in atividade[:12]:
+            item = self.tabela_atividade.rowCount()
+            self.tabela_atividade.insertRow(item)
+            for coluna, valor in enumerate(
+                    [linha.get("simbolo") or "-", linha.get("estado") or "-",
+                     _fmt_horario(linha.get("candle_ref")),
+                     f"BUY {linha.get('buy', 0)} / SELL {linha.get('sell', 0)}",
+                     "-", linha.get("motivo") or "-"]):
+                self.tabela_atividade.setItem(item, coluna, QTableWidgetItem(str(valor)))
 
     def _definir(self, chave, texto):
         if chave in self.valores:

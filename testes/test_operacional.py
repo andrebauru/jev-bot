@@ -167,9 +167,9 @@ class TestPrioridadeOperar(unittest.TestCase):
         orch.processados = []
         original = orch._processar_ativo
 
-        def contando(estado, id_ciclo):
+        def contando(estado, id_ciclo, **kwargs):
             orch.processados.append(estado.symbol)
-            return original(estado, id_ciclo)
+            return original(estado, id_ciclo, **kwargs)
 
         orch._processar_ativo = contando
         orch.fonte = FonteFake(estados=[estado_mt5(f"S{i}") for i in range(6)],

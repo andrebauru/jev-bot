@@ -231,7 +231,7 @@ class TestDecisoesOperacionais(unittest.TestCase):
             # Sem nenhum padrão validado: nenhuma chamada ao JEv.
             with patch("jev_bot.orquestrador.jev.decide") as chamada:
                 motivo = orch._oportunidade(estado_mt5(closes=closes), "id")
-            self.assertEqual(motivo, "sem_padrao")
+            self.assertEqual(motivo, "sem_edge_matematico")
             chamada.assert_not_called()
             self.assertEqual(orch.contadores_ciclo.get("sem_padrao"), 1)
 

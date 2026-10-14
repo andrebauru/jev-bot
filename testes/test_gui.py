@@ -189,6 +189,27 @@ class TestGui(unittest.TestCase):
         self.assertIn("último envio: nunca", texto)
         self.assertIn("idade da fila: 0s", texto)
 
+    def test_atividade_matematica_mostra_estados(self):
+        from jev_bot.gui.aba_operacao import AbaOperacao
+        aba = AbaOperacao(acoes={k: (lambda: None) for k in
+                                 ("iniciar", "pausar", "retomar", "emergencia",
+                                  "liberar_risco", "aplicar_limites", "cancelar_ciclo")})
+        aba.receber_metricas({"estado": "ANALISANDO", "diagnostico_funil": {
+            "totais": {}, "atividade": [
+                {"simbolo": "BTCUSD", "estado": "CALCULATING", "buy": 3, "sell": 1,
+                 "candle_ref": None, "motivo": None},
+                {"simbolo": "USDJPY", "estado": "REJECTED", "buy": 1, "sell": 2,
+                 "candle_ref": None, "motivo": "NEGATIVE_EXPECTANCY"}],
+            "pool_matematico": {"pico_concorrencia": 4, "duracao_p50_ms": 10,
+                                "duracao_p95_ms": 40},
+            "max_parallel_symbols": 4, "analises_pendentes": 2}})
+        self.assertEqual(aba.tabela_atividade.rowCount(), 2)
+        self.assertEqual(aba.tabela_atividade.item(0, 0).text(), "BTCUSD")
+        self.assertEqual(aba.tabela_atividade.item(0, 1).text(), "CALCULATING")
+        self.assertIn("BUY 3", aba.tabela_atividade.item(0, 3).text())
+        self.assertEqual(aba.tabela_atividade.item(1, 5).text(), "NEGATIVE_EXPECTANCY")
+        self.assertIn("pico concorrente 4", aba.diagnostico_funil.text())
+
     def test_splitters_redimensionaveis_em_janela_normal_e_reduzida(self):
         """Conteúdo de operação mantém listas utilizáveis em dimensões variadas."""
         from PySide6.QtWidgets import QWidget, QVBoxLayout, QSplitter
