@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 from PySide6.QtCore import Qt, QSettings
 from PySide6.QtGui import QBrush, QColor
@@ -40,6 +40,8 @@ def _fmt_moeda(valor, moeda=""):
 
 def _fmt_horario(iso):
     try:
+        if isinstance(iso, (int, float)) and not isinstance(iso, bool):
+            return datetime.fromtimestamp(float(iso), tz=timezone.utc).strftime("%d/%m %H:%M:%S")
         return datetime.fromisoformat(iso).strftime("%d/%m %H:%M:%S")
     except (TypeError, ValueError):
         return "-"
@@ -247,37 +249,37 @@ class AbaOperacao(QWidget):
         self.conta_real.setStyleSheet("color:#8ea3c8;")
         raiz.addWidget(self.conta_real)
 
-        # --- três listas + histórico no splitter vertical
+        # --- duas colunas redimensionáveis: cálculos Python | análises/decisões JEv
         divisor = QSplitter(Qt.Vertical)
         divisor.setChildrenCollapsible(False)
-        self.lista_calc = ListaAnalise(["ID", "Ativo", "Horário (UTC)", "Etapa",
-                                        "Amostra", "Padrões", "Resultado", "Erro"])
-        self.lista_oportunidade = ListaAnalise(["Ativo", "Horário (UTC)", "Estado matemático",
+        self.lista_calc = ListaAnalise(["Ativo", "Candle", "Status", "BUY/SELL",
+                                        "Custo", "Resultado"])
+        self.lista_oportunidade = ListaAnalise(["Ativo", "Candle", "Estado matemático",
                                                 "Motivo", "ID ciclo"])
-        self.lista_decisao = ListaAnalise(["Ativo", "Horário (UTC)", "Decisão",
-                                           "Motivo", "Latência"])
-        self.painel_calc = PainelAnalise("CÁLCULOS MATEMÁTICOS (Python)", self.lista_calc)
+        self.lista_decisao = ListaAnalise(["Ativo", "Enviado em", "Decisão", "Estado API",
+                                           "Motivo", "Latência", "Risco/Paper"])
+        self.painel_calc = PainelAnalise("CÁLCULOS PYTHON (por símbolo)", self.lista_calc)
         self.painel_oportunidade = PainelAnalise("OPORTUNIDADES — PYTHON QUANTITATIVO",
                                                  self.lista_oportunidade)
-        self.painel_decisao = PainelAnalise("DECISÃO JEv (SIM/NÃO e motivo)",
+        self.painel_decisao = PainelAnalise("ANÁLISES ENVIADAS / DECISÕES JEv",
                                             self.lista_decisao)
         self.paineis = {"calc": self.painel_calc, "oportunidade": self.painel_oportunidade,
                         "decisao": self.painel_decisao}
-        self.abas_fluxo = QTabWidget()
-        pagina_oportunidades = QWidget()
-        layout_oportunidades = QVBoxLayout(pagina_oportunidades)
-        layout_oportunidades.setContentsMargins(4, 4, 4, 4)
-        self.divisor_oportunidades = QSplitter(Qt.Vertical)
-        self.divisor_oportunidades.setChildrenCollapsible(False)
-        self.divisor_oportunidades.addWidget(self.painel_oportunidade)
-        self.divisor_oportunidades.addWidget(self.painel_calc)
-        self.divisor_oportunidades.setStretchFactor(0, 2)
-        self.divisor_oportunidades.setStretchFactor(1, 1)
-        self.divisor_oportunidades.setSizes([420, 210])
-        layout_oportunidades.addWidget(self.divisor_oportunidades)
-        self.abas_fluxo.addTab(pagina_oportunidades, "Oportunidades / cálculos")
-        self.abas_fluxo.addTab(self.painel_decisao, "Decisões JEv")
-        divisor.addWidget(self.abas_fluxo)
+        coluna_esquerda = QSplitter(Qt.Vertical)
+        coluna_esquerda.setChildrenCollapsible(False)
+        coluna_esquerda.addWidget(self.painel_calc)
+        coluna_esquerda.addWidget(self.painel_oportunidade)
+        coluna_esquerda.setStretchFactor(0, 3)
+        coluna_esquerda.setStretchFactor(1, 2)
+        self.coluna_esquerda = coluna_esquerda
+        self.divisor_colunas = QSplitter(Qt.Horizontal)
+        self.divisor_colunas.setChildrenCollapsible(False)
+        self.divisor_colunas.addWidget(coluna_esquerda)
+        self.divisor_colunas.addWidget(self.painel_decisao)
+        self.divisor_colunas.setStretchFactor(0, 1)
+        self.divisor_colunas.setStretchFactor(1, 1)
+        self.divisor_colunas.setSizes([680, 680])
+        divisor.addWidget(self.divisor_colunas)
         divisor.setStretchFactor(0, 3)
         divisor.setHandleWidth(5)
 
@@ -300,16 +302,20 @@ class AbaOperacao(QWidget):
         estado_divisor = self._settings.value("operacao/splitter_principal")
         if estado_divisor:
             divisor.restoreState(estado_divisor)
-        estado_oportunidades = self._settings.value("operacao/splitter_oportunidades")
-        if estado_oportunidades:
-            self.divisor_oportunidades.restoreState(estado_oportunidades)
+        estado_colunas = self._settings.value("operacao/splitter_colunas")
+        if estado_colunas:
+            self.divisor_colunas.restoreState(estado_colunas)
+        estado_esquerda = self._settings.value("operacao/splitter_coluna_esquerda")
+        if estado_esquerda:
+            self.coluna_esquerda.restoreState(estado_esquerda)
         raiz.addWidget(divisor, 1)
 
     def salvar_layout(self):
         """Persiste as proporções escolhidas pelo usuário nos splitters."""
         self._settings.setValue("operacao/splitter_principal", self.divisor_principal.saveState())
-        self._settings.setValue("operacao/splitter_oportunidades",
-                                self.divisor_oportunidades.saveState())
+        self._settings.setValue("operacao/splitter_colunas", self.divisor_colunas.saveState())
+        self._settings.setValue("operacao/splitter_coluna_esquerda",
+                                self.coluna_esquerda.saveState())
 
     # ------------------------------------------------------------- construção
     def _spin(self, layout, titulo):
@@ -500,11 +506,10 @@ class AbaOperacao(QWidget):
                 elif r.get("etapa") in ("calculado", "erro", "dados"):
                     self.progresso_download.setText("")
                 itens.append((
-                    [r.get("id"), r.get("simbolo") or "-", _fmt_horario(r.get("instante")),
-                     str(r.get("etapa") or "-"), texto_amostra,
-                     "-" if r.get("padroes_testados") is None else r.get("padroes_testados"),
-                     r.get("resultado") or r.get("mensagem") or "-",
-                     r.get("erro") or ""],
+                    [r.get("simbolo") or "-", _fmt_horario(r.get("candle_ref")),
+                     str(r.get("etapa") or "-"), r.get("direcao") or "-",
+                     r.get("custo") or "-",
+                     r.get("resultado") or r.get("mensagem") or "-"],
                     VERMELHO if r.get("etapa") == "erro" else None))
             elif canal == "oportunidade":
                 itens.append(([r.get("simbolo") or "-", _fmt_horario(r.get("instante")),
@@ -517,17 +522,18 @@ class AbaOperacao(QWidget):
             elif canal == "decisao":
                 decisao = str(r.get("decisao") or "-")
                 cor = (VERDE if decisao == "SIM" else VERMELHO if decisao in ("NAO", "NÃO")
-                       else AMBAR if decisao == "HOLD" else CINZA)
-                if decisao not in ("SIM", "NAO", "NÃO", "HOLD"):
+                       else AMBAR if decisao == "HOLD"
+                       else VERMELHO if decisao.startswith("JEV_") else CINZA)
+                if decisao not in ("SIM", "NAO", "NÃO", "HOLD") and not decisao.startswith("JEV_"):
                     continue  # nunca exibe estado pendente como decisão do JEv
-                latencia = []
-                if r.get("latencia_detecao_ms") is not None:
-                    latencia.append(f"despacho {r['latencia_detecao_ms']} ms")
-                if r.get("latencia_ms") is not None:
-                    latencia.append(f"JEv {r['latencia_ms']} ms")
                 itens.append((
                     [r.get("simbolo") or "-", _fmt_horario(r.get("instante")), decisao,
-                     r.get("justificativa") or "-", " / ".join(latencia) or "-"], cor))
+                     r.get("policy") or "-",
+                     r.get("justificativa") or "-",
+                     (f"{r.get('latencia_ms')} ms" if r.get("latencia_ms") is not None
+                      else f"det.{r.get('latencia_detecao_ms')} ms"
+                      if r.get("latencia_detecao_ms") is not None else "-"),
+                     f"{r.get('risco') or '-'} | {r.get('execucao') or '-'}"], cor))
             elif canal == "resumo":
                 oportunidades = r.get("oportunidades", 0)
                 funil = " → ".join(f"{etapa.split('_')[0]}:{qtd}" for etapa, qtd

@@ -314,7 +314,7 @@ class TestGuiDecisoes(unittest.TestCase):
         self.assertEqual(set(ativos), {"BTCUSD", "ETHUSD", "SOLUSD"})
         self.assertEqual(set(decisoes), {"SIM", "NAO", "HOLD"})
         self.assertEqual(aba.lista_decisao.headerItem().text(0), "Ativo")
-        self.assertEqual(aba.lista_decisao.headerItem().text(4), "Latência")
+        self.assertEqual(aba.lista_decisao.headerItem().text(5), "Latência")
 
     def test_resumo_no_status_e_vazio_contextual(self):
         aba = self._aba()

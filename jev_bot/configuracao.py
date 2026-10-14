@@ -93,6 +93,11 @@ def timeout_deepseek():
     return _inteiro("DEEPSEEK_TIMEOUT_S", 45, 5, 300)
 
 
+def dias_historico():
+    """Janela rolante de histórico M1 em dias (padrão 7, faixa 1..30)."""
+    return _inteiro("JEV_HISTORY_DAYS", 7, 1, 30)
+
+
 def _escapar_valor(valor):
     """Envolve o valor em aspas simples quando necessário no .env."""
     texto = str(valor)

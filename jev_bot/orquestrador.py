@@ -42,7 +42,7 @@ import queue
 import threading
 import time
 
-from . import cache_m1, candidatos, jev, logs, mercados, padroes, risk
+from . import cache_m1, candidatos, configuracao, jev, logs, mercados, padroes, risk
 from .markets import FonteMT5
 from .pool_matematico import PoolMatematico, max_paralelo
 from .motor_matematico import estatisticas, janela_descoberta, resumo_compacto
@@ -82,6 +82,10 @@ MOTIVOS_CODIGO = {
     "history": "INSUFFICIENT_HISTORY",
     "tick": "INVALID_TICK",
     "stale": "STALE_CANDLE",
+    "enviado_jev": "ANALISE_ENVIADA",
+    "sem_jev": "IA_INDISPONIVEL",
+    "fila_cheia": "FILA_BLOQUEADA",
+    "candle_ja_enviado": "ANALISE_JA_ENVIADA",
 }
 FAS = {"VARRENDO": "VARRENDO CATÁLOGO", "BAIXANDO_HISTORICO": "BAIXANDO HISTÓRICO",
        "CALCULANDO": "CALCULANDO", "VALIDANDO": "VALIDANDO PADRÕES",
@@ -165,6 +169,9 @@ class Orquestrador:
         self.ultima_resposta_jev = None
         self.estados_ativos = {}          # simbolo -> estado do pool matemático
         self.validados_memoria = {}       # simbolo -> candidatos validados no ciclo
+        self.analises_memoria = {}        # simbolo -> análise matemática completa (BUY/SELL)
+        self.matematica_memoria = {}      # simbolo -> dados brutos da última matemática
+        self.analisados_jev = {}          # simbolo -> último candle enviado ao JEv
         self.analises_pendentes = {}      # simbolo -> Future da análise matemática
         self.pool_matematico = PoolMatematico(relogio=relogio)
         self.fonte = None
@@ -205,7 +212,9 @@ class Orquestrador:
         self.ultimo_motivo = {}    # simbolo -> (codigo, detalhe) do último motivo
         self.ultimos = {"decisao": None, "oportunidade": None, "trade": None}
         self.cache_m1 = cache_m1.CacheM1(self.pasta_dados.parent / "cache_m1",
+                                         max_dias=configuracao.dias_historico(),
                                          relogio=relogio)
+        self.dias_historico = configuracao.dias_historico()
         self.prazo_ciclo = None
         self.prazo_scan = None
         self.pendentes_ciclo = []
@@ -717,14 +726,16 @@ class Orquestrador:
         return True
 
     def _processar_resultados_jev(self):
-        """Aplica respostas na thread do orquestrador, com candle e risco atuais."""
+        """Aplica respostas na thread do orquestrador; devolve quantas aplicou."""
         self._drenar_eventos_worker_jev()
+        aplicadas = 0
         while True:
             try:
                 request_id, result_run_id, decisao, erro, latencia_ms, meta = \
                     self.resultados_jev.get_nowait()
             except queue.Empty:
-                return
+                return aplicadas
+            aplicadas += 1
             contexto = self.pendentes_jev.pop(request_id, None)
             if contexto is None:
                 self._evento_funil("response_discarded_duplicate", meta["symbol"],
@@ -916,11 +927,12 @@ class Orquestrador:
                            candidate_id=contexto["padrao"], request_id=contexto.get("request_id"),
                            candle_ref=contexto["candle_ref"], run_id=contexto["run_id"],
                            motivo=gate.reason or "RISK_VETO")
-        self.publicar("decisao", {**base, "decisao": "SIM", "direcao": acao,
-                                  "justificativa": f"JEv SIM p={decisao.probability:.0%} "
+        self.publicar("decisao", {**base, "decisao": f"JEV_{acao}_RISK_BLOCKED", "direcao": acao,
+                                  "justificativa": f"JEv {acao} p={decisao.probability:.0%} "
                                                    f"c={decisao.confidence:.0%}; recusado pelo risco",
                                   "risco": f"não autorizado: {gate.reason}",
                                   "policy": "VETO", "paper": "NOT_OPENED",
+                                  "decisao_jev": acao,
                                   "execucao": "nenhuma", **metadata})
         self.logger.info("entrada recusada pelo gate de risco", simbolo=simbolo,
                          motivo=gate.reason or "-")
@@ -1539,6 +1551,14 @@ class Orquestrador:
             self._processar_acoes()
             self._processar_resultados_jev()
         self._drenar_analises(id_ciclo)
+        # Dreno curto e limitado das respostas JEv já prontas (não espera o lote;
+        # respostas tardias continuam sendo tratadas em _aguardar_slot).
+        fim_dreno = self.relogio() + 0.5
+        while self.pendentes_jev and self.relogio() < fim_dreno and not self.encerrar.is_set():
+            self._processar_acoes()
+            if self._processar_resultados_jev():
+                continue
+            self.encerrar.wait(0.02)
         # Continuidade incremental: nenhum símbolo monitorado é esquecido.
         self.pendentes_ciclo = [s for s in ordem
                                 if s not in processados or s in self.analises_pendentes]
@@ -1574,13 +1594,14 @@ class Orquestrador:
                                        "motivo": codigo, "estado": detalhe})
 
     def _coletar_janela(self, simbolo, id_analise):
-        """Download paginado da janela 30d com progresso, logs e cancelamento."""
+        """Download paginado da janela M1 configurada (padrão 7 dias)."""
         self._estado_set("ANALISANDO", f"Ciclo {self.ciclo} · BAIXANDO HISTÓRICO {simbolo}",
                          registrar=False, fase="BAIXANDO_HISTORICO")
 
         def progresso(coletados, solicitado):
             self.publicar("calc", {"id": id_analise, "simbolo": simbolo, "instante": _agora_iso(),
-                                   "etapa": "janela", "mensagem": "Baixando histórico M1 (30 dias)",
+                                   "etapa": "janela",
+                                   "mensagem": f"Baixando histórico M1 ({self.dias_historico} dias)",
                                    "amostra": {"candles": coletados, "dias": None,
                                                "solicitados": solicitado},
                                    "padroes_testados": None, "resultado": None, "erro": None})
@@ -1591,24 +1612,26 @@ class Orquestrador:
                                      "fase": self.fase, "quando": _agora_iso()})
             self.descarregar()
         inicio = time.time()
-        self._evento_funil("fetch_attempt", simbolo, history_days=30, fetch_kind="history")
-        janela = self.fonte.janela_m1(simbolo, dias=30, lote=LOTE_DOWNLOAD,
+        self._evento_funil("fetch_attempt", simbolo, history_days=self.dias_historico,
+                           fetch_kind="history")
+        janela = self.fonte.janela_m1(simbolo, dias=self.dias_historico, lote=LOTE_DOWNLOAD,
                                       cancelado=self._cancelado_scan, progresso=progresso)
         duracao = round(time.time() - inicio, 2)
         if janela is None:
             motivo = "cancelado" if self._cancelado_scan() else "indisponível"
             self._evento_funil("fetch_error", simbolo, motivo="HISTORY_FETCH_FAILED",
-                               duracao_ms=round(duracao * 1000), history_days=30)
+                               duracao_ms=round(duracao * 1000), history_days=self.dias_historico)
             self._evento_funil("history_insufficient", simbolo,
-                               motivo="HISTORY_FETCH_FAILED", history_days=30)
+                               motivo="HISTORY_FETCH_FAILED", history_days=self.dias_historico)
             self.logger.info("download de histórico não concluído", simbolo=simbolo, motivo=motivo)
             return None
         self._evento_funil("fetch_ok", simbolo, candle_ref=janela["fim"],
                            duracao_ms=round(duracao * 1000),
                            closed_m1_count=janela["recebidos"],
-                           gap_minutes=janela["minutos_lacuna"], history_days=30)
+                           gap_minutes=janela["minutos_lacuna"],
+                           history_days=self.dias_historico)
         self._evento_funil("closed_m1_count", simbolo, candle_ref=janela["fim"],
-                           quantidade=janela["recebidos"], history_days=30)
+                           quantidade=janela["recebidos"], history_days=self.dias_historico)
         self.logger.info("download de histórico concluído", simbolo=simbolo,
                          candles=janela["recebidos"], lacunas=janela["lacunas"],
                          lotes=max(1, -(-janela["recebidos"] // LOTE_DOWNLOAD)), duracao_s=duracao)
@@ -1625,6 +1648,7 @@ class Orquestrador:
         id_analise = f"{id_ciclo}-{simbolo}"
         agora = self.relogio()
         cache = self.dados_ativo.get(simbolo)
+        candle_ref = estado.candles[-1].get("time") if estado.candles else None
         vencida = cache is None or agora - cache["instante"] >= JANELA_TTL_S
         if cache is not None and not vencida:
             self._evento_funil("cache_hit", simbolo,
@@ -1664,7 +1688,8 @@ class Orquestrador:
                         "futuro": self.pool_matematico.submeter(
                             simbolo, self._matematica_pura, simbolo, janela, preco_atual,
                             spread_abs, spec, self.repositorio.padroes_ativos(simbolo)),
-                        "estado": estado, "janela": janela, "id_analise": id_analise}
+                        "estado": estado, "janela": janela, "id_analise": id_analise,
+                        "run_id": getattr(self, "run_id_atual", id_analise)}
                     return "CALCULATING"
                 self._atualizar_cache(simbolo, janela, id_analise,
                                       execution_spec=(estado.mathematics or {}).get(
@@ -1710,6 +1735,12 @@ class Orquestrador:
                                "padroes_testados": len(ativos_repo),
                                "resultado": f"movimento mediano {stats['movimento_1min']['mediana_pct']}% | custo spread {custo_pct}%",
                                "erro": None})
+        dados_mem = self.matematica_memoria.get(simbolo)
+        if dados_mem is not None:
+            dados = dict(dados_mem)
+            if candle_ref:
+                dados["candle_ref"] = candle_ref
+            return self._despachar_analise(estado, dados, id_analise)
         return self._oportunidade(estado, id_analise)
 
     def _aguardar_vaga(self, id_ciclo):
@@ -1888,6 +1919,9 @@ class Orquestrador:
         """Aplica na thread do orquestrador o resultado do pool (registro/cache/GUI)."""
         stats = dados["stats"]
         custo_pct = dados["custo_pct"]
+        if estado.candles:
+            # O candle de referência é o último M1 fechado do snapshot analisado.
+            dados["candle_ref"] = estado.candles[-1]["time"]
         candle_ref = dados["candle_ref"]
         janela_info = {"inicio": janela["inicio"], "fim": janela["fim"],
                        "dias": dados["dias_janela"], "candles": janela["recebidos"]}
@@ -1994,7 +2028,93 @@ class Orquestrador:
                                "erro": None})
         self.logger.info("estatísticas locais calculadas", simbolo=simbolo,
                          candles=stats.get("candles"), dias=stats.get("dias"))
-        return self._oportunidade(estado, id_analise)
+        self.matematica_memoria[simbolo] = dados
+        return self._despachar_analise(estado, dados, id_analise)
+
+    def _montar_analise(self, simbolo, dados):
+        """Payload quantitativo BUY/SELL entregue ao JEv (informação, não veto)."""
+        stats = dados["stats"]
+        itens = [(regra, validacao) for regra, validacao in dados["candidatos"]]
+        itens += [(regra, validacao) for regra, validacao, _origem in dados["revalidacoes"]]
+
+        def lado(direcao):
+            candidatos = [(r, v) for r, v in itens if r["direcao"] == direcao]
+            if not candidatos:
+                return {"sample_size": stats.get("candles_janela_completa"),
+                        "oos_n": 0, "expectancy_net_pct": None,
+                        "estado": "NENHUM_SETUP_ATIVO"}
+            regra, v = max(candidatos, key=lambda rv: rv[1]["total"].get("media_pct") or -1e9)
+            return {"strategy_id": regra.get("strategy_id", regra["tipo_regra"]),
+                    "sample_size": v["total"]["eventos"],
+                    "in_sample_rate": v["amostra"]["taxa"],
+                    "oos_n": v["oos"]["eventos"], "oos_rate": v["oos"]["taxa"],
+                    "expectancy_gross_pct": v["total"]["media_pct"],
+                    "expectancy_net_pct": v["total"]["media_pct"],
+                    "wilson_lower_oos_adjusted": v["estabilidade"].get("wilson_inferior_oos_ajustado"),
+                    "reason_codes": v.get("reason_codes", []),
+                    "estado": v.get("status")}
+
+        return {"symbol": simbolo, "candle_time": dados["candle_ref"],
+                "history_days": dados["dias_janela"],
+                "cost_spread_pct": dados["custo_pct"], "cost_basis": "spread_only",
+                "commission": "NAO_ESTIMADA", "slippage": "NAO_ESTIMADA",
+                "buy": lado("BUY"), "sell": lado("SELL"),
+                "candidates_evaluated": len(dados["candidatos"]) + len(dados["revalidacoes"]),
+                "aviso": "métricas informam a decisão; Python não veta por qualidade estatística"}
+
+    def _despachar_analise(self, estado, dados, id_analise):
+        """Envia TODA análise calculada ao JEv; Python não descarta por atratividade."""
+        simbolo = estado.symbol
+        candle_ref = dados["candle_ref"]
+        self.analises_memoria[simbolo] = self._montar_analise(simbolo, dados)
+        if self.book is None or not self.book.active or self.parado_risco or self.emergencia_ativa:
+            return "inativo"
+        if not self.selecao.operar(simbolo):
+            self.contadores_ciclo["somente_monitorar"] = \
+                self.contadores_ciclo.get("somente_monitorar", 0) + 1
+            return "somente_monitorar"
+        self._evento_funil("mathematical_edge_found", simbolo,
+                           candle_ref=candle_ref, motivo="ANALISE_COMPLETA")
+        if self.analisados_jev.get(simbolo) == candle_ref:
+            self._evento_funil("queue_deduped", simbolo, candle_ref=candle_ref,
+                               motivo="ANALISE_JA_ENVIADA")
+            return "candle_ja_enviado"
+        self.analisados_jev[simbolo] = candle_ref
+        estado.mathematics = dict(estado.mathematics or {})
+        estado.mathematics["analise_matematica"] = self.analises_memoria[simbolo]
+        run_id = getattr(self, "run_id_atual", id_analise)
+        instante = _agora_iso()
+        request_id = f"{run_id}:{simbolo}:analise:{candle_ref}"
+        registro_base = {"id": id_analise, "simbolo": simbolo, "instante": instante,
+                         "padrao": "analise", "candle_ref": candle_ref,
+                         "direcao": "ANALISE", "oportunidade": "análise matemática M1 completa"}
+        contexto = {"id": id_analise, "simbolo": simbolo, "estado": estado, "padrao": "analise",
+                    "identificador": f"analise@{candle_ref}", "candle_ref": candle_ref,
+                    "request_id": request_id, "run_id": run_id,
+                    "contadores": self.contadores_ciclo,
+                    "python_validated_at": instante, "jev_dispatched_at": instante,
+                    "latencia_detecao_ms": 0, "registro_base": registro_base}
+        meta = {"run_id": run_id, "symbol": simbolo, "candidate_id": "analise",
+                "candle_ref": candle_ref}
+        self.pendentes_jev[request_id] = contexto
+        if not self._enfileirar_jev(request_id, estado, meta):
+            self.pendentes_jev.pop(request_id, None)
+            self.estados_ativos[simbolo] = "PENDENTE_ENVIO"
+            self._evento_funil("queue_full", simbolo, candle_ref=candle_ref,
+                               motivo="QUEUE_FULL")
+            self._publicar_motivo(simbolo, id_analise, "FILA_BLOQUEADA",
+                                  "Fila JEv cheia; análise pendente de envio",
+                                  candle_ref=candle_ref)
+            return "fila_cheia"
+        self.estados_ativos[simbolo] = "WAITING_JEV"
+        self.contadores_ciclo["enviados_jev"] = self.contadores_ciclo.get("enviados_jev", 0) + 1
+        self.contadores_ciclo["aguardando_decisao"] = \
+            self.contadores_ciclo.get("aguardando_decisao", 0) + 1
+        self._evento_funil("queue_enqueued", simbolo, request_id=request_id,
+                           candle_ref=candle_ref)
+        self.logger.info("análise matemática despachada ao JEv", simbolo=simbolo,
+                         run_id=run_id, request_id=request_id, candle_ref=candle_ref)
+        return "enviado_jev"
 
     def _drenar_analises(self, id_ciclo):
         """Aplica análises concluídas no pool; retorna quantas foram aplicadas."""
@@ -2017,6 +2137,8 @@ class Orquestrador:
                                  detalhe=str(exc)[:160])
                 continue
             aplicadas += 1
+            run_id_salvo = getattr(self, "run_id_atual", None)
+            self.run_id_atual = contexto.get("run_id", run_id_salvo)
             try:
                 self._processar_acoes()
                 if self.pausado or self.parado_risco or self._cancelado_ciclo():
@@ -2035,6 +2157,7 @@ class Orquestrador:
                 self.logger.erro("falha ao aplicar análise", simbolo=simbolo,
                                  detalhe=str(exc)[:160])
             finally:
+                self.run_id_atual = run_id_salvo
                 self.processados_ciclo.add(simbolo)
                 self.descarregar()
         return aplicadas
@@ -2622,7 +2745,7 @@ class Orquestrador:
     def _candles_para_condicao(self, padrao, estado):
         """Escolhe a série para avaliar a condição no candle mais recente.
 
-        Regras com minutos > 99 exigem a cauda da janela de 30 dias; a cauda
+        Regras com minutos > 99 exigem a cauda da janela de hist?rico; a cauda
         é combinada com o estado somente quando contígua (sem lacunas entre
         elas), preservando a cronologia da avaliação.
         """

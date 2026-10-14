@@ -150,7 +150,7 @@ class FonteMT5:
         candles.sort(key=lambda c: c["time"])
         return candles
 
-    def janela_m1(self, simbolo, dias=30, lote=4320, cancelado=None, progresso=None):
+    def janela_m1(self, simbolo, dias=7, lote=4320, cancelado=None, progresso=None):
         """Coleta até `dias` de candles M1 encerrados, em lotes paginados.
 
         Cada lote é uma chamada curta ao terminal; entre lotes há

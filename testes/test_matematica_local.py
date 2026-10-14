@@ -49,6 +49,13 @@ class TestMatematicaLocal(unittest.TestCase):
                     patch("jev_bot.orquestrador.jev.decide",
                           return_value=Decision("TESTE", "BUY", .9, .9)) as jev:
                 orch._executar_ciclo("c1")
+                limite = time.monotonic() + 3
+                while (orch.analises_pendentes or orch.pendentes_jev) \
+                        and time.monotonic() < limite:
+                    orch._drenar_analises(f"ciclo{orch.ciclo}")
+                    orch._processar_resultados_jev()
+                    time.sleep(.005)
+                orch._processar_resultados_jev()
             ds.assert_not_called()
             jev.assert_called_once()
             self.assertGreaterEqual(orch.contadores_ciclo.get("candidatos_locais", 0), 1)
@@ -76,7 +83,8 @@ class TestMatematicaLocal(unittest.TestCase):
                         and r.get("etapa") == "validacao_local"}
             self.assertEqual(direcoes, {"BUY", "SELL"})
 
-    def test_sem_edge_matematico_nao_chama_jev(self):
+    def test_analise_sem_edge_e_enviada_ao_jev(self):
+        """Sem edge, a análise ainda é enviada; JEv decide e nada é fabricado."""
         candles = [{"time": i * 60, "open": 100.0, "high": 100.01, "low": 99.99,
                     "close": 100.0, "tick_volume": 1} for i in range(3000)]
         with tempfile.TemporaryDirectory() as pasta:
@@ -97,12 +105,13 @@ class TestMatematicaLocal(unittest.TestCase):
                                    cotacoes={"TESTE": (99.995, 100.005, time.time())},
                                    janelas={"TESTE": janela(candles)})
             orch.fonte.janela_m1 = lambda simbolo, **_k: janela(candles)
-            with patch("jev_bot.orquestrador.jev.decide") as jev:
+            with patch("jev_bot.orquestrador.jev.decide",
+                       return_value=Decision("TESTE", "HOLD", .5, .5)) as jev:
                 orch._executar_ciclo("c1")
-            jev.assert_not_called()
+            jev.assert_called_once()  # análise sem edge não é vetada pelo Python
             self.assertEqual(len(orch.book.fills), 0)
-            motivos = {r.get("motivo") for c, r in orch.eventos if c == "oportunidade"}
-            self.assertTrue(motivos & {"NO_MATHEMATICAL_EDGE", "SEM_SETUP"})
+            self.assertIn("TESTE", orch.analises_memoria)
+            self.assertEqual(orch.analises_memoria["TESTE"]["buy"]["estado"], "NENHUM_SETUP_ATIVO")
 
 
 if __name__ == "__main__":

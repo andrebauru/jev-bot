@@ -375,11 +375,19 @@ class TestCiclosMulti(unittest.TestCase):
                     candle.candles[-1]["time"] = estado.candles[-1]["time"] + numero * 60
                     orch.fonte.estados = lambda candle=candle: iter([candle])
                     orch._ciclo()
+                    limite = time.monotonic() + 2
+                    while (orch.analises_pendentes or orch.pendentes_jev) \
+                            and time.monotonic() < limite:
+                        orch._drenar_analises(f"ciclo{orch.ciclo}")
+                        orch._processar_resultados_jev()
+                        time.sleep(.005)
                 limite = time.monotonic() + 2
                 while orch.pendentes_jev and time.monotonic() < limite:
+                    orch._drenar_analises(f"ciclo{orch.ciclo}")
                     orch._processar_resultados_jev()
                     time.sleep(.005)
                 orch._processar_resultados_jev()
+            self.assertGreaterEqual(orch.funil_total.get("mathematical_edge_found", 0), 3)
             resumos_por_run = {}
             for canal, registro in orch.eventos:
                 if canal == "resumo":
@@ -401,7 +409,6 @@ class TestCiclosMulti(unittest.TestCase):
                 self.assertEqual(resumo["funil"]["jev_hold"], 1)
                 self.assertEqual(resumo["funil"].get("aguardando_decisao", 0), 0)
                 self.assertEqual(resumo["jev_pendentes"], 0)
-                self.assertEqual(resumo["ativos"]["TESTE"]["eligible_for_jev"], 1)
                 self.assertEqual(decisao["run_id"], resumo["run_id"])
                 self.assertTrue(decisao["python_validated_at"])
                 self.assertTrue(decisao["jev_dispatched_at"])
