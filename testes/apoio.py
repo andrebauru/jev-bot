@@ -55,14 +55,19 @@ def janela(candles, simbolo="TESTE"):
 def estado_mt5(simbolo="TESTE", closes=None):
     """Estado válido perto de agora, exigido pelo gate de risco."""
     agora = time.time()
-    return MarketState(simbolo, "Crypto", closes[-1] if closes else 100.0,
-                       bid=99.995, ask=100.005, tick_time=agora,
-                       stop_distance=0.5, loss_per_lot=10.0, margin_per_lot=100.0,
-                       volume_min=0.01, volume_max=10, volume_step=0.01,
-                       trade_mode=4, currencies=("USD",),
-                       candles=[{"time": agora - 60 * (len(closes) - i) if closes else agora,
-                                 "open": 100, "high": 100.5, "low": 99.5, "close": c,
-                                 "tick_volume": 10} for i, c in enumerate(closes or [100.0])])
+    estado = MarketState(simbolo, "Crypto", closes[-1] if closes else 100.0,
+                         bid=99.995, ask=100.005, tick_time=agora,
+                         stop_distance=0.5, loss_per_lot=10.0, margin_per_lot=100.0,
+                         volume_min=0.01, volume_max=10, volume_step=0.01,
+                         trade_mode=4, currencies=("USD",),
+                         candles=[{"time": agora - 60 * (len(closes) - i) if closes else agora,
+                                   "open": 100, "high": 100.5, "low": 99.5, "close": c,
+                                   "tick_volume": 10} for i, c in enumerate(closes or [100.0])])
+    estado.mathematics["mt5_execution_spec"] = {
+        "point": 10 ** -estado.digits, "trade_stops_level": 0,
+        "digits": estado.digits,
+    }
+    return estado
 
 
 class LoggerSilencioso:

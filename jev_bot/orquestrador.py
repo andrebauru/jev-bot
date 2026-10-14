@@ -1588,7 +1588,9 @@ class Orquestrador:
                         self.contadores_ciclo.get("sem_dados", 0) + 1
                 # Com cache anterior válido, ele permanece até a próxima tentativa.
             else:
-                self._atualizar_cache(simbolo, janela, id_analise)
+                self._atualizar_cache(simbolo, janela, id_analise,
+                                      execution_spec=(estado.mathematics or {}).get(
+                                          "mt5_execution_spec"))
                 cache = self.dados_ativo.get(simbolo)
         if cache is None or cache.get("stats") is None:
             self._evento_funil("history_insufficient", simbolo,
@@ -1686,7 +1688,45 @@ class Orquestrador:
             self.cache_m1.salvar(simbolo, janela["candles"])
         return janela
 
-    def _atualizar_cache(self, simbolo, janela, id_analise):
+    @staticmethod
+    def _validar_candidato_m1(regra, candles, custo_pct, stats, familias_testadas):
+        """Aplica OOS e, com especificação MT5, simulação trade-level sob custos."""
+        validacao = padroes.validar(regra, candles, custo_pct,
+                                    familias_testadas=familias_testadas)
+        spec = stats.get("execution_spec")
+        if "execution_spec" not in stats:
+            return validacao  # fixtures/relatórios legados sem contrato MT5
+        if not isinstance(spec, dict):
+            validacao["cost_model_complete"] = False
+            validacao["cost_model_status"] = "COST_UNKNOWN"
+            validacao["reason_codes"] = list(dict.fromkeys(
+                [*validacao.get("reason_codes", []), "COST_UNKNOWN"]))
+            if validacao["status"] == "validado":
+                validacao.update(status="rejeitado", motivo="Especificação de execução ausente",
+                                 reason_code="COST_UNKNOWN", reason_codes=["COST_UNKNOWN"])
+            return validacao
+        simulacao = padroes.simular_trade_level(
+            regra, candles, spec["spread_abs"], point=spec["point"],
+            trade_stops_level=spec["trade_stops_level"], commission_pct=None)
+        validacao["trade_level"] = simulacao
+        validacao["cost_model_complete"] = False  # comissão/slippage reais indisponíveis
+        validacao["cost_model_status"] = "COST_INCOMPLETE"
+        if validacao["status"] != "validado":
+            return validacao
+        stress = simulacao.get("scenarios", {}).get("extra_1_spread", {})
+        treino, oos = stress.get("train", {}), stress.get("oos", {})
+        if oos.get("n", 0) < padroes.MIN_EVENTOS_OOS:
+            validacao.update(status="rejeitado", motivo="Amostra trade-level OOS insuficiente",
+                             reason_code="TRADE_LEVEL_OOS_INSUFFICIENT",
+                             reason_codes=["TRADE_LEVEL_OOS_INSUFFICIENT"])
+        elif (treino.get("expectancy_pct") is None or oos.get("expectancy_pct") is None
+              or treino["expectancy_pct"] <= 0 or oos["expectancy_pct"] <= 0):
+            validacao.update(status="rejeitado", motivo="Expectativa não resiste ao cenário de slippage",
+                             reason_code="TRADE_LEVEL_STRESS_NEGATIVE",
+                             reason_codes=["TRADE_LEVEL_STRESS_NEGATIVE"])
+        return validacao
+
+    def _atualizar_cache(self, simbolo, janela, id_analise, execution_spec=None):
         """Estatísticas + revalidação + candidatos locais com a janela completa; guarda só a cauda.
 
         A janela completa (~43k candles) vive apenas durante este método — a
@@ -1709,6 +1749,22 @@ class Orquestrador:
         stats = estatisticas(recorte, 0.0)
         custo_pct = round(spread_abs / preco_atual * 100, 4)
         stats["custo_spread_pct"] = custo_pct
+        stats["cost_basis"] = "spread_only"
+        stats["commission_pct"] = None
+        stats["slippage_pct"] = None
+        if execution_spec is None:
+            api = getattr(self.fonte, "api", None)
+            info = api.symbol_info(simbolo) if api is not None else None
+            if info is not None:
+                execution_spec = {"point": float(info.point),
+                                  "trade_stops_level": int(info.trade_stops_level),
+                                  "digits": int(info.digits)}
+        stats["execution_spec"] = ({**execution_spec, "spread_abs": spread_abs}
+                                   if isinstance(execution_spec, dict)
+                                   and math.isfinite(float(execution_spec.get("point", 0)))
+                                   and float(execution_spec.get("point", 0)) > 0
+                                   and int(execution_spec.get("trade_stops_level", -1)) >= 0
+                                   else None)
         dias_janela = round((janela["candles"][-1]["time"] -
                              janela["candles"][0]["time"]) / 86400, 2)
         stats["dias_janela_completa"] = dias_janela
@@ -1725,8 +1781,9 @@ class Orquestrador:
                      "direcao": interna["direcao"], "horizonte_minutos": interna["horizonte_minutos"],
                      "justificativa": registro.get("justificativa", ""),
                      "strategy_id": registro.get("strategy_id", interna["tipo"])}
-            validacao = padroes.validar(regra, janela["candles"], custo_pct,
-                                       familias_testadas=candidatos.MAX_LOCAL_HYPOTHESES)
+            validacao = self._validar_candidato_m1(
+                regra, janela["candles"], custo_pct, stats,
+                familias_testadas=candidatos.MAX_LOCAL_HYPOTHESES)
             atualizado = self.repositorio.registrar(simbolo, regra, validacao,
                                                     registro.get("origem", "local"), janela_info)
             trades_padrao = [tr for tr in self.book.trades
@@ -1789,8 +1846,9 @@ class Orquestrador:
                        "dias": dias_janela, "candles": janela["recebidos"]}
         for regra in regras:
             inicio_validacao = time.monotonic()
-            validacao = padroes.validar(regra, janela["candles"], custo_pct,
-                                       familias_testadas=max(1, len(regras)))
+            validacao = self._validar_candidato_m1(
+                regra, janela["candles"], custo_pct, stats,
+                familias_testadas=max(1, len(regras)))
             duracao_validacao_ms = max(0, round((time.monotonic() - inicio_validacao) * 1000))
             registro = self.repositorio.registrar(simbolo, regra, validacao, "local",
                                                   janela_info)

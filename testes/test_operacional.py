@@ -112,6 +112,36 @@ class TestUnidadesValidacao(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "validação de custos suspensa"):
                 orch._atualizar_cache("TESTE", dados, "run-TESTE")
 
+    def test_execucao_sem_especificacao_mt5_bloqueia_com_custo_incerto(self):
+        candles = candles_deterministicos()
+        regra = {"tipo_regra": "quedas_consecutivas", "parametros": {"n": 3},
+                 "direcao": "BUY", "horizonte_minutos": 5}
+        base = padroes.validar(regra, candles, 0.02, familias_testadas=1)
+        self.assertEqual(base["status"], "validado")
+        sem_spec = Orquestrador._validar_candidato_m1(
+            regra, candles, 0.02, {"execution_spec": None}, familias_testadas=1)
+        self.assertEqual(sem_spec["status"], "rejeitado")
+        self.assertEqual(sem_spec["reason_code"], "COST_UNKNOWN")
+        self.assertEqual(sem_spec["cost_model_status"], "COST_UNKNOWN")
+        # Fonte legada sem o contrato MT5 no cache não é promovida (mantém OOS).
+        ausente = Orquestrador._validar_candidato_m1(
+            regra, candles, 0.02, {}, familias_testadas=1)
+        self.assertEqual(ausente["status"], "validado")
+
+    def test_estresse_de_slippage_pode_rejeitar_candidato_validado(self):
+        candles = candles_deterministicos()
+        regra = {"tipo_regra": "quedas_consecutivas", "parametros": {"n": 3},
+                 "direcao": "BUY", "horizonte_minutos": 5}
+        # Spread gigante torna o cenário conservador (slippage +1 spread) negativo.
+        stats = {"execution_spec": {"spread_abs": 50.0, "point": 0.01,
+                                    "trade_stops_level": 0, "digits": 2}}
+        resultado = Orquestrador._validar_candidato_m1(
+            regra, candles, 100.0, stats, familias_testadas=1)
+        self.assertEqual(resultado["status"], "rejeitado")
+        self.assertIn("trade_level", resultado)
+        self.assertEqual(resultado["cost_model_status"], "COST_INCOMPLETE")
+        self.assertTrue(resultado["trade_level"]["scenarios"])
+
 
 class TestPrioridadeOperar(unittest.TestCase):
     """Ativos com Operar são avaliados antes dos demais monitorados."""

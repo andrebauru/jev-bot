@@ -309,8 +309,128 @@ def _resultado(indices, direcao, horizonte, candles, custo_pct):
     return {"eventos": len(liquidos), "acertos": sum(v > 0 for v in liquidos),
             "taxa": round(sum(v > 0 for v in liquidos) / len(liquidos), 4),
             "media_pct": round(media, 4),
-            "mediana_pct": round(motor_matematico.percentil(liquidos, .5), 4),
-            "desvio_pct": round(math.sqrt(sum((v - media) ** 2 for v in liquidos) / len(liquidos)), 4)}
+             "mediana_pct": round(motor_matematico.percentil(liquidos, .5), 4),
+             "desvio_pct": round(math.sqrt(sum((v - media) ** 2 for v in liquidos) / len(liquidos)), 4)}
+
+
+def simular_trade_level(regra, candles, spread_abs, *, point=0.0,
+                        trade_stops_level=0, commission_pct=None,
+                        slippage_spreads=(0.0, 0.5, 1.0)):
+    """Testa fills OHLC M1 com spread, stop/alvo 1:2 e timeout.
+
+    Sinal no candle `i`, entrada aproximada na abertura de `i+1`; spread
+    atual constante é hipótese explícita porque OHLC não contém bid/ask
+    histórico. Slippage é sensibilidade adicional por spread. Se stop e alvo
+    são tocados na mesma barra, sempre assume o stop (pior caso).
+    """
+    if (spread_abs is None or not math.isfinite(float(spread_abs))
+            or spread_abs < 0 or not math.isfinite(float(point)) or point < 0):
+        return {"status": "COST_UNKNOWN", "signals": 0, "scenarios": {}}
+    candles = list(candles)
+    closes = _closes(candles)
+    n, horizon = len(candles), int(regra["horizonte_minutos"])
+    raw = indices_condicao(regra["tipo_regra"], regra["parametros"], candles)
+    signals = _eventos_nao_sobrepostos(raw, horizon)
+    cut = int(n * motor_matematico.CORTE_OOS)
+    trade_floor = (int(trade_stops_level) + 1) * float(point)
+
+    def trade(signal_i, slippage_extra):
+        entry_i = signal_i + 1
+        final_i = entry_i + horizon - 1
+        if entry_i >= n or final_i >= n:
+            return None
+        start = max(1, signal_i - 98)
+        moves = [abs(closes[j] - closes[j - 1]) for j in range(start, signal_i + 1)]
+        stop_distance = max(2 * max(moves, default=0.0), trade_floor, 2 * spread_abs)
+        if stop_distance <= 0:
+            return None
+        half_spread = float(spread_abs) / 2
+        buy = regra["direcao"] == "BUY"
+        open_mid = float(candles[entry_i]["open"])
+        entry = open_mid + half_spread if buy else open_mid - half_spread
+        if entry <= 0:
+            return None
+        stop = entry - stop_distance if buy else entry + stop_distance
+        target = entry + 2 * stop_distance if buy else entry - 2 * stop_distance
+        exit_type, exit_price, ambiguous = "TIME", None, False
+        for j in range(entry_i, final_i + 1):
+            bar = candles[j]
+            adverse = half_spread
+            open_exec = float(bar["open"]) + (-adverse if buy else adverse)
+            low_exec = float(bar["low"]) + (-adverse if buy else adverse)
+            high_exec = float(bar["high"]) + (-adverse if buy else adverse)
+            if buy:
+                if open_exec <= stop:
+                    exit_type, exit_price = "STOP_GAP", open_exec
+                    break
+                if open_exec >= target:
+                    exit_type, exit_price = "TARGET", target
+                    break
+                stop_hit, target_hit = low_exec <= stop, high_exec >= target
+            else:
+                if open_exec >= stop:
+                    exit_type, exit_price = "STOP_GAP", open_exec
+                    break
+                if open_exec <= target:
+                    exit_type, exit_price = "TARGET", target
+                    break
+                stop_hit, target_hit = high_exec >= stop, low_exec <= target
+            if stop_hit and target_hit:
+                exit_type, exit_price, ambiguous = "STOP_AMBIGUOUS_WORST_CASE", stop, True
+                break
+            if stop_hit:
+                exit_type, exit_price = "STOP", stop
+                break
+            if target_hit:
+                exit_type, exit_price = "TARGET", target
+                break
+        if exit_price is None:
+            close = float(candles[final_i]["close"])
+            exit_price = close + (-half_spread if buy else half_spread)
+        ret = ((exit_price - entry) / entry if buy else (entry - exit_price) / entry) * 100
+        ret -= float(spread_abs) * float(slippage_extra) / entry * 100
+        if commission_pct is not None:
+            ret -= float(commission_pct)
+        return {"return_pct": ret, "exit": exit_type, "ambiguous": ambiguous,
+                "bars_held": final_i - entry_i + 1}
+
+    def summarize(indices, scenario):
+        trades = [x for i in indices if (x := trade(i, scenario)) is not None]
+        returns = [x["return_pct"] for x in trades]
+        wins, losses = [x for x in returns if x > 0], [x for x in returns if x < 0]
+        equity = peak = 1.0
+        drawdown = 0.0
+        for value in returns:
+            equity *= 1 + value / 100
+            peak = max(peak, equity)
+            drawdown = max(drawdown, (peak - equity) / peak if peak else 0.0)
+        return {"n": len(trades),
+                "win_rate": round(len(wins) / len(trades), 4) if trades else None,
+                "expectancy_pct": round(sum(returns) / len(trades), 4) if trades else None,
+                "median_pct": round(motor_matematico.percentil(returns, .5), 4) if trades else None,
+                "p05_pct": round(motor_matematico.percentil(returns, .05), 4) if trades else None,
+                "p95_pct": round(motor_matematico.percentil(returns, .95), 4) if trades else None,
+                "profit_factor": round(sum(wins) / abs(sum(losses)), 4) if losses else None,
+                "max_drawdown_pct": round(drawdown * 100, 4),
+                "ambiguous_worst_case": sum(t["ambiguous"] for t in trades),
+                "stops": sum(t["exit"].startswith("STOP") for t in trades),
+                "targets": sum(t["exit"] == "TARGET" for t in trades),
+                "time_exits": sum(t["exit"] == "TIME" for t in trades),
+                "commission_pct": commission_pct,
+                "commission_status": "ESTIMADA" if commission_pct is not None else "NAO_ESTIMADA",
+                "slippage_extra_spreads": scenario}
+
+    train = [i for i in signals if i + horizon < cut]
+    oos = [i for i in signals if i >= cut and i + horizon < n]
+    all_signals = [i for i in signals if i + horizon < n]
+    scenarios = {f"extra_{float(s):g}_spread": {
+        "all": summarize(all_signals, s), "train": summarize(train, s),
+        "oos": summarize(oos, s)} for s in slippage_spreads}
+    return {"status": "OK" if any(v["all"]["n"] for v in scenarios.values())
+            else "INSUFFICIENT_EVENTS", "signals": len(signals),
+            "horizon_minutes": horizon, "cost_basis": "observed_spread_plus_slippage_sensitivity",
+            "entry_approximation": "next_M1_open", "ambiguous_bar_policy": "STOP_WORST_CASE",
+            "scenarios": scenarios}
 
 
 def calibracao_brier(trades_do_padrao, minimo=20):
@@ -491,6 +611,7 @@ def contrato_oportunidade(padrao, candles, analysis_id, risk_context, agora=None
         "cost_basis": padrao.get("cost_basis", "spread_only"),
         "commission_pct": padrao.get("commission_pct"),
         "slippage_pct": padrao.get("slippage_pct"),
+        "trade_level": padrao.get("trade_level"),
         "wilson_inferior": padrao.get("wilson_inferior"),
         "reference_price": close_referencia,
     }
@@ -514,6 +635,7 @@ def contrato_oportunidade(padrao, candles, analysis_id, risk_context, agora=None
         "cost_components": {"spread_pct": padrao.get("custo_spread_pct"),
                              "commission_pct": padrao.get("commission_pct"),
                              "slippage_pct": padrao.get("slippage_pct")},
+        "trade_level": padrao.get("trade_level"),
         "direction": regra["direcao"],
         "reference_price": close_referencia,
         "expiry": validade,
@@ -652,6 +774,8 @@ class RepositorioPadroes:
             "cost_basis": validacao.get("cost_basis", "spread_only"),
             "commission_pct": validacao.get("commission_pct"),
             "slippage_pct": validacao.get("slippage_pct"),
+            "cost_model_status": validacao.get("cost_model_status", "COST_INCOMPLETE"),
+            "trade_level": validacao.get("trade_level"),
             "validado_em": agora,
         })
         registro["historico_status"].append({"em": agora, "status": validacao["status"],

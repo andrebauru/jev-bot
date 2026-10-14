@@ -362,6 +362,11 @@ class FonteMT5:
                       "tick_volume": int(b["tick_volume"])} for b in barras],
         )
         estado.mathematics = resumir(estado.candles, info.point, ask - bid)
+        estado.mathematics["mt5_execution_spec"] = {
+            "point": float(info.point),
+            "trade_stops_level": int(info.trade_stops_level),
+            "digits": int(info.digits),
+        }
         return estado
 
     def lucro(self, posicao, preco):

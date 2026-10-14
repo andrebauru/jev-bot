@@ -62,6 +62,27 @@ class TestPadroes(unittest.TestCase):
         candles[1]["close"] = 90.0
         self.assertAlmostEqual(padroes._resultado([0], "SELL", 1, candles, 0)["media_pct"], 10.0)
 
+    def test_trade_level_aplica_spread_e_pior_caso_stop_alvo_ambiguo(self):
+        candles = [
+            {"time": 0, "open": 100.0, "high": 100.7, "low": 99.3,
+             "close": 100.0, "tick_volume": 1},
+            {"time": 60, "open": 100.0, "high": 101.0, "low": 99.0,
+             "close": 100.0, "tick_volume": 1},
+            {"time": 120, "open": 100.0, "high": 100.1, "low": 99.9,
+             "close": 100.0, "tick_volume": 1},
+        ]
+        for direction in ("BUY", "SELL"):
+            result = padroes.simular_trade_level(
+                {"tipo_regra": "amplitude_1min_pct", "parametros": {"pct": 1.0},
+                 "direcao": direction, "horizonte_minutos": 1},
+                candles, spread_abs=.1, point=.01, trade_stops_level=0)
+            base = result["scenarios"]["extra_0_spread"]["all"]
+            self.assertEqual(base["n"], 1)
+            self.assertEqual(base["ambiguous_worst_case"], 1)
+            self.assertEqual(base["commission_status"], "NAO_ESTIMADA")
+            stress = result["scenarios"]["extra_1_spread"]["all"]
+            self.assertLessEqual(stress["expectancy_pct"], base["expectancy_pct"])
+
     def test_repositorio_deduplica_persiste_e_expira(self):
         with tempfile.TemporaryDirectory() as pasta:
             repo = padroes.RepositorioPadroes(Path(pasta), relogio=lambda: 1_000_000)
