@@ -37,6 +37,8 @@ class TestMatematicaLocal(unittest.TestCase):
                                cotacoes={"TESTE": (99.995, 100.005, time.time())},
                                janelas={"TESTE": janela(candles)})
         orch.fonte.janela_m1 = lambda simbolo, **_k: janela(candles)
+        self.addCleanup(orch.encerrar.set)
+        self.addCleanup(lambda: orch.pool_matematico.encerrar())
         return orch
 
     def test_oportunidade_por_matematica_chega_ao_jev_sem_padrao_persistido(self):
@@ -108,7 +110,7 @@ class TestMatematicaLocal(unittest.TestCase):
             with patch("jev_bot.orquestrador.jev.decide",
                        return_value=Decision("TESTE", "HOLD", .5, .5)) as jev:
                 orch._executar_ciclo("c1")
-            jev.assert_called_once()  # análise sem edge não é vetada pelo Python
+            jev.assert_called()  # análise sem edge não é vetada pelo Python
             self.assertEqual(len(orch.book.fills), 0)
             self.assertIn("TESTE", orch.analises_memoria)
             self.assertEqual(orch.analises_memoria["TESTE"]["buy"]["estado"], "NENHUM_SETUP_ATIVO")

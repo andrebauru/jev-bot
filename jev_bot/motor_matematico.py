@@ -16,7 +16,7 @@ from __future__ import annotations
 import math
 import time
 
-JANELA_DIAS = 7
+JANELA_DIAS = 1
 CORTE_OOS = 0.7          # fração inicial usada para descoberta
 MINIMO_DIAS = 7          # amostra mínima para estatísticas confiáveis
 

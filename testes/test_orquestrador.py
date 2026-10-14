@@ -245,9 +245,9 @@ class TestOrquestrador(unittest.TestCase):
                 cancelados.append(cancelado)
                 chamadas[0] += 1
                 if progresso:
-                    for coletados in range(lote, dias * 1440 + 1, lote):
-                        progressos.append(coletados)
-                        progresso(coletados, dias * 1440)
+                    solicitado = dias * 1440
+                    progressos.append(solicitado)
+                    progresso(solicitado, solicitado)
                 return j
 
             orch.fonte.janela_m1 = fonte_lote

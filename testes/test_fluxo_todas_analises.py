@@ -18,9 +18,9 @@ from jev_bot.types import Decision
 class TestHistorico7Dias(unittest.TestCase):
     """Janela padrão de 7 dias, configurável e coerente no cache."""
 
-    def test_padrao_sete_dias(self):
+    def test_padrao_um_dia(self):
         with patch.dict(os.environ, {}, clear=True):
-            self.assertEqual(configuracao.dias_historico(), 7)
+            self.assertEqual(configuracao.dias_historico(), 1)
 
     def test_env_configuravel_e_limitado(self):
         with patch.dict(os.environ, {"JEV_HISTORY_DAYS": "10"}, clear=True):
@@ -29,18 +29,18 @@ class TestHistorico7Dias(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 configuracao.dias_historico()
 
-    def test_cache_recorta_a_sete_dias(self):
+    def test_cache_recorta_a_um_dia(self):
         with tempfile.TemporaryDirectory() as pasta:
             cache = CacheM1(Path(pasta))
-            self.assertEqual(cache.max_dias, 7)
+            self.assertEqual(cache.max_dias, 1)
             arquivo = Path(pasta) / "mercados.json"
             mercados.salvar({"selecao": {"C": {"TESTE": {"monitorar": True,
                                                          "operar": True}}}}, arquivo)
             orch = Orquestrador(banco=Path(pasta) / "db.json",
                                 pasta_dados=Path(pasta) / "padroes",
                                 caminho_selecao=arquivo)
-            self.assertEqual(orch.dias_historico, 7)
-            self.assertEqual(orch.cache_m1.max_dias, 7)
+            self.assertEqual(orch.dias_historico, 1)
+            self.assertEqual(orch.cache_m1.max_dias, 1)
 
 
 class TestTodasAnalisesAoJev(unittest.TestCase):
@@ -67,6 +67,8 @@ class TestTodasAnalisesAoJev(unittest.TestCase):
                                cotacoes={"TESTE": (99.995, 100.005, time.time())},
                                janelas={"TESTE": janela(candles)})
         orch.fonte.janela_m1 = lambda simbolo, **_k: janela(candles)
+        self.addCleanup(orch.encerrar.set)
+        self.addCleanup(lambda: orch.pool_matematico.encerrar())
         return orch
 
     def _drenar(self, orch):
@@ -121,6 +123,64 @@ class TestTodasAnalisesAoJev(unittest.TestCase):
             self.assertEqual(bloqueios[0]["decisao"], "JEV_SELL_RISK_BLOCKED")
             self.assertEqual(bloqueios[0]["decisao_jev"], "SELL")
             self.assertEqual(bloqueios[0]["policy"], "VETO")
+
+    def test_dados_insuficientes_nao_enviam_payload(self):
+        poucos = [{"time": i * 60, "open": 100.0, "high": 100.5, "low": 99.5,
+                   "close": 100.0, "tick_volume": 1} for i in range(10)]
+        with tempfile.TemporaryDirectory() as pasta:
+            arquivo = Path(pasta) / "mercados.json"
+            mercados.salvar({"selecao": {"C": {"TESTE": {"monitorar": True, "operar": True}}}},
+                            arquivo)
+            orch = Orquestrador(banco=Path(pasta) / "db.json",
+                                pasta_dados=Path(pasta) / "padroes",
+                                caminho_selecao=arquivo, relogio=time.time)
+            orch.logger = LoggerSilencioso()
+            orch.book = Book.load(Path(pasta) / "db.json", "USD")
+            orch.book.active = True
+            orch.jev_configurado = True
+            orch.repositorio = padroes.RepositorioPadroes(Path(pasta) / "padroes")
+            orch.eventos = []
+            orch.publicar = lambda canal, registro: orch.eventos.append((canal, registro))
+            orch.fonte = FonteFake(estados=[estado_mt5("TESTE", closes=[100.0] * 10)],
+                                   cotacoes={"TESTE": (99.995, 100.005, time.time())},
+                                   janelas={"TESTE": janela(poucos)})
+            orch.fonte.janela_m1 = lambda simbolo, **_k: janela(poucos)
+            with patch("jev_bot.orquestrador.jev.decide") as jev:
+                orch._executar_ciclo("c1")
+                self._drenar(orch)
+            jev.assert_not_called()
+            motivos = {r.get("motivo") for c, r in orch.eventos if c == "oportunidade"}
+            self.assertIn("DADOS_INSUFICIENTES", motivos)
+
+    def test_evento_neutro_e_enviado_ao_jev(self):
+        with tempfile.TemporaryDirectory() as pasta:
+            orch = self._orquestrador(pasta)
+            with patch("jev_bot.orquestrador.jev.decide",
+                       return_value=Decision("TESTE", "HOLD", .5, .5)) as jev:
+                orch._executar_ciclo("c1")
+                self._drenar(orch)
+            jev.assert_called_once()
+            self.assertIn("evento", orch.analises_memoria["TESTE"])
+            self.assertIn("history", orch.analises_memoria["TESTE"])
+
+    def test_deduplicacao_por_simbolo_e_candle(self):
+        with tempfile.TemporaryDirectory() as pasta:
+            orch = self._orquestrador(pasta)
+            estado = estado_mt5("TESTE", closes=[100.0] * 30)
+            dados = {"candle_ref": estado.candles[-1]["time"], "custo_pct": .01,
+                     "dias_janela": 1, "evento": {"status": "OK",
+                                                  "bars_available": 100},
+                     "candidatos": [], "revalidacoes": [], "buy_evaluated": 0,
+                     "sell_evaluated": 0, "stats": {}}
+            with patch("jev_bot.orquestrador.jev.decide",
+                       return_value=Decision("TESTE", "HOLD", .5, .5)) as jev:
+                primeiro = orch._despachar_analise(estado, dados, "id1")
+                segundo = orch._despachar_analise(estado, dados, "id2")
+                self._drenar(orch)
+            self.assertEqual(primeiro, "enviado_jev")
+            self.assertEqual(segundo, "candle_ja_enviado")
+            self.assertEqual(orch.contadores_ciclo.get("enviados_jev"), 1)
+            jev.assert_called_once()
 
     def test_hold_do_jev_nao_gera_ordem(self):
         with tempfile.TemporaryDirectory() as pasta:

@@ -44,6 +44,7 @@ import time
 
 from . import cache_m1, candidatos, configuracao, jev, logs, mercados, padroes, risk
 from .markets import FonteMT5
+from .evento import evento_quantitativo
 from .pool_matematico import PoolMatematico, max_paralelo
 from .motor_matematico import estatisticas, janela_descoberta, resumo_compacto
 from .painel import BANCO_PADRAO, carregar_carteira
@@ -86,6 +87,7 @@ MOTIVOS_CODIGO = {
     "sem_jev": "IA_INDISPONIVEL",
     "fila_cheia": "FILA_BLOQUEADA",
     "candle_ja_enviado": "ANALISE_JA_ENVIADA",
+    "dados_insuficientes": "DADOS_INSUFICIENTES",
 }
 FAS = {"VARRENDO": "VARRENDO CATÁLOGO", "BAIXANDO_HISTORICO": "BAIXANDO HISTÓRICO",
        "CALCULANDO": "CALCULANDO", "VALIDANDO": "VALIDANDO PADRÕES",
@@ -1872,6 +1874,8 @@ class Orquestrador:
         recorte = {**janela, "candles": descoberta, "fim": descoberta[-1]["time"]}
         stats = estatisticas(recorte, 0.0)
         custo_pct = round(spread_abs / preco_atual * 100, 4)
+        spread_pct = spread_abs / preco_atual if preco_atual > 0 else None
+        evento = evento_quantitativo(janela["candles"], spread_pct=spread_pct)
         stats["custo_spread_pct"] = custo_pct
         stats["cost_basis"] = "spread_only"
         stats["commission_pct"] = None
@@ -1909,7 +1913,7 @@ class Orquestrador:
                 familias_testadas=max(1, len(regras)))
             avaliacoes.append((regra, validacao))
         return {"stats": stats, "custo_pct": custo_pct, "dias_janela": dias_janela,
-                "candle_ref": janela["candles"][-1]["time"],
+                "candle_ref": janela["candles"][-1]["time"], "evento": evento,
                 "revalidacoes": revalidacoes, "candidatos": avaliacoes,
                 "erro_geracao": erro_geracao, "regras_total": len(regras),
                 "buy_evaluated": sum(1 for r, _ in avaliacoes if r["direcao"] == "BUY"),
@@ -2054,12 +2058,21 @@ class Orquestrador:
                     "reason_codes": v.get("reason_codes", []),
                     "estado": v.get("status")}
 
-        return {"symbol": simbolo, "candle_time": dados["candle_ref"],
-                "history_days": dados["dias_janela"],
+        ev = dados.get("evento") or {}
+        return {"symbol": simbolo, "candle_time": dados["candle_ref"], "timeframe": "M1",
+                "history": {"days": dados["dias_janela"],
+                            "bars_available": ev.get("bars_available"),
+                            "bars_used": ev.get("bars_used"),
+                            "last_closed_m1": ev.get("last_closed_m1"),
+                            "coverage_minutes": ev.get("coverage_minutes"),
+                            "data_quality": ev.get("data_quality")},
+                "evento": ev,
                 "cost_spread_pct": dados["custo_pct"], "cost_basis": "spread_only",
                 "commission": "NAO_ESTIMADA", "slippage": "NAO_ESTIMADA",
                 "buy": lado("BUY"), "sell": lado("SELL"),
                 "candidates_evaluated": len(dados["candidatos"]) + len(dados["revalidacoes"]),
+                "instructions": "JEv decide BUY, SELL ou HOLD; HOLD é adequado sem suporte "
+                                "direcional. Python não escolhe direção.",
                 "aviso": "métricas informam a decisão; Python não veta por qualidade estatística"}
 
     def _despachar_analise(self, estado, dados, id_analise):
@@ -2067,6 +2080,14 @@ class Orquestrador:
         simbolo = estado.symbol
         candle_ref = dados["candle_ref"]
         self.analises_memoria[simbolo] = self._montar_analise(simbolo, dados)
+        evento = dados.get("evento") or {}
+        if evento.get("status") != "OK":
+            self.contadores_ciclo["dados_insuficientes"] = \
+                self.contadores_ciclo.get("dados_insuficientes", 0) + 1
+            self._publicar_motivo(simbolo, id_analise, "DADOS_INSUFICIENTES",
+                                  evento.get("reason", "dados essenciais ausentes"),
+                                  candle_ref=candle_ref)
+            return "dados_insuficientes"
         if self.book is None or not self.book.active or self.parado_risco or self.emergencia_ativa:
             return "inativo"
         if not self.selecao.operar(simbolo):

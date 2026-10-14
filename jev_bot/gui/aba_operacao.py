@@ -400,14 +400,22 @@ class AbaOperacao(QWidget):
         resposta = diag.get("ultima_resposta_jev_age_s")
         envio_txt = f"há {envio:g}s" if envio is not None else "nunca"
         resposta_txt = f"há {resposta:g}s" if resposta is not None else "nunca"
-        self.diagnostico_funil.setText(
+        compacto = (f"Funil: sel {totais.get('symbol_selected', 0)} · "
+                    f"dados {totais.get('symbol_available_mt5', 0)} · "
+                    f"candidatos {totais.get('candidate_generated', 0)} · "
+                    f"env {totais.get('queue_enqueued', 0)} · "
+                    f"JEv {totais.get('jev_request_started', 0)} · "
+                    f"resp {totais.get('jev_response_received', 0)} · "
+                    f"decisões {decisoes} · paper {totais.get('paper_opened', 0)} · "
+                    f"calc {diag.get('analises_pendentes', 0)}/{diag.get('max_parallel_symbols', 0)} · "
+                    f"pico {diag.get('pool_matematico', {}).get('pico_concorrencia', 0)}")
+        detalhe = (
             "Funil (sessão): "
             f"selecionados {totais.get('symbol_selected', 0)} → "
             f"operáveis {totais.get('symbol_operable', 0)} → "
             f"dados válidos {totais.get('symbol_available_mt5', 0)} → "
             f"candidatos {totais.get('candidate_generated', 0)} → "
-            f"aprovados {totais.get('quant_validated', 0)} "
-            f"(sem elegibilidade {totais.get('ineligible_for_jev', 0)}) → "
+            f"elegíveis {totais.get('quant_validated', 0)} → "
             f"enfileirados {totais.get('queue_enqueued', 0)} → "
             f"chamadas JEv {totais.get('jev_request_started', 0)} → "
             f"respostas {totais.get('jev_response_received', 0)} → "
@@ -420,6 +428,8 @@ class AbaOperacao(QWidget):
             f"p50 {diag.get('pool_matematico', {}).get('duracao_p50_ms')} ms | "
             f"p95 {diag.get('pool_matematico', {}).get('duracao_p95_ms')} ms\n"
             "Custo da validação: spread observado; comissão/slippage não estimados")
+        self.diagnostico_funil.setText(compacto)
+        self.diagnostico_funil.setToolTip(detalhe)
         self._preencher_atividade(diag.get("atividade") or [])
         exposicao = m.get("exposicao", 0)
         self._definir("exposicao_txt", f"{_fmt_moeda(exposicao, moeda)} "

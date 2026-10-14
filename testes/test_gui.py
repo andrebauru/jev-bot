@@ -183,11 +183,12 @@ class TestGui(unittest.TestCase):
             "ultimo_envio_jev_age_s": None, "idade_fila_s": 0,
             "ultima_resposta_jev_age_s": None, "fila_size": 0, "worker_alive": False}})
         texto = aba.diagnostico_funil.text()
-        self.assertIn("selecionados 0", texto)
-        self.assertIn("respostas 0", texto)
-        self.assertIn("OOS_RATE_BELOW_MIN:4", texto)
-        self.assertIn("último envio: nunca", texto)
-        self.assertIn("idade da fila: 0s", texto)
+        self.assertIn("sel 0", texto)
+        self.assertIn("resp 0", texto)
+        dica = aba.diagnostico_funil.toolTip()
+        self.assertIn("OOS_RATE_BELOW_MIN:4", dica)
+        self.assertIn("último envio: nunca", dica)
+        self.assertIn("idade da fila: 0s", dica)
 
     def test_atividade_matematica_mostra_estados(self):
         from jev_bot.gui.aba_operacao import AbaOperacao
@@ -208,7 +209,7 @@ class TestGui(unittest.TestCase):
         self.assertEqual(aba.tabela_atividade.item(0, 1).text(), "CALCULATING")
         self.assertIn("BUY 3", aba.tabela_atividade.item(0, 3).text())
         self.assertEqual(aba.tabela_atividade.item(1, 5).text(), "NEGATIVE_EXPECTANCY")
-        self.assertIn("pico concorrente 4", aba.diagnostico_funil.text())
+        self.assertIn("pico 4", aba.diagnostico_funil.text())
 
     def test_splitters_redimensionaveis_em_janela_normal_e_reduzida(self):
         """Conteúdo de operação mantém listas utilizáveis em dimensões variadas."""

@@ -94,8 +94,8 @@ def timeout_deepseek():
 
 
 def dias_historico():
-    """Janela rolante de histórico M1 em dias (padrão 7, faixa 1..30)."""
-    return _inteiro("JEV_HISTORY_DAYS", 7, 1, 30)
+    """Janela rolante de histórico M1 em dias (padrão 1, faixa 1..30)."""
+    return _inteiro("JEV_HISTORY_DAYS", 1, 1, 30)
 
 
 def _escapar_valor(valor):

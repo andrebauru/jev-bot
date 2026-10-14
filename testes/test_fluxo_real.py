@@ -398,7 +398,9 @@ class TestCacheIncremental(unittest.TestCase):
             orch.fonte.incremento_m1 = Mock(return_value=novos)
             segunda = orch._janela_com_cache("TESTE", "id")
             self.assertEqual(orch.fonte.janela_m1.call_count, 1)  # refetch completo não ocorreu
-            self.assertEqual(segunda["recebidos"], 3000 + 30)
+            # Janela de 1 dia: a cauda é recortada a ~1440 candles + os novos.
+            self.assertLessEqual(segunda["recebidos"], 1441)
+            self.assertGreaterEqual(segunda["recebidos"], 1440)
             self.assertEqual(orch.contadores_ciclo.get("cache_incremental"), 1)
 
     def test_lacuna_grande_invalida_e_refetch_completo(self):

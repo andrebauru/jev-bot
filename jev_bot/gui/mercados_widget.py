@@ -65,6 +65,14 @@ class PainelMercados(QWidget):
         self.arvore.setColumnCount(3)
         self.arvore.setHeaderLabels(["Categoria / Símbolo", "Monitorar", "Operar"])
         self.arvore.setUniformRowHeights(True)
+        # Caixas maiores e legíveis no tema escuro (DPI alto incluído).
+        self.arvore.setStyleSheet(
+            "QTreeView::indicator { width:20px; height:20px; }"
+            "QTreeView::item { padding:6px 4px; }")
+        self.arvore.setIndentation(18)
+        self.arvore.setColumnWidth(COL_MONITORAR, 110)
+        self.arvore.setColumnWidth(COL_OPERAR, 96)
+        self.arvore.header().setDefaultAlignment(Qt.AlignCenter)
         self.arvore.itemChanged.connect(self._item_alterado)
         self.arvore.itemExpanded.connect(self._expandir_categoria)
         colunas.addWidget(self.arvore, 1)

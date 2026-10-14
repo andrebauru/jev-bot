@@ -289,6 +289,8 @@ class TestPoliticaPaper(unittest.TestCase):
             v, "local", janela(candles))
         registro["status"] = "validado"
         orch.repositorio.salvar("TESTE", orch.repositorio.carregar("TESTE"))
+        self.addCleanup(orch.encerrar.set)
+        self.addCleanup(lambda: orch.pool_matematico.encerrar())
         return orch, estado_mt5(closes=closes)
 
     def test_sim_com_risco_allow_e_paper_opened(self):
@@ -355,6 +357,8 @@ class TestCiclosMulti(unittest.TestCase):
             v, "local", janela(candles))
         registro["status"] = "validado"
         orch.repositorio.salvar("TESTE", orch.repositorio.carregar("TESTE"))
+        self.addCleanup(orch.encerrar.set)
+        self.addCleanup(lambda: orch.pool_matematico.encerrar())
         return orch, estado_mt5(closes=closes)
 
     def test_tres_ciclos_ids_crescentes(self):

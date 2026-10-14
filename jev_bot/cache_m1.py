@@ -50,7 +50,7 @@ def _desempacotar(linha):
 class CacheM1:
     """Armazenamento limitado por símbolo (JSON atômico) com anexo incremental."""
 
-    def __init__(self, pasta, max_dias=7, relogio=time.time):
+    def __init__(self, pasta, max_dias=1, relogio=time.time):
         self.pasta = Path(pasta)
         self.max_dias = max_dias
         self.relogio = relogio
