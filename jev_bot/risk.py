@@ -67,22 +67,19 @@ def bloqueio_spread(state, limits):
     return ""
 
 
-def check(decision: Decision, book, limits: Limits, state: MarketState, agora=None) -> Gate:
-    """Dimensiona lotes pelo prejuízo no stop, nunca arredondando risco para cima."""
+def pre_check(side: str, book, limits: Limits, state: MarketState, agora=None) -> Gate:
+    """Avalia e dimensiona uma entrada ja direcionada pelo Python (pre e pos-JEv).
+
+    Nao conhece JEv nem probabilidade: direcao fixa, dados de mercado, limites
+    de risco e capacidade de execucao PAPER. `SKIP` = veto deterministico.
+    """
     def recusar(motivo):
-        """Padroniza a recusa explicável de uma entrada."""
         return Gate("SKIP", motivo)
 
-    if decision.action not in ("BUY", "SELL"):
-        return recusar(f"{decision.action} não executa")
-    if decision.source != "jev" or decision.symbol != state.symbol or state.source != "MT5":
-        return recusar("Origem ou símbolo inválido")
-    if not (_numero_valido(decision.confidence) and _numero_valido(decision.probability)):
-        return recusar("Confiança/probabilidade ausente ou inválida")
-    if any(not 0 <= v <= 1 for v in (decision.confidence, decision.probability)):
-        return recusar("Confiança/probabilidade inválida")
-    if decision.confidence < limits.min_confidence or decision.probability < limits.min_probability:
-        return recusar("Confiança/probabilidade abaixo do limite")
+    if side not in ("BUY", "SELL"):
+        return recusar("Direcao proposta invalida")
+    if state.source != "MT5":
+        return recusar("Origem invalida")
     if not book.active:
         return recusar("Paper pausado; use start (Iniciar trading)")
     if not book.prices_valid:
@@ -98,7 +95,7 @@ def check(decision: Decision, book, limits: Limits, state: MarketState, agora=No
         return recusar("Limite de posições atingido")
     if any(p.symbol == state.symbol for p in book.fills):
         return recusar("Já existe posição neste ativo")
-    if state.trade_mode not in (1, 2, 4) or (state.trade_mode == 1 and decision.action == "SELL") or (state.trade_mode == 2 and decision.action == "BUY"):
+    if state.trade_mode not in (1, 2, 4) or (state.trade_mode == 1 and side == "SELL") or (state.trade_mode == 2 and side == "BUY"):
         return recusar("Direção não permitida pelo broker")
     valores = (state.price, state.bid, state.ask, state.stop_distance,
                state.loss_per_lot, state.margin_per_lot, state.volume_min,
@@ -127,10 +124,25 @@ def check(decision: Decision, book, limits: Limits, state: MarketState, agora=No
     margem = volume * state.margin_per_lot
     if sum(p.margin for p in book.fills) + margem > equity * limits.max_margin:
         return recusar("Margem paper excede 30% do patrimônio")
-    entrada = state.ask if decision.action == "BUY" else state.bid
-    direcao = 1 if decision.action == "BUY" else -1
+    entrada = state.ask if side == "BUY" else state.bid
+    direcao = 1 if side == "BUY" else -1
     stop = entrada - direcao * state.stop_distance
     alvo = entrada + direcao * 2 * state.stop_distance
     if min(stop, alvo) <= 0:
         return recusar("Stop/alvo inválido")
     return Gate("EXECUTE", "", volume, entrada, stop, alvo, risco_real, margem)
+
+
+def check(decision: Decision, book, limits: Limits, state: MarketState, agora=None) -> Gate:
+    """Compatibilidade: valida a decisao legada e delega o dimensionamento."""
+    if decision.action not in ("BUY", "SELL"):
+        return Gate("SKIP", f"{decision.action} nao executa")
+    if decision.source != "jev" or decision.symbol != state.symbol or state.source != "MT5":
+        return Gate("SKIP", "Origem ou simbolo invalido")
+    if not (_numero_valido(decision.confidence) and _numero_valido(decision.probability)):
+        return Gate("SKIP", "Confianca/probabilidade ausente ou invalida")
+    if any(not 0 <= v <= 1 for v in (decision.confidence, decision.probability)):
+        return Gate("SKIP", "Confianca/probabilidade invalida")
+    if decision.confidence < limits.min_confidence or decision.probability < limits.min_probability:
+        return Gate("SKIP", "Confianca/probabilidade abaixo do limite")
+    return pre_check(decision.action, book, limits, state, agora)

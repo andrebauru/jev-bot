@@ -45,6 +45,66 @@ def configuracao():
     return chave, endpoint
 
 
+def avaliar_entrada(proposta, engine="jev") -> dict:
+    """Aprovação binária de uma entrada já decidida e pré-aprovada pelo Python.
+
+    O JEv responde estritamente `{"approved": bool, "reason": str}` e não pode
+    propor direção oposta nem alterar lote, stop, alvo ou risco. Qualquer
+    resposta ambígua, legado BUY/SELL/HOLD, JSON inválido, timeout ou HTTP de
+    erro vira `JevError` (nunca aprovação implícita).
+    """
+    if engine != "jev":
+        raise ValueError("Somente o motor JEV é permitido.")
+    inicio = time.monotonic()
+    modelo = os.environ.get("OPENROUTER_MODEL", "typesafe/jev-1.13").strip()
+    chave, endpoint = configuracao()
+    body = json.dumps({"model": modelo,
+                       "state": proposta,
+                       "questions": {"approval": {
+        "type": "approval",
+        "instructions": "Avalie exclusivamente se esta entrada proposta merece aprovação. "
+                        "A direção é fixa (BUY/SELL) e definida pelo sistema; você NÃO pode propor "
+                        "a direção oposta nem alterar direção, lote, stop, take-profit ou risco. "
+                        "Responda estritamente com JSON {\"approved\":true|false,\"reason\":\"...\"}. "
+                        "Se faltar informação suficiente, responda false. "
+                        "HOLD, BUY, SELL ou qualquer escolha de ação são respostas inválidas.",
+        "criteria": {
+            "YES": "A evidência quantitativa fornecida apoia a entrada proposta.",
+            "NO": "A evidência é insuficiente, contraditória ou não apoia a entrada proposta.",
+        },
+    }}}, allow_nan=False).encode()
+    req = Request(endpoint, data=body, headers={
+        "content-type": "application/json", "authorization": f"Bearer {chave}",
+    })
+    http_success = False
+    try:
+        with urlopen(req, timeout=15) as resposta:
+            corpo = resposta.read(1_000_000).decode()
+        http_success = True
+        data = json.loads(corpo)
+        ans = data["answers"]["approval"]
+        aprovado = ans["approved"]
+        motivo = ans["reason"]
+        if not isinstance(aprovado, bool):
+            raise ValueError("aprovação não booleana")
+        if not isinstance(motivo, str) or not motivo.strip():
+            raise ValueError("motivo ausente")
+    except HTTPError as exc:
+        code = exc.code
+        exc.close()
+        raise JevError(f"HTTP_{code}", "http_error") from None
+    except (TimeoutError, socket.timeout):
+        raise JevError("JEv_TIMEOUT", "timeout") from None
+    except URLError as exc:
+        if isinstance(getattr(exc, "reason", None), (TimeoutError, socket.timeout)):
+            raise JevError("JEv_TIMEOUT", "timeout") from None
+        raise JevError("JEv_NETWORK_ERROR", "http_error") from None
+    except (ValueError, KeyError, TypeError, AttributeError):
+        raise JevError("JEv_PARSE_ERROR", "parse_error", http_success=http_success) from None
+    return {"approved": aprovado, "reason": motivo.strip()[:400],
+            "modelo": modelo, "latencia_ms": round((time.monotonic() - inicio) * 1000)}
+
+
 def decide(state: MarketState, engine="jev", limites=None) -> Decision:
     """Consulta JEV e rejeita respostas incompletas ou fora do contrato esperado."""
     if engine != "jev":

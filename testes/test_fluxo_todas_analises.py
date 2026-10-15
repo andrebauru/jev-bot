@@ -79,13 +79,13 @@ class TestTodasAnalisesAoJev(unittest.TestCase):
             time.sleep(.005)
         orch._processar_resultados_jev()
 
-    def test_expectativa_negativa_ainda_vai_ao_jev(self):
+    def test_expectativa_negativa_ainda_propoe_e_jev_aprova(self):
+        """Evidência fraca não impede o Python de propor; quem reprova é o JEv/risco."""
         regra = {"tipo_regra": "quedas_consecutivas", "parametros": {"n": 3},
                  "direcao": "BUY", "horizonte_minutos": 5,
                  "strategy_id": "conditional_sequence"}
         with tempfile.TemporaryDirectory() as pasta:
             orch = self._orquestrador(pasta)
-            # Força validar negativo substituindo a validação do candidato.
             negativo = {"status": "rejeitado", "motivo": "OOS ruim",
                         "reason_code": "OOS_EDGE_NEGATIVE", "reason_codes": ["OOS_EDGE_NEGATIVE"],
                         "total": {"eventos": 100, "acertos": 40, "taxa": .4, "media_pct": -0.5,
@@ -98,31 +98,29 @@ class TestTodasAnalisesAoJev(unittest.TestCase):
             with patch("jev_bot.orquestrador.candidatos.regras_candidatas",
                        return_value=[regra]), \
                     patch.object(Orquestrador, "_validar_candidato_m1", return_value=negativo), \
-                    patch("jev_bot.orquestrador.jev.decide",
-                          return_value=Decision("TESTE", "BUY", .9, .9)) as jev:
+                    patch("jev_bot.orquestrador.jev.avaliar_entrada",
+                          return_value={"approved": True, "reason": "ok"}) as jev:
                 orch._executar_ciclo("c1")
                 self._drenar(orch)
             jev.assert_called_once()
             self.assertEqual(len(orch.book.fills), 1)
             self.assertEqual(orch.analises_memoria["TESTE"]["buy"]["expectancy_net_pct"], -0.5)
 
-    def test_risco_bloqueia_preservando_decisao_do_jev(self):
+    def test_risco_pre_jev_nao_chama_e_nao_abre(self):
+        """Veto de risco pré-JEv: nenhuma chamada, nenhuma ordem, motivo claro."""
         with tempfile.TemporaryDirectory() as pasta:
             orch = self._orquestrador(pasta)
             gate = Mock(verdict="SKIP", reason="Limite de drawdown", volume=0,
                         entry=0, stop=0, target=0, risk_amount=0, margin=0)
-            with patch("jev_bot.orquestrador.risk.check", return_value=gate), \
-                    patch("jev_bot.orquestrador.jev.decide",
-                          return_value=Decision("TESTE", "SELL", .8, .8)):
+            with patch("jev_bot.orquestrador.risk.pre_check", return_value=gate), \
+                    patch("jev_bot.orquestrador.jev.avaliar_entrada") as jev:
                 orch._executar_ciclo("c1")
                 self._drenar(orch)
+            jev.assert_not_called()
             self.assertEqual(len(orch.book.fills), 0)
-            bloqueios = [r for c, r in orch.eventos if c == "decisao"
-                         and str(r.get("decisao", "")).startswith("JEV_")]
-            self.assertTrue(bloqueios)
-            self.assertEqual(bloqueios[0]["decisao"], "JEV_SELL_RISK_BLOCKED")
-            self.assertEqual(bloqueios[0]["decisao_jev"], "SELL")
-            self.assertEqual(bloqueios[0]["policy"], "VETO")
+            self.assertEqual(orch.contadores_sessao.get("pre_risk_reject", 0), 1)
+            motivos = {r.get("motivo") for c, r in orch.eventos if c == "oportunidade"}
+            self.assertIn("RISK_REJECTED_PRE_JEV", motivos)
 
     def test_dados_insuficientes_nao_enviam_payload(self):
         poucos = [{"time": i * 60, "open": 100.0, "high": 100.5, "low": 99.5,
@@ -145,35 +143,49 @@ class TestTodasAnalisesAoJev(unittest.TestCase):
                                    cotacoes={"TESTE": (99.995, 100.005, time.time())},
                                    janelas={"TESTE": janela(poucos)})
             orch.fonte.janela_m1 = lambda simbolo, **_k: janela(poucos)
-            with patch("jev_bot.orquestrador.jev.decide") as jev:
+            with patch("jev_bot.orquestrador.jev.avaliar_entrada") as jev:
                 orch._executar_ciclo("c1")
                 self._drenar(orch)
             jev.assert_not_called()
             motivos = {r.get("motivo") for c, r in orch.eventos if c == "oportunidade"}
             self.assertIn("DADOS_INSUFICIENTES", motivos)
 
-    def test_evento_neutro_e_enviado_ao_jev(self):
+    def test_proposta_envia_payload_imutavel(self):
+        """A proposta leva symbol/side/entry/stop/alvo/risco/ids e evidências."""
         with tempfile.TemporaryDirectory() as pasta:
             orch = self._orquestrador(pasta)
-            with patch("jev_bot.orquestrador.jev.decide",
-                       return_value=Decision("TESTE", "HOLD", .5, .5)) as jev:
+            with patch("jev_bot.orquestrador.jev.avaliar_entrada",
+                       return_value={"approved": True, "reason": "ok"}) as jev:
                 orch._executar_ciclo("c1")
                 self._drenar(orch)
             jev.assert_called_once()
+            payload = jev.call_args[0][0]
+            for campo in ("symbol", "side_proposed", "entry_reference", "stop_loss",
+                          "take_profit", "volume", "risk_amount", "risk_pct", "spread",
+                          "candidate_id", "request_id", "run_id", "candle_ref", "expires_at",
+                          "evidencias"):
+                self.assertIn(campo, payload)
             self.assertIn("evento", orch.analises_memoria["TESTE"])
             self.assertIn("history", orch.analises_memoria["TESTE"])
 
     def test_deduplicacao_por_simbolo_e_candle(self):
+        regra = {"tipo_regra": "quedas_consecutivas", "parametros": {"n": 3},
+                 "direcao": "BUY", "horizonte_minutos": 5}
+        validacao = {"status": "validado", "motivo": "ok", "reason_code": "QUANT_VALIDATED",
+                     "reason_codes": ["QUANT_VALIDATED"],
+                     "total": {"eventos": 10, "acertos": 7, "taxa": .7, "media_pct": .5},
+                     "amostra": {"eventos": 7, "taxa": .7, "media_pct": .5},
+                     "oos": {"eventos": 3, "taxa": .7, "media_pct": .5},
+                     "estabilidade": {}, "custo_pct": .01, "cost_basis": "spread_only"}
         with tempfile.TemporaryDirectory() as pasta:
             orch = self._orquestrador(pasta)
             estado = estado_mt5("TESTE", closes=[100.0] * 30)
             dados = {"candle_ref": estado.candles[-1]["time"], "custo_pct": .01,
-                     "dias_janela": 1, "evento": {"status": "OK",
-                                                  "bars_available": 100},
-                     "candidatos": [], "revalidacoes": [], "buy_evaluated": 0,
-                     "sell_evaluated": 0, "stats": {}}
-            with patch("jev_bot.orquestrador.jev.decide",
-                       return_value=Decision("TESTE", "HOLD", .5, .5)) as jev:
+                     "dias_janela": 1, "evento": {"status": "OK", "bars_available": 100},
+                     "candidatos": [(regra, validacao)], "revalidacoes": [],
+                     "buy_evaluated": 1, "sell_evaluated": 0, "stats": {}}
+            with patch("jev_bot.orquestrador.jev.avaliar_entrada",
+                       return_value={"approved": True, "reason": "ok"}) as jev:
                 primeiro = orch._despachar_analise(estado, dados, "id1")
                 segundo = orch._despachar_analise(estado, dados, "id2")
                 self._drenar(orch)
@@ -182,16 +194,16 @@ class TestTodasAnalisesAoJev(unittest.TestCase):
             self.assertEqual(orch.contadores_ciclo.get("enviados_jev"), 1)
             jev.assert_called_once()
 
-    def test_hold_do_jev_nao_gera_ordem(self):
+    def test_jev_no_nao_gera_ordem(self):
         with tempfile.TemporaryDirectory() as pasta:
             orch = self._orquestrador(pasta)
-            with patch("jev_bot.orquestrador.jev.decide",
-                       return_value=Decision("TESTE", "HOLD", .5, .5)):
+            with patch("jev_bot.orquestrador.jev.avaliar_entrada",
+                       return_value={"approved": False, "reason": "sem suporte"}):
                 orch._executar_ciclo("c1")
                 self._drenar(orch)
             self.assertEqual(len(orch.book.fills), 0)
-            holds = [r for c, r in orch.eventos if c == "decisao" and r.get("decisao") == "HOLD"]
-            self.assertTrue(holds)
+            naos = [r for c, r in orch.eventos if c == "decisao" and r.get("decisao") == "NAO"]
+            self.assertTrue(naos)
 
 
 if __name__ == "__main__":

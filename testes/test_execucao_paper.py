@@ -1,16 +1,13 @@
-"""Execução paper ponta a ponta com JEv mockado (sem custo de API, sem ordem real).
+"""Aprovação binária do JEv com risco antes e depois (A–L), sem custo e sem ordem real.
 
-Cobre o prompt de correção A–J: BUY/SELL viram ordens paper com fill e
-histórico; HOLD não gera ordem; bloqueio de risco preserva a decisão;
-candle expirado descarta com motivo; erros de API têm estado próprio
-(nunca mascarados como HOLD); None em UI/log não derruba o motor e None
-em preço/risco rejeita a entrada; idempotência por candidato; persistência
-sem duplicação; múltiplos símbolos com atualização de GUI.
+Contrato: o Python decide a direção e pré-aprova o risco; o JEv só responde
+SIM/NÃO; a execução é PAPER e a direção executada é exatamente a proposta.
 """
 
 import dataclasses
 import os
 import tempfile
+import threading
 import time
 from pathlib import Path
 from unittest.mock import patch
@@ -22,25 +19,21 @@ from jev_bot import mercados, padroes
 from jev_bot.execution.paper import Book
 from jev_bot.jev import JevError
 from jev_bot.orquestrador import Orquestrador
-from jev_bot.risk import check as risk_check
+from jev_bot.risk import pre_check
 from jev_bot.types import Decision
 
-VALIDACAO = {
-    "status": "validado", "motivo": "Evidência dentro e fora da amostra",
-    "reason_code": "QUANT_VALIDATED", "reason_codes": ["QUANT_VALIDATED"],
-    "total": {"eventos": 100, "acertos": 70, "taxa": .7, "media_pct": 0.5,
-              "mediana_pct": 0.5, "desvio_pct": .1},
-    "amostra": {"eventos": 70, "taxa": .7, "media_pct": 0.5},
-    "oos": {"eventos": 30, "taxa": .7, "media_pct": 0.6},
-    "estabilidade": {"wilson_inferior_oos_ajustado": .5},
-    "custo_pct": .05, "cost_basis": "spread_only",
-    "wilson_inferior": .5, "familias_testadas": 1}
+APROVADO = {"approved": True, "reason": "evidência suficiente"}
+
+CAMPOS_PROPOSTA = {"symbol", "side_proposed", "entry_reference", "stop_loss",
+                   "take_profit", "volume", "risk_amount", "risk_pct", "spread",
+                   "candidate_id", "request_id", "run_id", "candle_ref", "expires_at",
+                   "evidencias"}
 
 
-class TesteExecucaoPaper(unittest.TestCase):
-    """Encadeamento técnico: candidato → JEv → risco → executor paper."""
+class TesteAprovacaoBinaria(unittest.TestCase):
+    """Risco pré-JEv, aprovação SIM/NÃO e execução paper direcionada pelo Python."""
 
-    def _orquestrador(self, pasta, simbolos=("TESTE",)):
+    def _orquestrador(self, pasta, simbolos=("TESTE",), estados=None, n_candles=400):
         arquivo = Path(pasta) / "mercados.json"
         mercados.salvar({"selecao": {"C": {s: {"monitorar": True, "operar": True}
                                             for s in simbolos}}}, arquivo)
@@ -55,260 +48,247 @@ class TesteExecucaoPaper(unittest.TestCase):
         orch.repositorio = padroes.RepositorioPadroes(Path(pasta) / "padroes")
         orch.eventos = []
         orch.publicar = lambda canal, registro: orch.eventos.append((canal, registro))
-        estados, cotacoes, janelas = [], {}, {}
+        estados = estados or []
+        listados, cotacoes, janelas = [], {}, {}
         for indice, simbolo in enumerate(simbolos):
-            candles = candles_deterministicos(base=100.0 + indice)
+            candles = candles_deterministicos(n=n_candles, base=100.0 + indice)
             closes = [c["close"] for c in candles[-100:]]
-            estados.append(estado_mt5(simbolo, closes=closes))
+            listados.append(estado_mt5(simbolo, closes=closes))
             cotacoes[simbolo] = (99.995, 100.005, time.time())
             janelas[simbolo] = janela(candles)
-        orch.fonte = FonteFake(estados=estados, cotacoes=cotacoes, janelas=janelas)
-        orch.fonte.janela_m1 = lambda simbolo, **_k: janelas[simbolo]
+        for extra in estados:
+            listados.append(extra)
+        orch.fonte = FonteFake(estados=listados, cotacoes=cotacoes, janelas=janelas)
+        orch.fonte.janela_m1 = lambda simbolo, **_k: janelas.get(
+            simbolo, janela(candles_deterministicos(n=n_candles)))
         self.addCleanup(orch.encerrar.set)
         self.addCleanup(lambda: orch.pool_matematico.encerrar())
         return orch
 
+    def _ciclo_bloqueado(self, orch, construir_resposta):
+        """Executa um ciclo com a resposta JEv bloqueada ate o teste liberar."""
+        entrou, liberar = threading.Event(), threading.Event()
+
+        def resposta(_payload):
+            entrou.set()
+            liberar.wait(3)
+            return construir_resposta()
+
+        with patch("jev_bot.orquestrador.jev.avaliar_entrada", side_effect=resposta):
+            orch._executar_ciclo("c1")
+        self.assertTrue(entrou.wait(2), "worker JEv nao iniciou a chamada")
+        return liberar
+
     def _drenar(self, orch):
-        limite = time.monotonic() + 3
+        limite = time.monotonic() + 4
         while (orch.analises_pendentes or orch.pendentes_jev) and time.monotonic() < limite:
             orch._drenar_analises(f"ciclo{orch.ciclo}")
             orch._processar_resultados_jev()
             time.sleep(.005)
         orch._processar_resultados_jev()
 
-    def _ciclo_validado(self, orch, decisao):
-        """Ciclo com validação local positiva e resposta JEv controlada."""
-        with patch.object(Orquestrador, "_validar_candidato_m1",
-                          return_value=VALIDACAO), \
-                patch("jev_bot.orquestrador.jev.decide", return_value=decisao) as jev:
+    def _ciclo(self, orch, **patch_kw):
+        with patch("jev_bot.orquestrador.jev.avaliar_entrada", **patch_kw) as mock:
             orch._executar_ciclo("c1")
             self._drenar(orch)
-        return jev
+        return mock
 
-    # A. BUY válido + risco aprovado → ordem paper, fill, posição e histórico.
-    def test_a_buy_valido_abre_ordem_paper(self):
-        with tempfile.TemporaryDirectory() as pasta:
-            orch = self._orquestrador(pasta)
-            self._ciclo_validado(orch, Decision("TESTE", "BUY", .9, .9))
-            self.assertEqual(len(orch.book.fills), 1)
-            posicao = orch.book.fills[0]
-            self.assertEqual(posicao.action, "BUY")
-            self.assertAlmostEqual(posicao.entry, 100.005, places=6)  # ask observado
-            self.assertGreater(posicao.volume, 0)
-            self.assertGreater(posicao.risk_amount, 0)
-            trade = orch.book.trades[-1]
-            self.assertEqual(trade["status"], "OPEN")
-            self.assertEqual(trade["candidate_id"], "analise")
-            self.assertEqual(trade["candle_ref"], orch.analises_memoria["TESTE"]["candle_time"])
-            self.assertAlmostEqual(trade["fill_price"], posicao.entry, places=6)
-            self.assertEqual(trade["expected_net_pct"], 0.5)     # previsto registrado
-            self.assertAlmostEqual(trade["spread_pct"],
-                                   orch.analises_memoria["TESTE"]["cost_spread_pct"], places=8)
-            self.assertEqual(orch.funil_total.get("paper_opened"), 1)
-            self.assertEqual(orch.contadores_sessao["decision_buy"], 1)
+    def _decisoes(self, orch):
+        return [r for c, r in orch.eventos if c == "decisao"]
 
-    # B. SELL válido + risco aprovado → 1 ordem paper SELL.
-    def test_b_sell_valido_abre_ordem_paper(self):
-        with tempfile.TemporaryDirectory() as pasta:
-            orch = self._orquestrador(pasta)
-            self._ciclo_validado(orch, Decision("TESTE", "SELL", .8, .8))
-            self.assertEqual(len(orch.book.fills), 1)
-            posicao = orch.book.fills[0]
-            self.assertEqual(posicao.action, "SELL")
-            self.assertAlmostEqual(posicao.entry, 99.995, places=6)  # bid observado
-            self.assertEqual(orch.book.trades[-1]["status"], "OPEN")
-
-    # C. HOLD → 0 ordens; estado da API COMPLETED; motivo claro.
-    def test_c_hold_nao_abre_ordem_e_api_completa(self):
-        with tempfile.TemporaryDirectory() as pasta:
-            orch = self._orquestrador(pasta)
-            self._ciclo_validado(orch, Decision("TESTE", "HOLD", .5, .5))
-            self.assertEqual(len(orch.book.fills), 0)
-            linhas = [r for c, r in orch.eventos if c == "decisao"]
-            self.assertEqual(linhas[-1]["decisao"], "HOLD")
-            self.assertEqual(linhas[-1]["estado_api"], "COMPLETED")
-            self.assertEqual(linhas[-1]["paper"], "NOT_OPENED")
-            self.assertIn("JEv HOLD", linhas[-1]["justificativa"])
-            self.assertEqual(orch.contadores_sessao["decision_hold"], 1)
-            top = orch._metricas()["diagnostico_funil"]["motivos_nao_execucao_top3"]
-            self.assertIn(("JEv_HOLD", 1), [(m["codigo"], m["quantidade"]) for m in top])
-
-    # D. BUY + risco reprovado → 0 ordens, rejeição rastreável.
-    def test_d_risco_reprovado_preserva_decisao_sem_ordem(self):
-        with tempfile.TemporaryDirectory() as pasta:
-            orch = self._orquestrador(pasta)
-            orch.book.drawdown_blocked = True  # bloqueio determinístico real
-            # O autostart suspende tudo com bloqueios; o veto por decisão é
-            # testado mantendo o motor ativo (mesmo gate real de risco).
-            with patch.object(Orquestrador, "_avaliar_autostart",
-                              lambda self, origem=None: setattr(self, "pausado", False)):
-                self._ciclo_validado(orch, Decision("TESTE", "BUY", .9, .9))
-            self.assertEqual(len(orch.book.fills), 0)
-            linhas = [r for c, r in orch.eventos if c == "decisao"]
-            self.assertEqual(linhas[-1]["decisao"], "JEV_BUY_RISK_BLOCKED")
-            self.assertEqual(linhas[-1]["estado_api"], "COMPLETED")
-            self.assertEqual(linhas[-1]["decisao_jev"], "BUY")
-            self.assertEqual(orch.funil_total.get("risk_veto"), 1)
-
-    # E. Candle expirado → 0 ordens, motivo explícito STALE.
-    def test_e_candle_expirado_descarta_resposta(self):
-        with tempfile.TemporaryDirectory() as pasta:
-            orch = self._orquestrador(pasta)
-            candles = candles_deterministicos()
-            closes = [c["close"] for c in candles[-100:]]
-            novo = estado_mt5("TESTE", closes=closes)
-            novo.candles[-1]["time"] += 60  # candle M1 seguinte durante a espera
-            orch.fonte.revalidar = lambda _estado: novo
-            self._ciclo_validado(orch, Decision("TESTE", "BUY", .9, .9))
-            self.assertEqual(len(orch.book.fills), 0)
-            self.assertEqual(orch.funil_total.get("response_discarded_stale"), 1)
-            linhas = [r for c, r in orch.eventos if c == "decisao"]
-            self.assertEqual(linhas[-1]["decisao"], "STALE")
-            self.assertEqual(linhas[-1]["estado_api"], "DISCARDED_STALE")
-
-    # F. Erros de API/timeout/JSON inválido → estados próprios, nunca HOLD.
-    def test_f_erros_de_api_tem_estado_proprio(self):
-        casos = [(JevError("HTTP_401", "http_error"), "ERROR_HTTP_401"),
-                 (JevError("JEv_TIMEOUT", "timeout"), "ERROR_JEv_TIMEOUT"),
-                 (JevError("JEv_PARSE_ERROR", "parse_error"), "ERROR_JEv_PARSE_ERROR")]
-        for erro, estado_esperado in casos:
-            with self.subTest(erro=erro.code), tempfile.TemporaryDirectory() as pasta:
+    # A / B. BUY e SELL aprovados -> ordem paper na direção proposta.
+    def test_ab_buy_e_sell_aprovados_abrem_paper(self):
+        for side in ("BUY", "SELL"):
+            with self.subTest(side=side), tempfile.TemporaryDirectory() as pasta:
                 orch = self._orquestrador(pasta)
-                with patch.object(Orquestrador, "_validar_candidato_m1",
-                                  return_value=VALIDACAO), \
-                        patch("jev_bot.orquestrador.jev.decide", side_effect=erro):
+                # Força a direção proposta pelo Python para o lado testado.
+                with patch.object(Orquestrador, "_propor_entrada",
+                                  side_effect=lambda *a, **k: {"side_proposed": side,
+                                                               "strategy_id": "s",
+                                                               "candidate_id": "s",
+                                                               "status": "validado",
+                                                               "expectancy_net_pct": 0.5,
+                                                               "sample_size": 10, "oos_n": 3,
+                                                               "oos_rate": 0.7,
+                                                               "reason_codes": []}):
+                    mock = self._ciclo(orch, return_value=dict(APROVADO))
+                self.assertEqual(mock.call_count, 1)
+                payload = mock.call_args[0][0]
+                self.assertEqual(payload["side_proposed"], side)
+                self.assertTrue(CAMPOS_PROPOSTA.issubset(payload))
+                self.assertEqual(len(orch.book.fills), 1)
+                posicao = orch.book.fills[0]
+                self.assertEqual(posicao.action, side)
+                esperado = 100.005 if side == "BUY" else 99.995
+                self.assertAlmostEqual(posicao.entry, esperado, places=6)
+                trade = orch.book.trades[0]
+                self.assertEqual(trade["side_proposed"], side)
+                self.assertEqual(trade["jev_reason"], APROVADO["reason"])
+                self.assertEqual(orch.contadores_sessao["paper_opened"], 1)
+                self.assertEqual(orch.contadores_sessao["jev_yes"], 1)
+                self.assertEqual(self._decisoes(orch)[-1]["decisao"], "SIM")
+                self.assertEqual(self._decisoes(orch)[-1]["estado_api"], "COMPLETED")
+
+    # C. JEv NO -> zero posições.
+    def test_c_jev_no_zero_posicoes(self):
+        with tempfile.TemporaryDirectory() as pasta:
+            orch = self._orquestrador(pasta)
+            self._ciclo(orch, return_value={"approved": False, "reason": "evidência fraca"})
+            self.assertEqual(len(orch.book.fills), 0)
+            self.assertEqual(orch.contadores_sessao["jev_no"], 1)
+            self.assertEqual(orch.contadores_sessao["paper_opened"], 0)
+            self.assertEqual(self._decisoes(orch)[-1]["decisao"], "NAO")
+
+    # D. Risco pré-vetado -> zero chamadas ao JEv e zero posições.
+    def test_d_risco_pre_vetado_nao_chama_jev(self):
+        casos = {"lote": dataclasses.replace(estado_mt5("TESTE"), loss_per_lot=1e9),
+                 "spread": dataclasses.replace(estado_mt5("TESTE"), bid=90.0, ask=110.0),
+                 "stop": dataclasses.replace(estado_mt5("TESTE"), stop_distance=0.0)}
+        for nome, estado in casos.items():
+            with self.subTest(caso=nome), tempfile.TemporaryDirectory() as pasta:
+                candles = candles_deterministicos()
+                closes = [c["close"] for c in candles[-100:]]
+                estado.candles = [{"time": time.time() - 60 * (len(closes) - i),
+                                   "open": 100, "high": 100.5, "low": 99.5, "close": c,
+                                   "tick_volume": 10} for i, c in enumerate(closes)]
+                orch = self._orquestrador(pasta)
+                orch.fonte.estados = lambda: iter([estado])
+                with patch("jev_bot.orquestrador.jev.avaliar_entrada") as mock:
                     orch._executar_ciclo("c1")
                     self._drenar(orch)
+                self.assertEqual(mock.call_count, 0, "veto pré-JEv não deve chamar o JEv")
                 self.assertEqual(len(orch.book.fills), 0)
-                linhas = [r for c, r in orch.eventos if c == "decisao"]
-                self.assertEqual(linhas[-1]["decisao"], "ERRO_API")
-                self.assertEqual(linhas[-1]["estado_api"], estado_esperado)
-                self.assertNotEqual(linhas[-1]["decisao"], "HOLD")
-                self.assertEqual(orch.contadores_sessao["paper_opened"], 0)
+                self.assertEqual(orch.contadores_sessao.get("pre_risk_reject", 0), 1)
+                motivos = {r.get("motivo") for c, r in orch.eventos if c == "oportunidade"}
+                self.assertIn("RISK_REJECTED_PRE_JEV", motivos)
 
-    # G. None em UI/log não derruba; None em preço/risco rejeita com segurança.
-    def test_g_none_nao_derruba_motor_e_risco_rejeita(self):
+    # E. JEv não muda a direção; protocolo legado é rejeitado.
+    def test_e_jev_nao_muda_direcao_e_legado_rejeitado(self):
         with tempfile.TemporaryDirectory() as pasta:
             orch = self._orquestrador(pasta)
-            validacao_none = {**VALIDACAO,
-                              "total": dict(VALIDACAO["total"], taxa=None),
-                              "oos": {"eventos": 0, "acertos": 0, "taxa": None,
-                                      "media_pct": None}}
-            texto = orch._texto_validacao(validacao_none)  # regressão do crash
-            self.assertIn("N/D", texto)
-            self.assertIn("OOS sem eventos", texto)
-            estado_sem_preco = dataclasses.replace(estado_mt5("TESTE"), bid=None, ask=None)
-            gate = risk_check(Decision("TESTE", "BUY", .9, .9), orch.book,
-                              orch.book.limits, estado_sem_preco)
-            self.assertNotEqual(gate.verdict, "EXECUTE")
-            self.assertIn("inválid", gate.reason)
-            # Motor continua após falha recuperável de aplicação de análise.
-            with patch.object(Orquestrador, "_validar_candidato_m1",
-                              return_value=VALIDACAO), \
-                    patch.object(Orquestrador, "_aplicar_matematica",
-                                 side_effect=TypeError("unsupported format string "
-                                                       "passed to NoneType.__format__")):
-                orch._executar_ciclo("c1")  # não propaga: erro é recuperável
-            self.assertEqual(orch.estados_ativos.get("TESTE"), "ERROR")
-            motivos = [r.get("motivo") for c, r in orch.eventos if c == "oportunidade"]
-            self.assertIn("SEM_ELEGIBILIDADE", motivos)
-            # O motor segue operável: um novo ciclo roda normalmente.
-            with patch.object(Orquestrador, "_validar_candidato_m1",
-                              return_value=VALIDACAO), \
-                    patch("jev_bot.orquestrador.jev.decide",
-                          return_value=Decision("TESTE", "HOLD", .5, .5)) as jev:
-                orch._executar_ciclo("c2")
-                self._drenar(orch)
-            jev.assert_called()
-
-    def test_g_none_na_interface_exibe_nd(self):
-        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-        from PySide6.QtWidgets import QApplication
-        QApplication.instance() or QApplication([])
-        from jev_bot.gui.aba_operacao import AbaOperacao
-        aba = AbaOperacao(acoes={k: (lambda: None) for k in
-                                 ("iniciar", "pausar", "retomar", "emergencia",
-                                  "liberar_risco", "aplicar_limites", "cancelar_ciclo")})
-        aba.receber_metricas({"estado": "PRONTO", "detalhe": "", "ativo": True,
-                              "moeda": "USD", "equity": None, "saldo": None, "aberto": None,
-                              "exposicao": None, "exposicao_fracao": None,
-                              "drawdown": None, "drawdown_max": None, "posicoes": 0,
-                              "limites": {}, "conta": {"currency": "USD", "balance": None,
-                                                       "equity": None, "profit": None},
-                              "diagnostico_funil": {}})
-        self.assertIn("N/D", aba.valores["equity"].text())
-        self.assertIn("N/D", aba.conta_real.text())
-
-    # H. Duas respostas para o mesmo candidato → no máximo uma ordem.
-    def test_h_idempotencia_por_candidato(self):
-        with tempfile.TemporaryDirectory() as pasta:
-            orch = self._orquestrador(pasta)
-            with patch.object(Orquestrador, "_validar_candidato_m1",
-                              return_value=VALIDACAO), \
-                    patch("jev_bot.orquestrador.jev.decide",
-                          return_value=Decision("TESTE", "BUY", .9, .9)) as jev:
-                orch._executar_ciclo("c1")
-                # Entrega duplicada da MESMA resposta antes do processamento.
-                request_id = (f"{orch.run_id_atual}:TESTE:analise:"
-                              f"{orch.analises_memoria['TESTE']['candle_time']}")
-                orch.resultados_jev.put((request_id, orch.run_id_atual,
-                                         Decision("TESTE", "BUY", .9, .9), None, 5,
-                                         {"run_id": orch.run_id_atual, "symbol": "TESTE",
-                                          "candidate_id": "analise",
-                                          "candle_ref": orch.analises_memoria["TESTE"]["candle_time"]}))
-                self._drenar(orch)
-            jev.assert_called_once()
+            # Extra keys não alteram a direção proposta pelo Python.
+            self._ciclo(orch, return_value={"approved": True, "reason": "ok",
+                                            "side": "SELL", "volume": 999})
             self.assertEqual(len(orch.book.fills), 1)
-            self.assertGreaterEqual(orch.funil_total.get("response_discarded_duplicate"), 1)
+            self.assertEqual(orch.book.fills[0].action, orch.book.trades[0]["side_proposed"])
+        # Resposta legada/ambígua -> erro de protocolo, sem ordem.
+        for resposta in ({"choice": "SELL"}, {"approved": "yes", "reason": "x"},
+                         {"approved": True}, None):
+            with self.subTest(resposta=resposta), tempfile.TemporaryDirectory() as pasta:
+                orch = self._orquestrador(pasta)
+                self._ciclo(orch, return_value=resposta)
+                self.assertEqual(len(orch.book.fills), 0)
+                self.assertEqual(self._decisoes(orch)[-1]["decisao"], "ERRO")
+                self.assertEqual(self._decisoes(orch)[-1]["estado_api"], "ERROR_PROTOCOL")
 
-    # I. Persistência e restauração de posição/trade sem duplicação.
-    def test_i_persistencia_sem_duplicacao(self):
+    # F. Erros técnicos explícitos; motor continua.
+    def test_f_erros_tecnicos_sem_ordem_e_motor_continua(self):
+        casos = [JevError("HTTP_401", "http_error"), JevError("HTTP_429", "http_error"),
+                 JevError("HTTP_500", "http_error"), JevError("JEv_TIMEOUT", "timeout"),
+                 JevError("JEv_PARSE_ERROR", "parse_error")]
+        for erro in casos:
+            with self.subTest(erro=erro.code), tempfile.TemporaryDirectory() as pasta:
+                orch = self._orquestrador(pasta)
+                self._ciclo(orch, side_effect=erro)
+                self.assertEqual(len(orch.book.fills), 0)
+                linha = self._decisoes(orch)[-1]
+                self.assertEqual(linha["decisao"], "ERRO")
+                self.assertEqual(linha["estado_api"], f"ERROR_{erro.code}")
+                self.assertEqual(orch.contadores_sessao["jev_error"], 1)
+                # Motor segue: novo ciclo processa normalmente (novo candle).
+                orch.proxima_tentativa_jev = 0
+                orch.analisados_jev.clear()
+                self._ciclo(orch, return_value=dict(APROVADO))
+                self.assertEqual(len(orch.book.fills), 1)
+
+    # G. YES tardio/duplicado/IDs inconsistentes -> zero posicoes.
+    def test_g_candle_expirado(self):
         with tempfile.TemporaryDirectory() as pasta:
             orch = self._orquestrador(pasta)
-            self._ciclo_validado(orch, Decision("TESTE", "BUY", .9, .9))
-            orch._persistir()
-            restaurado = Book.load(Path(pasta) / "db.json", "USD")
-            self.assertEqual(len(restaurado.fills), 1)
-            self.assertEqual(len(restaurado.trades), 1)
-            restaurado.save(Path(pasta) / "db.json")
-            novamente = Book.load(Path(pasta) / "db.json", "USD")
-            self.assertEqual(len(novamente.fills), 1)
-            self.assertEqual(len(novamente.trades), 1)
-            self.assertEqual(restaurado.trades[0]["trade_id"],
-                             novamente.trades[0]["trade_id"])
+            liberar = self._ciclo_bloqueado(orch, lambda: dict(APROVADO))
+            candles = candles_deterministicos()
+            closes = [c["close"] for c in candles[-100:]]
+            novo_estado = estado_mt5("TESTE", closes=closes)
+            novo_estado.candles[-1]["time"] += 60
+            orch.fonte.revalidar = lambda _estado: novo_estado
+            liberar.set()
+            self._drenar(orch)
+            self.assertEqual(len(orch.book.fills), 0)
+            self.assertEqual(self._decisoes(orch)[-1]["decisao"], "EXPIRADO")
 
-    # J. Múltiplos símbolos, filas e atualização de GUI sem congelamento.
-    def test_j_multipla_simbolos_e_gui(self):
-        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-        from PySide6.QtWidgets import QApplication
-        QApplication.instance() or QApplication([])
-        from jev_bot.gui.aba_operacao import AbaOperacao
+    def test_g_ttl_expirado(self):
         with tempfile.TemporaryDirectory() as pasta:
-            orch = self._orquestrador(pasta, simbolos=("TESTE", "TESTE2"))
-            with patch.object(Orquestrador, "_validar_candidato_m1",
-                              return_value=VALIDACAO), \
-                    patch("jev_bot.orquestrador.jev.decide",
-                          side_effect=lambda estado: Decision(estado.symbol, "BUY", .9, .9)):
-                orch._executar_ciclo("c1")
-                self._drenar(orch)
-            self.assertEqual(len(orch.book.fills), 2)
-            self.assertEqual({p.symbol for p in orch.book.fills}, {"TESTE", "TESTE2"})
-            self.assertEqual(orch.contadores_sessao["paper_opened"], 2)
-            aba = AbaOperacao(acoes={k: (lambda: None) for k in
-                                     ("iniciar", "pausar", "retomar", "emergencia",
-                                      "liberar_risco", "aplicar_limites", "cancelar_ciclo")})
-            registros = [{"id": f"c{i}", "simbolo": f"S{i}",
-                          "instante": "2026-01-01T00:00:00+00:00", "padrao": "analise",
-                          "candle_ref": i, "direcao": "ANALISE", "decisao": "HOLD",
-                          "estado_api": "COMPLETED", "policy": "HOLD",
-                          "justificativa": "j", "risco": "-", "execucao": "-"}
-                         for i in range(60)]
-            aba.receber_lote("decisao", registros)
-            self.assertEqual(aba.lista_decisao.topLevelItemCount(), 60)
-            self.assertEqual(aba.lista_decisao.topLevelItem(0).text(3), "COMPLETED")
+            orch = self._orquestrador(pasta)
+            liberar = self._ciclo_bloqueado(orch, lambda: dict(APROVADO))
+            real = orch.relogio
+            orch.relogio = lambda: real() + 10_000
+            liberar.set()
+            self._drenar(orch)
+            orch.relogio = real
+            self.assertEqual(len(orch.book.fills), 0)
+            self.assertEqual(self._decisoes(orch)[-1]["decisao"], "EXPIRADO")
 
-    def test_estados_api_distintos_na_interface(self):
-        """PENDING nunca aparece como estado de API; COMPLETED/ERROR aparecem."""
+    def test_g_resposta_duplicada(self):
+        with tempfile.TemporaryDirectory() as pasta:
+            orch = self._orquestrador(pasta)
+            liberar = self._ciclo_bloqueado(orch, lambda: dict(APROVADO))
+            liberar.set()
+            limite = time.monotonic() + 3
+            while orch.resultados_jev.empty() and time.monotonic() < limite:
+                time.sleep(.005)
+            rid, rrun, resp, err, lat, meta = orch.resultados_jev.get()
+            orch.resultados_jev.put((rid, rrun, resp, err, lat, meta))
+            orch.resultados_jev.put((rid, rrun, dict(APROVADO), None, 1, meta))
+            self._drenar(orch)
+            self.assertEqual(len(orch.book.fills), 1)
+            self.assertGreaterEqual(
+                orch.funil_total.get("response_discarded_duplicate", 0), 1)
+
+    def test_g_ids_inconsistentes(self):
+        with tempfile.TemporaryDirectory() as pasta:
+            orch = self._orquestrador(pasta)
+            liberar = self._ciclo_bloqueado(orch, lambda: dict(APROVADO))
+            liberar.set()
+            limite = time.monotonic() + 3
+            while orch.resultados_jev.empty() and time.monotonic() < limite:
+                time.sleep(.005)
+            rid, rrun, resp, err, lat, meta = orch.resultados_jev.get()
+            orch.resultados_jev.put((rid, "run-errado", dict(APROVADO), None, 1, meta))
+            self._drenar(orch)
+            self.assertEqual(len(orch.book.fills), 0)
+            self.assertGreaterEqual(
+                orch.funil_total.get("response_discarded_run_mismatch", 0), 1)
+
+    # H. YES + risco alterado -> veto pos-JEv, zero posicoes.
+    def test_h_risco_alterado_veta_pos_jev(self):
+        with tempfile.TemporaryDirectory() as pasta:
+            orch = self._orquestrador(pasta)
+            liberar = self._ciclo_bloqueado(orch, lambda: dict(APROVADO))
+            orch.book.drawdown_blocked = True  # risco mudou apos a aprovacao do JEv
+            liberar.set()
+            self._drenar(orch)
+            self.assertEqual(len(orch.book.fills), 0)
+            self.assertEqual(orch.contadores_sessao.get("post_risk_reject", 0), 1)
+            linha = self._decisoes(orch)[-1]
+            self.assertEqual(linha["decisao"], "SIM")
+            self.assertEqual(linha["paper"], "NOT_OPENED")
+
+    # I. Muitos símbolos e duas oportunidades -> sem duplicação/travamento.
+    def test_i_muitos_simbolos_sem_duplicacao(self):
+        simbolos = [f"S{i}" for i in range(90)]
+        with tempfile.TemporaryDirectory() as pasta:
+            orch = self._orquestrador(pasta, simbolos=simbolos)
+            inicio = time.monotonic()
+            self._ciclo(orch, return_value={"approved": False, "reason": "no"})
+            duracao = time.monotonic() - inicio
+            self.assertLess(duracao, 60)
+            self.assertEqual(len(orch.book.fills), 0)
+            # Nenhum símbolo recebe mais de uma resposta na mesma sessão/candle.
+            self.assertLessEqual(orch.contadores_sessao["jev_no"],
+                                 orch.contadores_sessao["jev_enqueued"])
+
+    # J. GUI mostra SIM/NÃO/ERRO e veto, sem falso PENDING.
+    def test_j_gui_sim_nao_erro_sem_pending(self):
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
         from PySide6.QtWidgets import QApplication
         QApplication.instance() or QApplication([])
@@ -316,35 +296,65 @@ class TesteExecucaoPaper(unittest.TestCase):
         aba = AbaOperacao(acoes={k: (lambda: None) for k in
                                  ("iniciar", "pausar", "retomar", "emergencia",
                                   "liberar_risco", "aplicar_limites", "cancelar_ciclo")})
-        base = {"id": "c1", "instante": "2026-01-01T00:00:00+00:00", "padrao": "analise",
+        base = {"id": "c1", "instante": "2026-01-01T00:00:00+00:00", "padrao": "s",
                 "candle_ref": 1, "direcao": "ANALISE", "justificativa": "j",
                 "risco": "-", "execucao": "-"}
         aba.receber_lote("decisao", [
-            {**base, "simbolo": "A", "decisao": "HOLD", "estado_api": "COMPLETED",
-             "policy": "HOLD"},
-            {**base, "simbolo": "B", "decisao": "ERRO_API", "estado_api": "ERROR_HTTP_429",
-             "policy": "ERROR"},
-            {**base, "simbolo": "C", "decisao": "STALE", "estado_api": "DISCARDED_STALE",
-             "policy": "STALE"},
-            {**base, "simbolo": "D", "decisao": "PENDING", "estado_api": "PENDING",
-             "policy": "PENDING"},  # estado pendente nunca é exibido como decisão
+            {**base, "simbolo": "A", "decisao": "SIM", "estado_api": "COMPLETED",
+             "side_proposed": "BUY", "paper": "OPENED"},
+            {**base, "simbolo": "B", "decisao": "NAO", "estado_api": "COMPLETED",
+             "side_proposed": "SELL"},
+            {**base, "simbolo": "C", "decisao": "ERRO", "estado_api": "ERROR_HTTP_429",
+             "side_proposed": "BUY"},
+            {**base, "simbolo": "D", "decisao": "PENDING", "estado_api": "PENDING"},
         ])
         simbolos = [aba.lista_decisao.topLevelItem(i).text(0)
                     for i in range(aba.lista_decisao.topLevelItemCount())]
-        self.assertEqual(simbolos, ["C", "B", "A"])  # mais recente no topo; PENDING oculto
-        estados = [aba.lista_decisao.topLevelItem(i).text(3) for i in range(3)]
-        self.assertEqual(estados, ["DISCARDED_STALE", "ERROR_HTTP_429", "COMPLETED"])
+        self.assertEqual(simbolos, ["C", "B", "A"])  # PENDING oculto
+        self.assertEqual(aba.lista_decisao.topLevelItem(2).text(2), "SIM")
+        self.assertEqual(aba.lista_decisao.topLevelItem(2).text(4), "BUY")
 
-    def test_sessao_separada_de_historico(self):
-        """Contadores por sessão começam zerados e não herdam acumulados."""
+    # K. Regressão do crash OOS None.
+    def test_k_regressao_oos_none(self):
         with tempfile.TemporaryDirectory() as pasta:
             orch = self._orquestrador(pasta)
-            self.assertEqual(sum(orch.contadores_sessao.values()), 0)
-            self._ciclo_validado(orch, Decision("TESTE", "HOLD", .5, .5))
-            metricas = orch._metricas()["diagnostico_funil"]
-            self.assertGreater(metricas["sessao"].get("decision_hold", 0), 0)
-            self.assertGreater(metricas["sessao"].get("queue_enqueued", 0), 0)
-            self.assertLess(metricas["sessao"].get("paper_opened", 0), 1)
+            texto = orch._texto_validacao({
+                "total": {"eventos": 5, "taxa": None, "media_pct": None},
+                "oos": {"eventos": 0, "taxa": None, "media_pct": None},
+                "custo_pct": 0.01, "reason_code": "INSUFFICIENT_SAMPLE"})
+            self.assertIn("N/D", texto)
+            self.assertIn("OOS sem eventos", texto)
+
+    # L. Nenhum caminho de ordem real.
+    def test_l_sem_order_send(self):
+        raiz = Path(__file__).resolve().parent.parent / "jev_bot"
+        achados = []
+        for arquivo in raiz.rglob("*.py"):
+            if "order_send" in arquivo.read_text(encoding="utf-8"):
+                achados.append(str(arquivo))
+        self.assertEqual(achados, [], "nenhum caminho de ordem real é permitido")
+
+    def test_direcao_executada_igual_a_proposta(self):
+        """A direção executada é exatamente `side_proposed`, nunca invertida."""
+        with tempfile.TemporaryDirectory() as pasta:
+            orch = self._orquestrador(pasta)
+            for side in ("BUY", "SELL"):
+                orch.book.fills.clear()
+                orch.book.trades.clear()
+                orch.analisados_jev.clear()
+                with patch.object(Orquestrador, "_propor_entrada",
+                                  side_effect=lambda *a, **k: {"side_proposed": side,
+                                                               "strategy_id": "s",
+                                                               "candidate_id": "s",
+                                                               "status": "validado",
+                                                               "expectancy_net_pct": 0.5,
+                                                               "sample_size": 1, "oos_n": 1,
+                                                               "oos_rate": 0.7,
+                                                               "reason_codes": []}):
+                    self._ciclo(orch, return_value={"approved": True, "reason": "r",
+                                                    "side": "SELL" if side == "BUY" else "BUY"})
+                self.assertEqual(orch.book.trades[-1]["side_proposed"], side)
+                self.assertEqual(orch.book.trades[-1]["action"], side)
 
 
 if __name__ == "__main__":

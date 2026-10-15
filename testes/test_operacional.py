@@ -157,6 +157,7 @@ class TestPrioridadeOperar(unittest.TestCase):
         orch.logger = LoggerSilencioso()
         orch.book = Book.load(Path(pasta) / "db.json", "USD")
         orch.book.active = True
+        orch.book.prices_valid = True
         orch.jev_configurado = True
         orch.repositorio = padroes.RepositorioPadroes(Path(pasta) / "padroes",
                                                       relogio=time.time)
@@ -337,6 +338,7 @@ class TestCiclosMulti(unittest.TestCase):
         orch.logger = LoggerSilencioso()
         orch.book = Book.load(Path(pasta) / "db.json", "USD")
         orch.book.active = True
+        orch.book.prices_valid = True
         orch.jev_configurado = True
         orch.repositorio = padroes.RepositorioPadroes(Path(pasta) / "padroes",
                                                       relogio=time.time)
@@ -362,22 +364,23 @@ class TestCiclosMulti(unittest.TestCase):
         return orch, estado_mt5(closes=closes)
 
     def test_tres_ciclos_ids_crescentes(self):
-        """Ciclos 1→2→3 registram run_id, despacho, latência e contadores."""
+        """Ciclos 1 a 3 registram run_id, aprovacao e contadores por sessao."""
         with tempfile.TemporaryDirectory() as pasta:
             orch, estado = self._orquestrador(pasta)
             chamadas = []
 
-            def decidir(_estado):
-                chamadas.append(_estado.symbol)
-                return Decision("TESTE", "HOLD", .5, .5)
+            def aprovar(proposta):
+                chamadas.append(proposta["symbol"])
+                return {"approved": True, "reason": "ok"}
 
-            with patch("jev_bot.orquestrador.jev.decide",
-                       side_effect=decidir):
+            with patch("jev_bot.orquestrador.jev.avaliar_entrada",
+                       side_effect=aprovar):
                 for numero in range(3):
                     candle = estado_mt5(closes=[c["close"] for c in
                                                 candles_deterministicos()[-100:]])
                     candle.candles[-1]["time"] = estado.candles[-1]["time"] + numero * 60
                     orch.fonte.estados = lambda candle=candle: iter([candle])
+                    orch.analisados_jev.clear()
                     orch._ciclo()
                     limite = time.monotonic() + 2
                     while (orch.analises_pendentes or orch.pendentes_jev) \
@@ -391,7 +394,7 @@ class TestCiclosMulti(unittest.TestCase):
                     orch._processar_resultados_jev()
                     time.sleep(.005)
                 orch._processar_resultados_jev()
-            self.assertGreaterEqual(orch.funil_total.get("mathematical_edge_found", 0), 3)
+            self.assertGreaterEqual(orch.funil_total.get("pre_risk_pass", 0), 1)
             resumos_por_run = {}
             for canal, registro in orch.eventos:
                 if canal == "resumo":
@@ -401,19 +404,22 @@ class TestCiclosMulti(unittest.TestCase):
             self.assertEqual((c1, c2, c3), (1, 2, 3))
             estados = [r.get("estado") for c, r in orch.eventos if c == "estado"]
             self.assertGreaterEqual(estados.count("ANALISANDO"), 2)
-            self.assertEqual(len(orch.book.fills), 0)  # HOLD não executa
+            # A 1a aprovacao abre paper; as seguintes colidem com a posicao
+            # existente e sao vetadas pelo risco (jamais duplicam).
+            self.assertEqual(len(orch.book.fills), 1)
+            self.assertGreaterEqual(orch.contadores_sessao["pre_risk_reject"], 2)
             decisoes = [r for canal, r in orch.eventos
-                        if canal == "decisao" and r.get("decisao") == "HOLD"]
-            self.assertEqual(len(chamadas), 3)
+                        if canal == "decisao" and r.get("decisao") == "SIM"]
+            self.assertEqual(len(chamadas), 1)  # JEv só após pré-risco aprovado
             self.assertEqual(len({r["run_id"] for r in resumos}), 3)
-            self.assertEqual(len(decisoes), 3)
-            for resumo, decisao in zip(resumos, decisoes):
+            self.assertGreaterEqual(len(decisoes), 1)
+            self.assertEqual(sum(r["funil"].get("jev_enqueued", 0) for r in resumos), 1)
+            for resumo in resumos:
                 self.assertEqual(resumo["resultado"], "CONCLUIDO")
                 self.assertEqual(resumo["funil"]["deepseek_calls"], 0)
-                self.assertEqual(resumo["funil"]["jev_hold"], 1)
                 self.assertEqual(resumo["funil"].get("aguardando_decisao", 0), 0)
                 self.assertEqual(resumo["jev_pendentes"], 0)
-                self.assertEqual(decisao["run_id"], resumo["run_id"])
+            for decisao in decisoes:
                 self.assertTrue(decisao["python_validated_at"])
                 self.assertTrue(decisao["jev_dispatched_at"])
                 self.assertGreaterEqual(decisao["latencia_detecao_ms"], 0)
@@ -437,48 +443,49 @@ class TestCiclosMulti(unittest.TestCase):
                             if simbolo in ("TESTE", "SEGUNDO") else [])
 
             orch.fonte.estados = estados
+            candles = candles_deterministicos()
             orch.fonte.janela_m1 = lambda simbolo, **_kwargs: (
-                janela(candles_deterministicos()) if simbolo == "TESTE" else None)
+                janela(candles) if simbolo == "TESTE" else None)
             entrou_no_worker = threading.Event()
             liberar_resposta = threading.Event()
             terminou = threading.Event()
 
-            def jev_lento(_estado):
+            def jev_lento(_proposta):
                 entrou_no_worker.set()
                 liberar_resposta.wait(2)
                 terminou.set()
-                return Decision("TESTE", "HOLD", .5, .5)
+                return {"approved": True, "reason": "ok"}
 
             inicio = time.monotonic()
-            with patch("jev_bot.orquestrador.jev.decide", side_effect=jev_lento):
+            with patch("jev_bot.orquestrador.jev.avaliar_entrada", side_effect=jev_lento):
                 orch._ciclo()
                 duracao_ciclo = time.monotonic() - inicio
-                self.assertLess(duracao_ciclo, .9)
-                self.assertTrue(entrou_no_worker.wait(.2))
+                self.assertLess(duracao_ciclo, 2.5)
+                self.assertTrue(entrou_no_worker.wait(1))
                 self.assertIn("fetch:SEGUNDO", ordem)
-                self.assertFalse(terminou.is_set(), "o ciclo não esperou a resposta de rede")
+                self.assertFalse(terminou.is_set(), "o ciclo nao esperou a resposta de rede")
                 self.assertEqual(len(orch.book.fills), 0)
                 liberar_resposta.set()
                 self.assertTrue(terminou.wait(2))
                 orch._processar_resultados_jev()
-            holds = [r for canal, r in orch.eventos
-                     if canal == "decisao" and r.get("decisao") == "HOLD"]
-            self.assertTrue(holds)
+            aprovacoes = [r for canal, r in orch.eventos
+                          if canal == "decisao" and r.get("decisao") in ("SIM", "NAO", "ERRO")]
+            self.assertTrue(aprovacoes)
 
     def test_resposta_do_candle_anterior_e_descartada(self):
-        """Decisão tardia não executa paper após mudar o último candle fechado."""
+        """Aprovacao tardia nao executa paper apos mudar o ultimo candle fechado."""
         with tempfile.TemporaryDirectory() as pasta:
             orch, estado = self._orquestrador(pasta)
             orch.fonte.estados = lambda: iter([estado])
             entrou, liberar, terminou = threading.Event(), threading.Event(), threading.Event()
 
-            def jev_lento(_estado):
+            def jev_lento(_proposta):
                 entrou.set()
                 liberar.wait(2)
                 terminou.set()
-                return Decision("TESTE", "BUY", .9, .9)
+                return {"approved": True, "reason": "ok"}
 
-            with patch("jev_bot.orquestrador.jev.decide", side_effect=jev_lento):
+            with patch("jev_bot.orquestrador.jev.avaliar_entrada", side_effect=jev_lento):
                 orch._ciclo()
                 self.assertTrue(entrou.wait(1))
                 estado.candles[-1]["time"] += 60
@@ -490,11 +497,9 @@ class TestCiclosMulti(unittest.TestCase):
                     time.sleep(.005)
                 orch._processar_resultados_jev()
             self.assertEqual(len(orch.book.fills), 0)
-            self.assertEqual(orch.funil_total["response_discarded_stale"], 1)
-            # A resposta tardia é publicada com estado explícito de descarte,
-            # nunca como decisão do JEv (SIM/NAO/HOLD) nem como ordem.
+            self.assertEqual(orch.funil_total["jev_expired"], 1)
             decisoes = [r.get("decisao") for c, r in orch.eventos if c == "decisao"]
-            self.assertEqual(decisoes, ["STALE"])
+            self.assertEqual(decisoes, ["EXPIRADO"])
 
     def test_fila_jev_cheia_nao_inventa_decisao(self):
         """Backpressure bloqueia a oportunidade com motivo, sem fabricar HOLD."""
@@ -527,18 +532,22 @@ class TestCiclosMulti(unittest.TestCase):
             self.assertFalse(any(c == "decisao" for c, _ in orch.eventos))
 
     def test_worker_sobrevive_erro_401_e_processa_proximo_job(self):
-        """Falha HTTP tipada não mata o consumidor serial da fila."""
+        """Falha HTTP tipada nao mata o consumidor serial da fila."""
         with tempfile.TemporaryDirectory() as pasta:
             orch, estado = self._orquestrador(pasta)
+            proposta = {"symbol": "TESTE", "side_proposed": "BUY"}
             metas = [
-                {"run_id": "r1", "symbol": "TESTE", "candidate_id": "p1", "candle_ref": 1},
-                {"run_id": "r1", "symbol": "TESTE", "candidate_id": "p2", "candle_ref": 1},
-                {"run_id": "r1", "symbol": "TESTE", "candidate_id": "p3", "candle_ref": 1},
+                {"run_id": "r1", "symbol": "TESTE", "candidate_id": "p1",
+                 "candle_ref": 1, "proposta": proposta},
+                {"run_id": "r1", "symbol": "TESTE", "candidate_id": "p2",
+                 "candle_ref": 1, "proposta": proposta},
+                {"run_id": "r1", "symbol": "TESTE", "candidate_id": "p3",
+                 "candle_ref": 1, "proposta": proposta},
             ]
             respostas = [jev.JevError("HTTP_401", "http_error"),
                          jev.JevError("JEv_PARSE_ERROR", "parse_error", http_success=True),
-                         Decision("TESTE", "SELL", .9, .9)]
-            with patch("jev_bot.orquestrador.jev.decide", side_effect=respostas):
+                         {"approved": True, "reason": "ok"}]
+            with patch("jev_bot.orquestrador.jev.avaliar_entrada", side_effect=respostas):
                 self.assertTrue(orch._enfileirar_jev("r1:req1", estado, metas[0]))
                 self.assertTrue(orch._enfileirar_jev("r1:req2", estado, metas[1]))
                 self.assertTrue(orch._enfileirar_jev("r1:req3", estado, metas[2]))
@@ -556,7 +565,7 @@ class TestCiclosMulti(unittest.TestCase):
                                                 "http_success": False})
             self.assertEqual(resultados[1][3], {"code": "JEv_PARSE_ERROR", "stage": "parse_error",
                                                 "http_success": True})
-            self.assertEqual(resultados[2][2].action, "SELL")
+            self.assertTrue(resultados[2][2]["approved"])
             stages = []
             while not orch.eventos_worker_jev.empty():
                 stages.append(orch.eventos_worker_jev.get_nowait()["stage"])

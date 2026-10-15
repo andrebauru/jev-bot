@@ -48,6 +48,7 @@ from . import cache_m1, candidatos, configuracao, jev, logs, mercados, padroes, 
 from .markets import FonteMT5
 from .evento import evento_quantitativo
 from .pool_matematico import PoolMatematico, max_paralelo
+from .types import Decision
 from .motor_matematico import estatisticas, janela_descoberta, resumo_compacto
 from .painel import BANCO_PADRAO, carregar_carteira
 
@@ -90,12 +91,18 @@ MOTIVOS_CODIGO = {
     "fila_cheia": "FILA_BLOQUEADA",
     "candle_ja_enviado": "ANALISE_JA_ENVIADA",
     "dados_insuficientes": "DADOS_INSUFICIENTES",
+    "sem_entrada_python": "SEM_ENTRADA_PYTHON",
+    "pre_risk_reject": "RISK_REJECTED_PRE_JEV",
+    "post_risk_reject": "RISK_REJECTED_POST_JEV",
+    "backoff": "IA_INDISPONIVEL",
+    "encerrada": "PAPER_CLOSED",
 }
 FAS = {"VARRENDO": "VARRENDO CATÁLOGO", "BAIXANDO_HISTORICO": "BAIXANDO HISTÓRICO",
        "CALCULANDO": "CALCULANDO", "VALIDANDO": "VALIDANDO PADRÕES",
        "DECIDINDO_JEV": "DECIDINDO JEV"}
 MAX_AVALIADOS = 2000         # memoria de deduplicação por candle
 LOTE_DOWNLOAD = 4320         # candles por chamada ao terminal (3 dias)
+CANDLE_TTL_S = 120           # validade da proposta JEv (candle M1 + 2 min)
 
 
 def _agora_iso():
@@ -733,7 +740,7 @@ class Orquestrador:
                                          "request_id": request_id,
                                          "duracao_ms": queue_age_ms})
             try:
-                decisao = jev.decide(estado)
+                resposta = jev.avaliar_entrada(meta["proposta"])
                 erro = None
                 elapsed = max(0, round((time.monotonic() - inicio) * 1000))
                 self.eventos_worker_jev.put({"stage": "jev_http_success", "meta": meta,
@@ -741,7 +748,7 @@ class Orquestrador:
                 self.eventos_worker_jev.put({"stage": "jev_response_received", "meta": meta,
                                              "request_id": request_id, "duracao_ms": elapsed})
             except Exception as exc:  # a thread só devolve erro tipado ao orquestrador
-                decisao = None
+                resposta = None
                 erro = {"code": getattr(exc, "code", "JEV_CLIENT_ERROR"),
                         "stage": getattr(exc, "stage", "http_error"),
                         "http_success": bool(getattr(exc, "http_success", False))}
@@ -758,7 +765,7 @@ class Orquestrador:
                                              "request_id": request_id,
                                              "duracao_ms": max(0, round((time.monotonic() - inicio) * 1000)),
                                              "motivo": erro["code"]})
-            self.resultados_jev.put((request_id, meta["run_id"], decisao, erro,
+            self.resultados_jev.put((request_id, meta["run_id"], resposta, erro,
                                      max(0, round((time.monotonic() - inicio) * 1000)),
                                      meta))
 
@@ -859,176 +866,221 @@ class Orquestrador:
             resumo["resultado"] = "CONCLUIDO"
         self.publicar("resumo", dict(resumo))
 
-    def _finalizar_decisao_jev(self, contexto, decisao, erro, latencia_ms):
-        """Finaliza política, validação temporal e paper exclusivamente no motor."""
+    def _publicar_aprovacao(self, base, side, decisao, estado_api, motivo,
+                            latencia_ms=None, risco=None, paper="NOT_OPENED", execucao="nenhuma"):
+        """Publica a linha de aprovação JEv (nunca PENDING como decisão final)."""
+        self.publicar("decisao", {**base, "direcao": side, "side_proposed": side,
+                                  "decisao": decisao, "estado_api": estado_api,
+                                  "justificativa": motivo or "-",
+                                  "risco": risco or "-", "policy": decisao,
+                                  "paper": paper, "execucao": execucao,
+                                  "latencia_ms": latencia_ms})
+
+    def _finalizar_decisao_jev(self, contexto, resposta, erro, latencia_ms):
+        """Aprovação binária do JEv; o Python mantém direção e risco (paper)."""
         simbolo = contexto["simbolo"]
-        base = {**contexto["registro_base"], "instante": _agora_iso()}
+        proposta = contexto["proposta"]
+        side = proposta["side_proposed"]
+        base = {**contexto["registro_base"], "instante": _agora_iso(),
+                "direcao": side, "side_proposed": side,
+                "run_id": contexto.get("run_id"), "request_id": contexto.get("request_id"),
+                "candle_ref": contexto.get("candle_ref"),
+                "python_validated_at": contexto.get("python_validated_at"),
+                "jev_dispatched_at": contexto.get("jev_dispatched_at"),
+                "latencia_detecao_ms": contexto.get("latencia_detecao_ms")}
+        candidato = contexto["padrao"]
         if erro:
             code = erro.get("code", "JEV_CLIENT_ERROR")
             stage = erro.get("stage", "http_error")
             if stage == "queue_expired":
                 self._publicar_motivo(simbolo, contexto["id"], "FILA_BLOQUEADA", code,
                                       candle_ref=contexto["candle_ref"],
-                                      candidate_id=contexto["padrao"], run_id=contexto["run_id"])
-                self.publicar("decisao", {**base, "decisao": "ERRO_API",
-                                          "estado_api": "ERROR_QUEUE_TTL_EXPIRED",
-                                          "justificativa": "análise expirou na fila antes do envio; "
-                                                           "não é decisão do JEv",
-                                          "risco": "-", "policy": "ERROR", "paper": "NOT_OPENED",
-                                          "execucao": "nenhuma"})
+                                      candidate_id=candidato, run_id=contexto["run_id"])
+                self._publicar_aprovacao(base, side, "EXPIRADO", f"ERROR_{code}",
+                                         "análise expirou na fila antes do envio", latencia_ms)
                 return
-            self.contadores_ciclo["ia_indisponivel"] = \
-                self.contadores_ciclo.get("ia_indisponivel", 0) + 1
             self.proxima_tentativa_jev = self.relogio() + TENTATIVA_JEV_S
-            self._evento_funil("ineligible_for_jev", simbolo,
-                               candidate_id=contexto["padrao"],
+            self._evento_funil("jev_error", simbolo, candidate_id=candidato,
                                request_id=contexto.get("request_id"),
                                candle_ref=contexto["candle_ref"], run_id=contexto["run_id"],
-                               motivo="IA_INDISPONIVEL", error_code=code, error_stage=stage)
-            self._publicar_motivo(simbolo, contexto["id"], "ERRO_API", code,
+                               motivo=code, error_stage=stage)
+            self._evento_funil("paper_not_opened", simbolo, candidate_id=candidato,
+                               request_id=contexto.get("request_id"),
+                               candle_ref=contexto["candle_ref"], run_id=contexto["run_id"],
+                               motivo="JEV_ERROR")
+            self._publicar_motivo(simbolo, contexto["id"], "JEV_ERROR", code,
                                   candle_ref=contexto["candle_ref"],
-                                  candidate_id=contexto["padrao"], run_id=contexto["run_id"])
-            self.publicar("decisao", {**base, "decisao": "ERRO_API",
-                                      "estado_api": f"ERROR_{code}",
-                                      "justificativa": f"JEv indisponível ({stage}); decisão ausente, "
-                                                       "nunca mascarada como HOLD",
-                                      "risco": "-", "policy": "ERROR", "paper": "NOT_OPENED",
-                                      "execucao": "nenhuma"})
+                                  candidate_id=candidato, run_id=contexto["run_id"])
+            self._publicar_aprovacao(base, side, "ERRO", f"ERROR_{code}",
+                                     f"JEv indisponível ({stage}); nenhuma ordem", latencia_ms)
             self.logger.aviso("JEv indisponível", simbolo=simbolo,
                               run_id=contexto["run_id"], request_id=contexto.get("request_id"),
                               error_code=code, error_stage=stage)
             return
 
         atualizado = self.fonte.revalidar(contexto["estado"])
-        if (atualizado is None or not atualizado.candles
-                or atualizado.candles[-1].get("time") != contexto["candle_ref"]):
+        expirado = (atualizado is None or not atualizado.candles
+                    or atualizado.candles[-1].get("time") != contexto["candle_ref"])
+        if not expirado and proposta.get("expires_at"):
+            expirado = self.relogio() > proposta["expires_at"]
+        if expirado:
             self.contadores_ciclo["stale_jev_response"] = \
                 self.contadores_ciclo.get("stale_jev_response", 0) + 1
-            self._evento_funil("response_discarded_stale", simbolo,
-                               candidate_id=contexto["padrao"], request_id=contexto.get("request_id"),
+            self._evento_funil("jev_expired", simbolo, candidate_id=candidato,
+                               request_id=contexto.get("request_id"),
                                candle_ref=contexto["candle_ref"], run_id=contexto["run_id"],
-                               motivo="CLOSED_M1_CHANGED")
+                               motivo="STALE")
+            self._evento_funil("paper_not_opened", simbolo, candidate_id=candidato,
+                               request_id=contexto.get("request_id"),
+                               candle_ref=contexto["candle_ref"], run_id=contexto["run_id"],
+                               motivo="STALE")
             self._publicar_motivo(simbolo, contexto["id"], "RESPONSE_DISCARDED_STALE",
-                                  "candle M1 mudou durante a espera da resposta JEv",
+                                  "candle M1/validade expirados antes da execução",
                                   candle_ref=contexto["candle_ref"],
-                                  candidate_id=contexto["padrao"], run_id=contexto["run_id"])
-            self.logger.info("resposta JEv descartada: candle vencido", simbolo=simbolo,
-                             run_id=contexto["run_id"], candle_ref=contexto["candle_ref"])
+                                  candidate_id=candidato, run_id=contexto["run_id"])
             self.estados_ativos[simbolo] = "STALE"
-            self.publicar("decisao", {**base, "decisao": "STALE",
-                                      "estado_api": "DISCARDED_STALE",
-                                      "justificativa": "resposta recebida, mas o candle M1 mudou "
-                                                       "durante a espera; descartada com motivo",
-                                      "risco": "-", "policy": "STALE", "paper": "NOT_OPENED",
-                                      "execucao": "nenhuma"})
+            self._publicar_aprovacao(base, side, "EXPIRADO", "DISCARDED_STALE",
+                                     "resposta não executada: candle M1/validade expirados",
+                                     latencia_ms)
+            return
+
+        if (not isinstance(resposta, dict) or not isinstance(resposta.get("approved"), bool)
+                or not isinstance(resposta.get("reason"), str) or not resposta["reason"].strip()):
+            self._evento_funil("jev_error", simbolo, candidate_id=candidato,
+                               request_id=contexto.get("request_id"),
+                               candle_ref=contexto["candle_ref"], run_id=contexto["run_id"],
+                               motivo="PROTOCOL_ERROR")
+            self._evento_funil("paper_not_opened", simbolo, candidate_id=candidato,
+                               request_id=contexto.get("request_id"),
+                               candle_ref=contexto["candle_ref"], run_id=contexto["run_id"],
+                               motivo="JEV_ERROR")
+            self._publicar_motivo(simbolo, contexto["id"], "JEV_ERROR",
+                                  "resposta fora do protocolo binário",
+                                  candle_ref=contexto["candle_ref"],
+                                  candidate_id=candidato, run_id=contexto["run_id"])
+            self._publicar_aprovacao(base, side, "ERRO", "ERROR_PROTOCOL",
+                                     "resposta ambígua/legado; rejeitada pelo protocolo", latencia_ms)
             return
 
         self.estados_ativos[simbolo] = "JEV_RESPONSE"
-        self._evento_funil("response_accepted", simbolo,
-                           candidate_id=contexto["padrao"], request_id=contexto.get("request_id"),
-                           candle_ref=contexto["candle_ref"], run_id=contexto["run_id"],
-                           duracao_ms=latencia_ms)
         self.ultimos["decisao"] = self.relogio()
-        self.logger.info("decisão JEv recebida", simbolo=simbolo, acao=decisao.action,
-                         probabilidade=round(decisao.probability, 2),
-                         confianca=round(decisao.confidence, 2),
-                         analysis_id=contexto["id"], run_id=contexto["run_id"])
-        gate = risk.check(decisao, self.book, self.book.limits, atualizado)
-        acao = decisao.action
-        metadata = {"run_id": contexto["run_id"],
-                    "python_validated_at": contexto["python_validated_at"],
-                    "jev_dispatched_at": contexto["jev_dispatched_at"],
-                    "latencia_detecao_ms": contexto["latencia_detecao_ms"],
-                    "latencia_ms": latencia_ms}
-        if acao == "HOLD":
-            self._evento_funil("decision_hold", simbolo,
-                               candidate_id=contexto["padrao"], request_id=contexto.get("request_id"),
-                               candle_ref=contexto["candle_ref"], run_id=contexto["run_id"])
-            self._evento_funil("paper_not_opened", simbolo,
-                               candidate_id=contexto["padrao"], request_id=contexto.get("request_id"),
+        motivo_jev = str(resposta.get("reason") or "sem motivo")[:300]
+        if not resposta["approved"]:
+            self._evento_funil("jev_no", simbolo, candidate_id=candidato,
+                               request_id=contexto.get("request_id"),
                                candle_ref=contexto["candle_ref"], run_id=contexto["run_id"],
-                               motivo="JEv_HOLD")
-            self.contadores_ciclo["jev_hold"] = self.contadores_ciclo.get("jev_hold", 0) + 1
-            expira = self.relogio() + HOLD_TTL_S
-            self.holds[(simbolo, contexto["identificador"])] = expira
-            self.publicar("decisao", {**base, "decisao": "HOLD",
-                                      "justificativa": f"JEv HOLD p={decisao.probability:.0%} "
-                                                       f"c={decisao.confidence:.0%}; oportunidade adiada",
-                                      "risco": gate.reason or "aguardando", "policy": "HOLD",
-                                      "estado_api": "COMPLETED", "paper": "NOT_OPENED",
-                                      "execucao": f"adiada por até {HOLD_TTL_S // 60}min, depois descartada",
-                                      **metadata})
-            return
-        if acao == "AVOID":
-            self._evento_funil("decision_no", simbolo,
-                               candidate_id=contexto["padrao"], request_id=contexto.get("request_id"),
-                               candle_ref=contexto["candle_ref"], run_id=contexto["run_id"])
-            self._evento_funil("paper_not_opened", simbolo,
-                               candidate_id=contexto["padrao"], request_id=contexto.get("request_id"),
+                               motivo="JEV_REJECTED")
+            self._evento_funil("paper_not_opened", simbolo, candidate_id=candidato,
+                               request_id=contexto.get("request_id"),
                                candle_ref=contexto["candle_ref"], run_id=contexto["run_id"],
-                               motivo="JEv_AVOID")
-            self.contadores_ciclo["jev_nao"] = self.contadores_ciclo.get("jev_nao", 0) + 1
-            self.publicar("decisao", {**base, "decisao": "NAO",
-                                      "justificativa": f"JEv AVOID p={decisao.probability:.0%} "
-                                                       f"c={decisao.confidence:.0%}; candidata descartada",
-                                      "risco": gate.reason or "-", "execucao": "nenhuma",
-                                      "policy": "VETO", "estado_api": "COMPLETED",
-                                      "paper": "NOT_OPENED", **metadata})
+                               motivo="JEV_REJECTED")
+            self._publicar_motivo(simbolo, contexto["id"], "JEV_REJECTED", motivo_jev,
+                                  candle_ref=contexto["candle_ref"],
+                                  candidate_id=candidato, run_id=contexto["run_id"])
+            self._publicar_aprovacao(base, side, "NAO", "COMPLETED", motivo_jev, latencia_ms)
             return
-        self.contadores_ciclo["jev_sim"] = self.contadores_ciclo.get("jev_sim", 0) + 1
-        self._evento_funil("decision_buy" if acao == "BUY" else "decision_sell", simbolo,
-                           candidate_id=contexto["padrao"], request_id=contexto.get("request_id"),
-                           candle_ref=contexto["candle_ref"], run_id=contexto["run_id"])
-        if gate.verdict == "EXECUTE":
-            self.contadores_ciclo["executadas"] = self.contadores_ciclo.get("executadas", 0) + 1
-            payload = self.analises_memoria.get(simbolo) or {}
-            lado = (payload.get("buy") if acao == "BUY" else payload.get("sell")) or {}
-            self.book.execute(decisao, atualizado, gate, extra={
-                "candidate_id": contexto["padrao"], "candle_ref": contexto["candle_ref"],
-                "run_id": contexto["run_id"], "request_id": contexto.get("request_id"),
-                "spread_pct": payload.get("cost_spread_pct"),
-                "expected_net_pct": lado.get("expectancy_net_pct"),
-                "sample_size": lado.get("sample_size"), "oos_n": lado.get("oos_n"),
-                "fill_price": gate.entry, "fill_basis": "paper_bid_ask_mt5"})
-            self._evento_funil("paper_opened", simbolo,
-                               candidate_id=contexto["padrao"], request_id=contexto.get("request_id"),
-                               candle_ref=contexto["candle_ref"], run_id=contexto["run_id"])
-            self.book.update(self.fonte)
-            self._persistir()
-            self.ultimos["trade"] = self.relogio()
-            self.publicar("decisao", {**base, "decisao": "SIM", "direcao": acao,
-                                      "justificativa": f"JEv SIM p={decisao.probability:.0%} "
-                                                       f"c={decisao.confidence:.0%}; padrão validado",
-                                      "risco": f"autorizado; risco {_fmt_num(gate.risk_amount, 2)} {self.book.currency}",
-                                      "policy": "ALLOW", "estado_api": "COMPLETED", "paper": "OPENED",
-                                      "execucao": f"paper aberto: {gate.volume:g} lote(s) a {gate.entry:.8g}; stop {gate.stop:.8g}; alvo {gate.target:.8g}",
-                                      **metadata})
-            self.publicar("trades", list(reversed(self.book.trades[-500:])))
-            self.logger.info("entrada paper aberta", simbolo=simbolo, volume=gate.volume,
-                             entrada=round(gate.entry, 8), analysis_id=contexto["id"],
-                             padrao=contexto["padrao"], candle_ref=contexto["candle_ref"])
-            return
-        self.contadores_ciclo["risco_bloqueado"] = \
-            self.contadores_ciclo.get("risco_bloqueado", 0) + 1
-        self._evento_funil("risk_veto", simbolo,
-                           candidate_id=contexto["padrao"], request_id=contexto.get("request_id"),
-                           candle_ref=contexto["candle_ref"], run_id=contexto["run_id"],
-                           motivo=gate.reason or "RISK_VETO")
-        self._evento_funil("paper_not_opened", simbolo,
-                           candidate_id=contexto["padrao"], request_id=contexto.get("request_id"),
-                           candle_ref=contexto["candle_ref"], run_id=contexto["run_id"],
-                           motivo=gate.reason or "RISK_VETO")
-        self.publicar("decisao", {**base, "decisao": f"JEV_{acao}_RISK_BLOCKED", "direcao": acao,
-                                  "justificativa": f"JEv {acao} p={decisao.probability:.0%} "
-                                                   f"c={decisao.confidence:.0%}; recusado pelo risco",
-                                  "risco": f"não autorizado: {gate.reason}",
-                                  "policy": "VETO", "estado_api": "COMPLETED", "paper": "NOT_OPENED",
-                                  "decisao_jev": acao,
-                                  "execucao": "nenhuma", **metadata})
-        self.logger.info("entrada recusada pelo gate de risco", simbolo=simbolo,
-                         motivo=gate.reason or "-")
 
-    # ------------------------------------------------------------- comandos
+        # Aprovado: revalidar risco imediatamente antes de executar (PAPER).
+        gate = risk.pre_check(side, self.book, self.book.limits, atualizado)
+        if gate.verdict != "EXECUTE":
+            self._evento_funil("post_risk_reject", simbolo, candidate_id=candidato,
+                               request_id=contexto.get("request_id"),
+                               candle_ref=contexto["candle_ref"], run_id=contexto["run_id"],
+                               motivo=gate.reason or "RISK_REJECTED_POST_JEV")
+            self._evento_funil("paper_not_opened", simbolo, candidate_id=candidato,
+                               request_id=contexto.get("request_id"),
+                               candle_ref=contexto["candle_ref"], run_id=contexto["run_id"],
+                               motivo="RISK_REJECTED_POST_JEV")
+            self._publicar_motivo(simbolo, contexto["id"], "RISK_REJECTED_POST_JEV",
+                                  gate.reason or "risco mudou após a aprovação",
+                                  candle_ref=contexto["candle_ref"],
+                                  candidate_id=candidato, run_id=contexto["run_id"])
+            self._publicar_aprovacao(base, side, "SIM", "COMPLETED",
+                                     f"JEv aprovou, mas risco pós-veto: {gate.reason}",
+                                     latencia_ms, risco=gate.reason)
+            return
+
+        aprovacao = Decision(simbolo, side, None, None, "python",
+                             {"aprovacao_jev": motivo_jev})
+        self._evento_funil("jev_yes", simbolo, candidate_id=candidato,
+                           request_id=contexto.get("request_id"),
+                           candle_ref=contexto["candle_ref"], run_id=contexto["run_id"],
+                           motivo="JEV_APPROVED", side=side)
+        self.book.execute(aprovacao, atualizado, gate, extra={
+            "candidate_id": candidato, "candle_ref": contexto["candle_ref"],
+            "run_id": contexto["run_id"], "request_id": contexto.get("request_id"),
+            "side_proposed": side, "spread_pct": proposta.get("spread"),
+            "expected_net_pct": proposta.get("expectancy_net_pct"),
+            "sample_size": proposta.get("sample_size"), "oos_n": proposta.get("oos_n"),
+            "jev_reason": motivo_jev, "fill_price": gate.entry,
+            "fill_basis": "paper_bid_ask_mt5"})
+        self._evento_funil("paper_opened", simbolo, candidate_id=candidato,
+                           request_id=contexto.get("request_id"),
+                           candle_ref=contexto["candle_ref"], run_id=contexto["run_id"],
+                           motivo="PAPER_OPENED", side=side, volume=gate.volume)
+        self.book.update(self.fonte)
+        self._persistir()
+        self.ultimos["trade"] = self.relogio()
+        self._publicar_aprovacao(base, side, "SIM", "COMPLETED", motivo_jev,
+                                 latencia_ms,
+                                 risco=f"autorizado; risco {_fmt_num(gate.risk_amount, 2)} {self.book.currency}",
+                                 paper="OPENED",
+                                 execucao=(f"paper aberto: {gate.volume:g} lote(s) a "
+                                           f"{gate.entry:.8g}; stop {gate.stop:.8g}; alvo {gate.target:.8g}"))
+        self.publicar("trades", list(reversed(self.book.trades[-500:])))
+        self.logger.info("entrada paper aberta", simbolo=simbolo, side=side,
+                         volume=gate.volume, entrada=round(gate.entry, 8),
+                         analysis_id=contexto["id"], run_id=contexto["run_id"])
+
+    def _propor_entrada(self, simbolo, dados, analise):
+        """Direção determinística do Python a partir das hipóteses quantitativas."""
+        itens = [(r, v) for r, v in dados.get("candidatos", [])]
+        itens += [(r, v) for r, v, _o in dados.get("revalidacoes", [])]
+        if not itens:
+            return None
+
+        def chave(item):
+            regra, validacao = item
+            total = validacao.get("total") or {}
+            oos = validacao.get("oos") or {}
+            return (validacao.get("status") == "validado",
+                    total.get("media_pct") if total.get("media_pct") is not None else -1e9,
+                    oos.get("taxa") if oos.get("taxa") is not None else -1)
+
+        regra, validacao = max(itens, key=chave)
+        direcao = regra.get("direcao")
+        if direcao not in ("BUY", "SELL"):
+            return None
+        return {"side_proposed": direcao,
+                "strategy_id": regra.get("strategy_id", regra.get("tipo_regra")),
+                "candidate_id": regra.get("strategy_id", regra.get("tipo_regra")),
+                "status": validacao.get("status"),
+                "expectancy_net_pct": (validacao.get("total") or {}).get("media_pct"),
+                "sample_size": (validacao.get("total") or {}).get("eventos"),
+                "oos_n": (validacao.get("oos") or {}).get("eventos"),
+                "oos_rate": (validacao.get("oos") or {}).get("taxa"),
+                "reason_codes": validacao.get("reason_codes", [])}
+
+    def _montar_proposta(self, simbolo, proposta, estado, gate, analise,
+                         candle_ref, run_id, request_id):
+        """Payload imutável enviado ao JEv: entrada já decidida e pré-aprovada."""
+        return {"symbol": simbolo, "side_proposed": proposta["side_proposed"],
+                "entry_reference": gate.entry, "stop_loss": gate.stop,
+                "take_profit": gate.target, "volume": gate.volume,
+                "risk_amount": gate.risk_amount, "risk_pct": self.book.limits.risk_per_trade,
+                "spread": round(estado.ask - estado.bid, 10),
+                "candidate_id": proposta["candidate_id"], "request_id": request_id,
+                "run_id": run_id, "candle_ref": candle_ref,
+                "expires_at": candle_ref + CANDLE_TTL_S,
+                "evidencias": {"strategy_id": proposta["strategy_id"],
+                               "status_python": proposta["status"],
+                               "expectancy_net_pct": proposta["expectancy_net_pct"],
+                               "sample_size": proposta["sample_size"],
+                               "oos_n": proposta["oos_n"], "oos_rate": proposta["oos_rate"],
+                               "reason_codes": proposta["reason_codes"],
+                               "data_quality": (analise.get("history") or {}).get("data_quality"),
+                               "evento": analise.get("evento")}}
+
     def _processar_acoes(self):
         while True:
             try:
@@ -1451,7 +1503,10 @@ class Orquestrador:
                                           "rejeitado_validacao", "elegiveis", "enviados_jev",
                                           "jev_sim", "jev_nao", "jev_hold", "executadas",
                                           "pre_bloqueado", "risco_bloqueado", "sem_padrao",
-                                          "hold_aguardando", "hold_expirado", "erros")
+                                          "hold_aguardando", "hold_expirado", "erros",
+                                          "quant_candidates", "pre_risk_pass", "pre_risk_reject",
+                                          "jev_enqueued", "jev_yes", "jev_no", "jev_error",
+                                          "post_risk_reject", "sem_entrada_python", "jev_expired")
                                           if self.contadores_ciclo.get(e)},
                                          "deepseek_calls": 0},
                                       "tempos": {chave: (round(self.relogio() - valor, 1) if valor else None)
@@ -1509,7 +1564,10 @@ class Orquestrador:
                      "validados_ativos", "elegiveis", "enviados_jev", "aguardando_decisao",
                      "jev_sim", "jev_nao", "jev_hold", "pre_bloqueado", "risco_bloqueado",
                      "contrato_invalido", "executadas", "hold_aguardando", "hold_expirado",
-                     "erros", "sem_padrao", "somente_monitorar")
+                     "erros", "sem_padrao", "somente_monitorar",
+                     "quant_candidates", "pre_risk_pass", "pre_risk_reject",
+                     "jev_enqueued", "jev_yes", "jev_no", "jev_error",
+                     "post_risk_reject", "sem_entrada_python", "jev_expired")
             funil = {etapa: self.contadores_ciclo[etapa] for etapa in FUNIL
                      if self.contadores_ciclo.get(etapa)}
             tempos = {chave: (round(self.relogio() - valor, 1) if valor else None)
@@ -2172,10 +2230,11 @@ class Orquestrador:
                 "aviso": "métricas informam a decisão; Python não veta por qualidade estatística"}
 
     def _despachar_analise(self, estado, dados, id_analise):
-        """Envia TODA análise calculada ao JEv; Python não descarta por atratividade."""
+        """Direção e risco são do Python; o JEv só aprova a entrada proposta."""
         simbolo = estado.symbol
         candle_ref = dados["candle_ref"]
-        self.analises_memoria[simbolo] = self._montar_analise(simbolo, dados)
+        analise = self._montar_analise(simbolo, dados)
+        self.analises_memoria[simbolo] = analise
         evento = dados.get("evento") or {}
         if evento.get("status") != "OK":
             self.contadores_ciclo["dados_insuficientes"] = \
@@ -2190,30 +2249,65 @@ class Orquestrador:
             self.contadores_ciclo["somente_monitorar"] = \
                 self.contadores_ciclo.get("somente_monitorar", 0) + 1
             return "somente_monitorar"
-        self._evento_funil("mathematical_edge_found", simbolo,
-                           candle_ref=candle_ref, motivo="ANALISE_COMPLETA")
+        self._evento_funil("quant_candidates", simbolo, candle_ref=candle_ref,
+                           motivo="ANALISE_PYTHON")
+        proposta = self._propor_entrada(simbolo, dados, analise)
+        if proposta is None:
+            self._evento_funil("sem_entrada_python", simbolo, candle_ref=candle_ref,
+                               motivo="SEM_HIPOTESE_DIRECIONAL")
+            self._publicar_motivo(simbolo, id_analise, "SEM_ENTRADA_PYTHON",
+                                  "sem hipótese direcional do Python", candle_ref=candle_ref)
+            self.estados_ativos[simbolo] = "REJECTED"
+            return "sem_entrada_python"
         if self.analisados_jev.get(simbolo) == candle_ref:
             self._evento_funil("queue_deduped", simbolo, candle_ref=candle_ref,
                                motivo="ANALISE_JA_ENVIADA")
             return "candle_ja_enviado"
-        self.analisados_jev[simbolo] = candle_ref
-        estado.mathematics = dict(estado.mathematics or {})
-        estado.mathematics["analise_matematica"] = self.analises_memoria[simbolo]
+        if self.proxima_tentativa_jev > self.relogio():
+            self._evento_funil("paper_not_opened", simbolo, candle_ref=candle_ref,
+                               motivo="JEV_BACKOFF")
+            self._publicar_motivo(simbolo, id_analise, "IA_INDISPONIVEL",
+                                  "recuo após erro de API; sem chamada nova",
+                                  candle_ref=candle_ref)
+            return "backoff"
+        side = proposta["side_proposed"]
+        gate = risk.pre_check(side, self.book, self.book.limits, estado)
+        if gate.verdict != "EXECUTE":
+            self.contadores_ciclo["risco_bloqueado"] = \
+                self.contadores_ciclo.get("risco_bloqueado", 0) + 1
+            self._evento_funil("pre_risk_reject", simbolo, candle_ref=candle_ref,
+                               side=side, motivo=gate.reason or "RISK_REJECTED_PRE_JEV")
+            self._evento_funil("paper_not_opened", simbolo, candle_ref=candle_ref,
+                               motivo="RISK_REJECTED_PRE_JEV")
+            self._publicar_motivo(simbolo, id_analise, "RISK_REJECTED_PRE_JEV",
+                                  gate.reason or "veto de risco pré-JEv", candle_ref=candle_ref)
+            self.estados_ativos[simbolo] = "REJECTED"
+            return "pre_risk_reject"
+        self._evento_funil("pre_risk_pass", simbolo, candle_ref=candle_ref, side=side,
+                           motivo="RISCO_OK", volume=gate.volume)
         run_id = getattr(self, "run_id_atual", id_analise)
-        instante = _agora_iso()
-        request_id = f"{run_id}:{simbolo}:analise:{candle_ref}"
-        registro_base = {"id": id_analise, "simbolo": simbolo, "instante": instante,
-                         "padrao": "analise", "candle_ref": candle_ref,
-                         "direcao": "ANALISE", "oportunidade": "análise matemática M1 completa"}
-        contexto = {"id": id_analise, "simbolo": simbolo, "estado": estado, "padrao": "analise",
-                    "identificador": f"analise@{candle_ref}", "candle_ref": candle_ref,
+        request_id = f"{run_id}:{simbolo}:{side}:{candle_ref}"
+        payload = self._montar_proposta(simbolo, proposta, estado, gate, analise,
+                                        candle_ref, run_id, request_id)
+        estado.mathematics = dict(estado.mathematics or {})
+        estado.mathematics["proposta_entrada"] = payload
+        registro_base = {"id": id_analise, "simbolo": simbolo, "instante": _agora_iso(),
+                         "padrao": proposta["candidate_id"], "candle_ref": candle_ref,
+                         "direcao": side, "side_proposed": side,
+                         "oportunidade": "entrada proposta pelo Python, pré-aprovada pelo risco"}
+        contexto = {"id": id_analise, "simbolo": simbolo, "estado": estado,
+                    "padrao": proposta["candidate_id"],
+                    "identificador": f"{side}@{candle_ref}", "candle_ref": candle_ref,
                     "request_id": request_id, "run_id": run_id,
                     "contadores": self.contadores_ciclo,
-                    "python_validated_at": instante, "jev_dispatched_at": instante,
-                    "latencia_detecao_ms": 0, "registro_base": registro_base}
-        meta = {"run_id": run_id, "symbol": simbolo, "candidate_id": "analise",
-                "candle_ref": candle_ref}
+                    "python_validated_at": _agora_iso(), "jev_dispatched_at": _agora_iso(),
+                    "latencia_detecao_ms": 0, "registro_base": registro_base,
+                    "proposta": payload}
+        meta = {"run_id": run_id, "symbol": simbolo,
+                "candidate_id": proposta["candidate_id"], "candle_ref": candle_ref,
+                "side": side, "proposta": payload}
         self.pendentes_jev[request_id] = contexto
+        self.analisados_jev[simbolo] = candle_ref
         if not self._enfileirar_jev(request_id, estado, meta):
             self.pendentes_jev.pop(request_id, None)
             self.estados_ativos[simbolo] = "PENDENTE_ENVIO"
@@ -2227,9 +2321,9 @@ class Orquestrador:
         self.contadores_ciclo["enviados_jev"] = self.contadores_ciclo.get("enviados_jev", 0) + 1
         self.contadores_ciclo["aguardando_decisao"] = \
             self.contadores_ciclo.get("aguardando_decisao", 0) + 1
-        self._evento_funil("queue_enqueued", simbolo, request_id=request_id,
-                           candle_ref=candle_ref)
-        self.logger.info("análise matemática despachada ao JEv", simbolo=simbolo,
+        self._evento_funil("jev_enqueued", simbolo, request_id=request_id,
+                           candle_ref=candle_ref, side=side, motivo="ENCAMINHADO")
+        self.logger.info("proposta encaminhada ao JEv", simbolo=simbolo, side=side,
                          run_id=run_id, request_id=request_id, candle_ref=candle_ref)
         return "enviado_jev"
 

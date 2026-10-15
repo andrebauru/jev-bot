@@ -271,8 +271,8 @@ class AbaOperacao(QWidget):
                                         "Custo", "Resultado"])
         self.lista_oportunidade = ListaAnalise(["Ativo", "Candle", "Estado matemático",
                                                 "Motivo", "ID ciclo"])
-        self.lista_decisao = ListaAnalise(["Ativo", "Enviado em", "Decisão", "Estado API",
-                                           "Motivo", "Latência", "Risco/Paper"])
+        self.lista_decisao = ListaAnalise(["Ativo", "Enviado em", "Aprovação JEv", "Estado API",
+                                           "Direção", "Motivo", "Latência"])
         self.painel_calc = PainelAnalise("CÁLCULOS PYTHON (por símbolo)", self.lista_calc)
         self.painel_oportunidade = PainelAnalise("OPORTUNIDADES — PYTHON QUANTITATIVO",
                                                  self.lista_oportunidade)
@@ -447,15 +447,15 @@ class AbaOperacao(QWidget):
         if sessao:
             detalhe += (
                 "\nSessão atual: "
-                f"candidatos {sessao.get('candidate_generated', 0)} · "
-                f"elegíveis {sessao.get('quant_validated', 0)} · "
-                f"enviados {sessao.get('queue_enqueued', 0)} · "
-                f"respostas {sessao.get('response_accepted', 0)} · "
-                f"BUY {sessao.get('decision_buy', 0)} / "
-                f"SELL {sessao.get('decision_sell', 0)} / "
-                f"HOLD {sessao.get('decision_hold', 0)} · "
-                f"paper {sessao.get('paper_opened', 0)} · "
-                f"não abertas {sessao.get('paper_not_opened', 0)}")
+                f"candidatos {sessao.get('quant_candidates', 0)} · "
+                f"pré-risco ok {sessao.get('pre_risk_pass', 0)} / "
+                f"veto {sessao.get('pre_risk_reject', 0)} · "
+                f"enviados {sessao.get('jev_enqueued', 0)} · "
+                f"SIM {sessao.get('jev_yes', 0)} / "
+                f"NÃO {sessao.get('jev_no', 0)} / "
+                f"ERRO {sessao.get('jev_error', 0)} · "
+                f"pós-risco veto {sessao.get('post_risk_reject', 0)} · "
+                f"paper {sessao.get('paper_opened', 0)}")
         nao_exec = diag.get("motivos_nao_execucao_top3") or []
         if nao_exec:
             detalhe += "\nNão execução (top 3): " + ", ".join(
@@ -570,23 +570,19 @@ class AbaOperacao(QWidget):
                               else None))
             elif canal == "decisao":
                 decisao = str(r.get("decisao") or "-")
-                cor = (VERDE if decisao == "SIM" else VERMELHO if decisao in ("NAO", "NÃO")
-                       else AMBAR if decisao == "HOLD"
-                       else VERMELHO if decisao.startswith("JEV_")
-                       else VERMELHO if decisao in ("ERRO_API", "ERRO_INTERNO")
-                       else AMBAR if decisao == "STALE" else CINZA)
-                if decisao not in ("SIM", "NAO", "NÃO", "HOLD", "STALE",
-                                   "ERRO_API", "ERRO_INTERNO") and not decisao.startswith("JEV_"):
-                    continue  # nunca exibe estado pendente como decisão do JEv
-                estado_api = r.get("estado_api") or r.get("policy") or "-"
+                cor = (VERDE if decisao == "SIM" else AMBAR if decisao == "EXPIRADO"
+                       else VERMELHO if decisao in ("NAO", "NÃO", "ERRO") else CINZA)
+                if decisao not in ("SIM", "NAO", "NÃO", "ERRO", "EXPIRADO"):
+                    continue  # PENDING/estado transitório nunca é decisão final
+                estado_api = r.get("estado_api") or "-"
+                direcao = r.get("side_proposed") or r.get("direcao") or "-"
                 itens.append((
                     [r.get("simbolo") or "-", _fmt_horario(r.get("instante")), decisao,
-                     estado_api,
+                     estado_api, direcao,
                      r.get("justificativa") or "-",
                      (f"{r.get('latencia_ms')} ms" if r.get("latencia_ms") is not None
                       else f"det.{r.get('latencia_detecao_ms')} ms"
-                      if r.get("latencia_detecao_ms") is not None else "-"),
-                     f"{r.get('risco') or '-'} | {r.get('execucao') or '-'}"], cor))
+                      if r.get("latencia_detecao_ms") is not None else "-")], cor))
             elif canal == "resumo":
                 oportunidades = r.get("oportunidades", 0)
                 funil = " → ".join(f"{etapa.split('_')[0]}:{qtd}" for etapa, qtd

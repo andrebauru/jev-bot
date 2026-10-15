@@ -44,24 +44,21 @@ class TestMatematicaLocal(unittest.TestCase):
     def test_oportunidade_por_matematica_chega_ao_jev_sem_padrao_persistido(self):
         with tempfile.TemporaryDirectory() as pasta:
             orch = self._orquestrador(pasta)
-            # Nenhum padrão persistido existe antes do ciclo.
             self.assertEqual(orch.repositorio.validados("TESTE"), [])
+            proposta = {"side_proposed": "BUY", "strategy_id": "s", "candidate_id": "s",
+                        "status": "validado", "expectancy_net_pct": 0.4,
+                        "sample_size": 10, "oos_n": 3, "oos_rate": 0.7, "reason_codes": []}
             with patch("jev_bot.deepseek.analisar",
                        side_effect=AssertionError("DeepSeek proibido")) as ds, \
-                    patch("jev_bot.orquestrador.jev.decide",
-                          return_value=Decision("TESTE", "BUY", .9, .9)) as jev:
+                    patch.object(Orquestrador, "_propor_entrada",
+                                 return_value=proposta), \
+                    patch("jev_bot.orquestrador.jev.avaliar_entrada",
+                          return_value={"approved": True, "reason": "ok"}) as jev:
                 orch._executar_ciclo("c1")
-                limite = time.monotonic() + 3
-                while (orch.analises_pendentes or orch.pendentes_jev) \
-                        and time.monotonic() < limite:
-                    orch._drenar_analises(f"ciclo{orch.ciclo}")
-                    orch._processar_resultados_jev()
-                    time.sleep(.005)
-                orch._processar_resultados_jev()
+                _drenar(orch)
             ds.assert_not_called()
             jev.assert_called_once()
             self.assertGreaterEqual(orch.contadores_ciclo.get("candidatos_locais", 0), 1)
-            self.assertGreaterEqual(orch.contadores_ciclo.get("buy_evaluated", 0), 1)
             self.assertEqual(len(orch.book.fills), 1)
             self.assertEqual(orch.book.fills[0].action, "BUY")
 
@@ -76,17 +73,18 @@ class TestMatematicaLocal(unittest.TestCase):
             orch = self._orquestrador(pasta)
             with patch("jev_bot.orquestrador.candidatos.regras_candidatas",
                        return_value=regras), \
-                    patch("jev_bot.orquestrador.jev.decide",
-                          return_value=Decision("TESTE", "HOLD", .5, .5)):
+                    patch("jev_bot.orquestrador.jev.avaliar_entrada",
+                          return_value={"approved": False, "reason": "sem evidencia"}):
                 orch._executar_ciclo("c1")
+                _drenar(orch)
             self.assertEqual(orch.contadores_ciclo.get("buy_evaluated"), 1)
             self.assertEqual(orch.contadores_ciclo.get("sell_evaluated"), 1)
             direcoes = {r.get("direcao") for c, r in orch.eventos if c == "calc"
                         and r.get("etapa") == "validacao_local"}
             self.assertEqual(direcoes, {"BUY", "SELL"})
 
-    def test_analise_sem_edge_e_enviada_ao_jev(self):
-        """Sem edge, a análise ainda é enviada; JEv decide e nada é fabricado."""
+    def test_sem_hipotese_direcional_nao_chama_jev(self):
+        """Sem direção do Python, o JEv não é chamado e nada é fabricado."""
         candles = [{"time": i * 60, "open": 100.0, "high": 100.01, "low": 99.99,
                     "close": 100.0, "tick_volume": 1} for i in range(3000)]
         with tempfile.TemporaryDirectory() as pasta:
@@ -107,14 +105,23 @@ class TestMatematicaLocal(unittest.TestCase):
                                    cotacoes={"TESTE": (99.995, 100.005, time.time())},
                                    janelas={"TESTE": janela(candles)})
             orch.fonte.janela_m1 = lambda simbolo, **_k: janela(candles)
-            with patch("jev_bot.orquestrador.jev.decide",
-                       return_value=Decision("TESTE", "HOLD", .5, .5)) as jev:
+            with patch.object(Orquestrador, "_propor_entrada", return_value=None), \
+                    patch("jev_bot.orquestrador.jev.avaliar_entrada") as jev:
                 orch._executar_ciclo("c1")
-            jev.assert_called()  # análise sem edge não é vetada pelo Python
+                _drenar(orch)
+            jev.assert_not_called()
             self.assertEqual(len(orch.book.fills), 0)
-            self.assertIn("TESTE", orch.analises_memoria)
-            self.assertEqual(orch.analises_memoria["TESTE"]["buy"]["estado"], "NENHUM_SETUP_ATIVO")
+            motivos = {r.get("motivo") for c, r in orch.eventos if c == "oportunidade"}
+            self.assertIn("SEM_ENTRADA_PYTHON", motivos)
 
+
+def _drenar(orch):
+    limite = time.monotonic() + 3
+    while (orch.analises_pendentes or orch.pendentes_jev) and time.monotonic() < limite:
+        orch._drenar_analises(f"ciclo{orch.ciclo}")
+        orch._processar_resultados_jev()
+        time.sleep(.005)
+    orch._processar_resultados_jev()
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

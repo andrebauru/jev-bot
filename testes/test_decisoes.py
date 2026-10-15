@@ -99,6 +99,14 @@ class TestDecisoesOperacionais(unittest.TestCase):
         orch.fonte.janela_m1 = Mock(return_value=janela(candles))
         return orch, candles, closes
 
+    def _drenar(self, orch):
+        limite = time.monotonic() + 3
+        while (orch.analises_pendentes or orch.pendentes_jev) and time.monotonic() < limite:
+            orch._drenar_analises(f"ciclo{orch.ciclo}")
+            orch._processar_resultados_jev()
+            time.sleep(.005)
+        orch._processar_resultados_jev()
+
     def _padrao_validado(self, orch, candles):
         validacao = padroes.validar(
             {"tipo_regra": "quedas_consecutivas", "parametros": {"n": 3},
@@ -210,12 +218,13 @@ class TestDecisoesOperacionais(unittest.TestCase):
             orch.deepseek_configurado = True
             orch.orcamento.permitir.return_value = (False, "Limite de chamadas DeepSeek por hora atingido")
             with patch("jev_bot.deepseek.analisar",
-                       side_effect=AssertionError("rate limit não pode chamar a API")), \
-                    patch("jev_bot.orquestrador.jev.decide",
-                          return_value=Decision("TESTE", "BUY", .9, .9)) as chamada_jev:
+                       side_effect=AssertionError("rate limit nao pode chamar a API")), \
+                    patch("jev_bot.orquestrador.jev.avaliar_entrada",
+                          return_value={"approved": True, "reason": "ok"}) as chamada_jev:
                 orch._executar_ciclo("c1")
-            chamada_jev.assert_called()  # padrão local validado chegou ao JEv
-            self.assertGreaterEqual(orch.contadores_ciclo.get("executadas", 0), 1)
+                self._drenar(orch)
+            chamada_jev.assert_called()  # hipotese do Python chegou ao JEv
+            self.assertGreaterEqual(orch.contadores_ciclo.get("paper_opened", 0), 1)
             locais = [r for c, r in orch.eventos if c == "calc"
                       and r.get("etapa") == "validacao_local"]
             self.assertTrue(locais, "candidatos locais devem ser gerados sem IA")
@@ -295,26 +304,26 @@ class TestGuiDecisoes(unittest.TestCase):
         aba = self._aba()
         registros = [
             {"id": "c1", "simbolo": "BTCUSD", "instante": "2026-01-01T00:00:00+00:00",
-             "padrao": "p1", "candle_ref": 1, "direcao": "BUY", "decisao": "SIM",
-             "oportunidade": "x", "justificativa": "j", "risco": "autorizado",
+             "padrao": "p1", "candle_ref": 1, "side_proposed": "BUY", "decisao": "SIM",
+             "estado_api": "COMPLETED", "justificativa": "j", "risco": "autorizado",
              "execucao": "paper aberto"},
             {"id": "c1", "simbolo": "ETHUSD", "instante": "2026-01-01T00:00:00+00:00",
-             "padrao": "p2", "candle_ref": 2, "direcao": "SELL", "decisao": "NAO",
-             "oportunidade": "y", "justificativa": "JEv AVOID", "risco": "-",
+             "padrao": "p2", "candle_ref": 2, "side_proposed": "SELL", "decisao": "NAO",
+             "estado_api": "COMPLETED", "justificativa": "evidencia fraca", "risco": "-",
              "execucao": "nenhuma"},
             {"id": "c1", "simbolo": "SOLUSD", "instante": "2026-01-01T00:00:00+00:00",
-             "padrao": "p3", "candle_ref": 3, "direcao": "BUY", "decisao": "HOLD",
-             "oportunidade": "z", "justificativa": "JEv HOLD", "risco": "aguardando",
-             "execucao": "adiada"},
+             "padrao": "p3", "candle_ref": 3, "side_proposed": "BUY", "decisao": "ERRO",
+             "estado_api": "ERROR_HTTP_429", "justificativa": "JEv indisponivel", "risco": "-",
+             "execucao": "nenhuma"},
         ]
         aba.receber_lote("decisao", registros)
         self.assertEqual(aba.lista_decisao.topLevelItemCount(), 3)
         ativos = [aba.lista_decisao.topLevelItem(i).text(0) for i in range(3)]
         decisoes = [aba.lista_decisao.topLevelItem(i).text(2) for i in range(3)]
         self.assertEqual(set(ativos), {"BTCUSD", "ETHUSD", "SOLUSD"})
-        self.assertEqual(set(decisoes), {"SIM", "NAO", "HOLD"})
+        self.assertEqual(set(decisoes), {"SIM", "NAO", "ERRO"})
         self.assertEqual(aba.lista_decisao.headerItem().text(0), "Ativo")
-        self.assertEqual(aba.lista_decisao.headerItem().text(5), "Latência")
+        self.assertEqual(aba.lista_decisao.headerItem().text(6), "Latência")
 
     def test_resumo_no_status_e_vazio_contextual(self):
         aba = self._aba()

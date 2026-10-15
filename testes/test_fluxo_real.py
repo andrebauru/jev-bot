@@ -68,7 +68,7 @@ class TestFluxoReal(unittest.TestCase):
         return [rejeitada, validada]
 
     def test_e2e_rejeitada_e_validada_ate_terceira_lista(self):
-        """(a) rejeitada na lista 2; (b) validada → JEv → paper → lista 3."""
+        """(a) hipotese rejeitada; (b) validada -> risco -> JEv -> paper -> lista 3."""
         with tempfile.TemporaryDirectory() as pasta:
             orch = self._orquestrador(pasta)
             candles = candles_deterministicos()
@@ -92,74 +92,69 @@ class TestFluxoReal(unittest.TestCase):
             orch.fonte.estados = estados_incrementais
             orch.fonte.janela_m1 = lambda simbolo, **_kwargs: (
                 janela(candles) if simbolo == "TESTE" else None)
-            decisao = Decision("TESTE", "BUY", .9, .9)
+            proposta = {"side_proposed": "BUY", "strategy_id": "s", "candidate_id": "s",
+                        "status": "validado", "expectancy_net_pct": 0.5,
+                        "sample_size": 10, "oos_n": 3, "oos_rate": 0.7, "reason_codes": []}
             with patch("jev_bot.deepseek.analisar",
                        side_effect=AssertionError("DeepSeek desativado")) as chamada_ds, \
-                     patch("jev_bot.orquestrador.jev.decide",
-                           side_effect=lambda estado: (ordem.append(f"jev:{estado.symbol}") or decisao)) as chamada_jev:
+                    patch.object(Orquestrador, "_propor_entrada",
+                                 return_value=proposta), \
+                    patch("jev_bot.orquestrador.jev.avaliar_entrada",
+                          side_effect=lambda p: (ordem.append("jev:TESTE")
+                                                 or {"approved": True, "reason": "ok"})) as chamada_jev:
                 orch._executar_ciclo("c1")
             chamada_ds.assert_not_called()
             chamada_jev.assert_called_once()
-            self.assertIn("jev:TESTE", ordem,
-                          "candidato elegível deve ser despachado no ciclo, sem fabricar decisão")
-            # (a) padrão local sem ocorrências é rejeitado e registrado.
+            self.assertIn("jev:TESTE", ordem)
             registros_padrao = orch.repositorio.carregar("TESTE")["padroes"]
             self.assertTrue(any(p["status"] == "rejeitado" for p in registros_padrao))
-            # (b) hipótese validada e entrada paper executada.
             fills = orch.book.fills
             self.assertEqual(len(fills), 1)
             self.assertEqual(fills[0].action, "BUY")
-            self.assertEqual(fills[0].mode if hasattr(fills[0], "mode") else "paper", "paper")
             decisoes = [r for c, r in orch.eventos if c == "decisao"]
             sims = [r for r in decisoes if r.get("decisao") == "SIM"]
             self.assertEqual(len(sims), 1)
             self.assertIn("paper aberto", sims[0]["execucao"])
-            self.assertIn(sims[0]["decisao"], ("SIM", "NAO", "HOLD"))
+            self.assertEqual(sims[0]["side_proposed"], "BUY")
             self.assertTrue(sims[0]["run_id"])
             self.assertTrue(sims[0]["python_validated_at"])
             self.assertTrue(sims[0]["jev_dispatched_at"])
             self.assertGreaterEqual(sims[0]["latencia_detecao_ms"], 0)
             self.assertGreaterEqual(sims[0]["latencia_ms"], 0)
-            # Motivos resumidos: rejeição estatística distinta de erro técnico.
             resumos = [r for c, r in orch.eventos if c == "resumo"]
             self.assertTrue(resumos)
-            self.assertIn("executadas=1", resumos[0]["motivos"])
-            self.assertIn("enviados_jev=1", resumos[0]["motivos"])
-            # Chegada comprovada na lista exclusiva de decisões JEv.
+            self.assertIn("paper_opened=1", resumos[0]["motivos"])
+            self.assertIn("jev_enqueued=1", resumos[0]["motivos"])
             self._comprovar_terceira_lista(decisoes)
 
     def test_worker_jev_buy_revalida_e_abre_paper(self):
-        """Despacho assíncrono real do motor, resposta mockada, gate e paper."""
+        """Despacho assincrono real, aprovacao binaria mockada e paper."""
         with tempfile.TemporaryDirectory() as pasta:
             orch = self._orquestrador(pasta)
             candles = candles_deterministicos()
             regra = {"tipo_regra": "quedas_consecutivas", "parametros": {"n": 3},
                      "direcao": "BUY", "horizonte_minutos": 5,
-                     "justificativa": "regra local sintética validada"}
+                     "justificativa": "regra local sintetica validada"}
             validacao = padroes.validar(regra, candles, 0.02)
             self.assertEqual(validacao["status"], "validado", validacao["motivo"])
             orch.repositorio.registrar("TESTE", regra, validacao, "local", janela(candles))
-            orch.dados_ativo["TESTE"] = {
-                "instante": time.time(),
-                "stats": {"disponivel": True, "candles": len(candles), "dias": 30,
-                          "movimento_1min": {"mediana_pct": 0.01}},
-                "custo_pct": 0.02, "tail": candles[-720:],
-            }
-            closes = [c["close"] for c in candles[-100:]]
-            estado = estado_mt5("TESTE", closes=closes)
-            estado.candles[-1]["time"] = candles[-1]["time"]
+            estado = estado_mt5("TESTE", closes=[c["close"] for c in candles[-100:]])
             orch.fonte.estados = lambda: iter([estado])
             resolvida = threading.Event()
+            proposta = {"side_proposed": "BUY", "strategy_id": "s", "candidate_id": "s",
+                        "status": "validado", "expectancy_net_pct": 0.5,
+                        "sample_size": 10, "oos_n": 3, "oos_rate": 0.7, "reason_codes": []}
 
-            def jev_mock(_estado):
+            def jev_mock(_proposta):
                 resolvida.set()
-                return Decision("TESTE", "BUY", .9, .9)
+                return {"approved": True, "reason": "ok"}
 
             with patch("jev_bot.deepseek.analisar",
                        side_effect=AssertionError("DeepSeek proibido")) as deepseek_call, \
-                    patch("jev_bot.orquestrador.jev.decide", side_effect=jev_mock) as jev_call:
+                    patch.object(Orquestrador, "_propor_entrada", return_value=proposta), \
+                    patch("jev_bot.orquestrador.jev.avaliar_entrada", side_effect=jev_mock) as jev_call:
                 orch._ciclo()
-                self.assertTrue(resolvida.wait(2), "worker não chamou o mock JEv")
+                self.assertTrue(resolvida.wait(2), "worker nao chamou o mock JEv")
                 limite = time.monotonic() + 2
                 while orch.pendentes_jev and time.monotonic() < limite:
                     orch._processar_resultados_jev()
@@ -168,55 +163,54 @@ class TestFluxoReal(unittest.TestCase):
             jev_call.assert_called_once()
             deepseek_call.assert_not_called()
             self.assertEqual(len(orch.book.fills), 1)
+            self.assertEqual(orch.book.fills[0].action, "BUY")
             opened = [r for c, r in orch.eventos if c == "decisao" and r.get("decisao") == "SIM"]
             self.assertEqual(len(opened), 1)
             self.assertEqual(opened[0]["simbolo"], "TESTE")
+            self.assertEqual(opened[0]["side_proposed"], "BUY")
             self.assertTrue(opened[0]["run_id"])
             self.assertTrue(opened[0]["candle_ref"])
             self.assertGreaterEqual(opened[0]["latencia_ms"], 0)
-            self.assertEqual(orch.funil_total["queue_enqueued"], 1)
+            self.assertEqual(orch.funil_total["jev_enqueued"], 1)
             self.assertEqual(orch.funil_total["worker_dequeued"], 1)
             self.assertEqual(orch.funil_total["jev_response_received"], 1)
-            self.assertEqual(orch.funil_total["response_accepted"], 1)
+            self.assertEqual(orch.funil_total["jev_yes"], 1)
             self.assertEqual(orch.funil_total["paper_opened"], 1)
             trace = [e["etapa"] for e in orch.funil_eventos
                      if e.get("run_id") == opened[0]["run_id"]]
-            required_order = ("quant_validated", "eligible_for_jev", "queue_enqueue_attempt",
-                              "queue_enqueued", "worker_dequeued", "jev_request_started",
-                              "jev_http_success", "jev_response_received", "response_accepted",
-                              "decision_buy", "paper_opened")
+            required_order = ("quant_candidates", "pre_risk_pass", "jev_enqueued",
+                              "worker_dequeued", "jev_request_started",
+                              "jev_http_success", "jev_response_received",
+                              "jev_yes", "paper_opened")
             positions = [trace.index(stage) for stage in required_order]
             self.assertEqual(positions, sorted(positions), trace)
 
     def test_worker_jev_sell_revalida_e_abre_paper(self):
-        """A resposta SELL percorre o mesmo worker, revalidação e gate paper."""
+        """A direcao SELL do Python percorre o mesmo worker ate o paper."""
         with tempfile.TemporaryDirectory() as pasta:
             orch = self._orquestrador(pasta)
             candles = candles_deterministicos()
             regra = {"tipo_regra": "quedas_consecutivas", "parametros": {"n": 2},
                      "direcao": "SELL", "horizonte_minutos": 5,
-                     "justificativa": "regra local sintética validada"}
+                     "justificativa": "regra local sintetica validada"}
             validacao = padroes.validar(regra, candles, 0.02)
             self.assertEqual(validacao["status"], "validado", validacao["motivo"])
             orch.repositorio.registrar("TESTE", regra, validacao, "local", janela(candles))
-            orch.dados_ativo["TESTE"] = {
-                "instante": time.time(),
-                "stats": {"disponivel": True, "candles": len(candles), "dias": 30,
-                          "movimento_1min": {"mediana_pct": 0.01}},
-                "custo_pct": 0.02, "tail": candles[-720:],
-            }
             estado = estado_mt5("TESTE", closes=[c["close"] for c in candles[-100:]])
-            estado.candles[-1]["time"] = candles[-1]["time"]
             orch.fonte.estados = lambda: iter([estado])
             respondeu = threading.Event()
+            proposta = {"side_proposed": "SELL", "strategy_id": "s", "candidate_id": "s",
+                        "status": "validado", "expectancy_net_pct": 0.5,
+                        "sample_size": 10, "oos_n": 3, "oos_rate": 0.7, "reason_codes": []}
 
-            def jev_sell(_estado):
+            def jev_sell(_proposta):
                 respondeu.set()
-                return Decision("TESTE", "SELL", .9, .9)
+                return {"approved": True, "reason": "ok"}
 
             with patch("jev_bot.deepseek.analisar",
                        side_effect=AssertionError("DeepSeek proibido")), \
-                    patch("jev_bot.orquestrador.jev.decide", side_effect=jev_sell):
+                    patch.object(Orquestrador, "_propor_entrada", return_value=proposta), \
+                    patch("jev_bot.orquestrador.jev.avaliar_entrada", side_effect=jev_sell):
                 orch._ciclo()
                 self.assertTrue(respondeu.wait(2))
                 limite = time.monotonic() + 2
@@ -280,8 +274,8 @@ class TestFluxoReal(unittest.TestCase):
             self.assertEqual(orch.contadores_ciclo.get("sem_padrao"), 1)
             # Com candidatos locais validados, o JEv pode ser consultado; o
             # que não pode acontecer é entrada sem padrão validado e sem gate.
-            with patch("jev_bot.orquestrador.jev.decide",
-                       return_value=Decision("TESTE", "HOLD", .5, .5)) as chamada:
+            with patch("jev_bot.orquestrador.jev.avaliar_entrada",
+                       return_value={"approved": False, "reason": "sem evidencia"}) as chamada:
                 orch._executar_ciclo("c1")
             self.assertEqual(len(orch.book.fills), 0)
             if orch.repositorio.validados("TESTE"):
