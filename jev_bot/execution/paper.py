@@ -201,8 +201,13 @@ class Book:
             self.drawdown_blocked = True
         self.last_equity = equity
 
-    def execute(self, decision, state, gate):
-        """Registra entrada paper com volume, margem, stop e alvo aprovados."""
+    def execute(self, decision, state, gate, extra=None):
+        """Registra entrada paper com volume, margem, stop e alvo aprovados.
+
+        `extra` carrega identificadores do funil (run_id, candidate_id,
+        candle de referência) e a expectativa prevista, para auditar
+        previsto vs realizado sem misturar simulação com produção.
+        """
         if not self.active or gate.verdict != "EXECUTE":
             raise RuntimeError("Entrada paper não autorizada pelo controle de risco.")
         p = Fill(state.symbol, decision.action, gate.entry, gate.volume, gate.stop,
@@ -210,7 +215,8 @@ class Book:
                  trade_id=uuid4().hex, opened_at=datetime.now(timezone.utc).isoformat())
         self.fills.append(p)
         self.trades.append({**asdict(p), "status": "OPEN", "mode": "paper",
-                            "confidence": decision.confidence, "probability": decision.probability})
+                            "confidence": decision.confidence, "probability": decision.probability,
+                            **(extra or {})})
         self.log.append({**asdict(p), "event": "open", "risk": p.risk_amount, "time": p.opened_at})
         return p
 

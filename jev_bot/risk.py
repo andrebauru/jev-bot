@@ -48,8 +48,17 @@ class Gate:
     margin: float = 0.0
 
 
+def _numero_valido(valor):
+    """Dado numérico presente e finito; `None`/NaN são rejeitados explicitamente."""
+    return (isinstance(valor, (int, float)) and not isinstance(valor, bool)
+            and math.isfinite(valor))
+
+
 def bloqueio_spread(state, limits):
     """Compartilha a verificação de custo entre diagnóstico e autorização de entrada."""
+    if not (_numero_valido(state.ask) and _numero_valido(state.bid)
+            and _numero_valido(state.price) and _numero_valido(state.stop_distance)):
+        return "Spread elevado ou inválido"
     spread = state.ask - state.bid
     if (state.price <= 0 or state.stop_distance <= 0 or not math.isfinite(spread)
             or spread < 0 or spread / state.price > limits.max_spread_fraction
@@ -68,7 +77,9 @@ def check(decision: Decision, book, limits: Limits, state: MarketState, agora=No
         return recusar(f"{decision.action} não executa")
     if decision.source != "jev" or decision.symbol != state.symbol or state.source != "MT5":
         return recusar("Origem ou símbolo inválido")
-    if any(not math.isfinite(v) or not 0 <= v <= 1 for v in (decision.confidence, decision.probability)):
+    if not (_numero_valido(decision.confidence) and _numero_valido(decision.probability)):
+        return recusar("Confiança/probabilidade ausente ou inválida")
+    if any(not 0 <= v <= 1 for v in (decision.confidence, decision.probability)):
         return recusar("Confiança/probabilidade inválida")
     if decision.confidence < limits.min_confidence or decision.probability < limits.min_probability:
         return recusar("Confiança/probabilidade abaixo do limite")
@@ -92,7 +103,7 @@ def check(decision: Decision, book, limits: Limits, state: MarketState, agora=No
     valores = (state.price, state.bid, state.ask, state.stop_distance,
                state.loss_per_lot, state.margin_per_lot, state.volume_min,
                state.volume_max, state.volume_step, state.tick_time)
-    if any(not math.isfinite(v) or v <= 0 for v in valores):
+    if any(not _numero_valido(v) or v <= 0 for v in valores):
         return recusar("Dados de preço/contrato/risco inválidos")
     idade = (time.time() if agora is None else agora) - state.tick_time
     if not 0 <= idade <= 120:

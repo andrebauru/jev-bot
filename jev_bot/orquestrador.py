@@ -39,8 +39,10 @@ import copy
 import json
 import math
 import queue
+import sys
 import threading
 import time
+import traceback
 
 from . import cache_m1, candidatos, configuracao, jev, logs, mercados, padroes, risk
 from .markets import FonteMT5
@@ -98,6 +100,15 @@ LOTE_DOWNLOAD = 4320         # candles por chamada ao terminal (3 dias)
 
 def _agora_iso():
     return datetime.now(timezone.utc).isoformat()
+
+
+def _fmt_num(valor, nd=4):
+    """Número legível; `None` é dado ausente e vira N/D (nunca zero inventado)."""
+    if valor is None:
+        return "N/D"
+    if isinstance(valor, (int, float)):
+        return f"{float(valor):.{nd}g}" if nd else f"{float(valor):g}"
+    return str(valor)
 
 
 class Coalescedor:
@@ -221,6 +232,10 @@ class Orquestrador:
         self.prazo_scan = None
         self.pendentes_ciclo = []
         self.contadores_ciclo = {}
+        # Sessão separada dos acumulados: zera ao reiniciar o motor, nunca
+        # mistura histórico persistido com a execução corrente.
+        self.contadores_sessao = Counter()
+        self.sessao_rejeicoes = {}   # código -> [quantidade, exemplo_simbolo]
 
     def _evento_funil(self, etapa, simbolo="", *, candidate_id=None,
                       request_id=None, candle_ref=None, motivo=None,
@@ -234,6 +249,7 @@ class Orquestrador:
                   "motivo": motivo, **metricas}
         self.funil_eventos.append(evento)
         self.funil_total[etapa] += 1
+        self.contadores_sessao[etapa] += 1
         if self.contadores_ciclo is not None:
             self.contadores_ciclo[etapa] = self.contadores_ciclo.get(etapa, 0) + 1
         if motivo and etapa in ("candidate_rejected", "ineligible_for_jev", "queue_full",
@@ -270,14 +286,18 @@ class Orquestrador:
                               "SPREAD_TOO_HIGH": "VETO_RISCO",
                               "RISK_BLOCK": "VETO_RISCO"}.get(codigo, codigo)
                 self.funil_rejeicoes[codigo] += 1
+                self._contar_nao_execucao(codigo, simbolo)
                 if run_id:
                     self.funil_rejeicoes_por_run.setdefault(run_id, Counter())[codigo] += 1
                 for extra_code in dict.fromkeys(metricas.get("reason_codes") or ()):
                     if extra_code == codigo:
                         continue
                     self.funil_rejeicoes[extra_code] += 1
+                    self._contar_nao_execucao(extra_code, simbolo)
                     if run_id:
                         self.funil_rejeicoes_por_run.setdefault(run_id, Counter())[extra_code] += 1
+        if etapa == "paper_not_opened" and motivo:
+            self._contar_nao_execucao(str(motivo), simbolo)
         if simbolo:
             ativo = self.funil_por_ativo.setdefault(simbolo, {})
             ativo[etapa] = ativo.get(etapa, 0) + 1
@@ -310,8 +330,18 @@ class Orquestrador:
                      "response_discarded_run_mismatch", "response_discarded_duplicate",
                      "decision_buy", "decision_sell", "decision_hold", "risk_veto",
                      "paper_opened", "paper_not_opened", "calculations_started",
-                     "calculations_completed", "history_ready", "mathematical_edge_found"}:
+                     "calculations_completed", "history_ready", "mathematical_edge_found",
+                "decision_apply_error"}:
             self.logger.info("funil " + etapa, **campos)
+
+    def _contar_nao_execucao(self, codigo, simbolo):
+        """Motivos de n?o execu??o da sess?o, com quantidade e exemplo de s?mbolo."""
+        if not codigo:
+            return
+        entrada = self.sessao_rejeicoes.setdefault(codigo, [0, simbolo or "-"])
+        entrada[0] += 1
+        if entrada[1] == "-" and simbolo:
+            entrada[1] = simbolo
 
     # ------------------------------------------------------------------ API
     def iniciar(self):
@@ -547,27 +577,45 @@ class Orquestrador:
                     self._estado_set("PRONTO", "Conectado; autostart avaliado")
                     self._avaliar_autostart("bootstrap")
                 self.descarregar()
+                erros_consecutivos = 0
                 while not self.encerrar.is_set():
-                    self._processar_acoes()
-                    self._monitorar()
-                    self.descarregar()
-                    if self.encerrar.is_set() or self.pausado or self.parado_risco or self.emergencia_ativa:
+                    try:
+                        self._processar_acoes()
+                        self._monitorar()
+                        self.descarregar()
+                        if self.encerrar.is_set() or self.pausado or self.parado_risco or self.emergencia_ativa:
+                            self.encerrar.wait(0.5)
+                            continue
+                        if self.selecao.vazia():
+                            self._aguardar_selecao()
+                            continue
+                        if self._aguardar_slot():
+                            continue
+                        if self.pausado or self.parado_risco or self.emergencia_ativa:
+                            continue
+                        self._ciclo()
+                        erros_consecutivos = 0
+                    except (KeyboardInterrupt, SystemExit):
+                        raise
+                    except Exception as exc:  # recuperável: registra e segue o loop
+                        erros_consecutivos += 1
+                        self.logger.erro("erro recuperável no loop do motor",
+                                         detalhe=str(exc)[:160], consecutive=erros_consecutivos,
+                                         traceback=traceback.format_exc()[-900:])
+                        self.publicar("log", {"instante": _agora_iso(), "nivel": "aviso",
+                                              "mensagem": f"Erro recuperável no ciclo: {str(exc)[:120]}"})
+                        self.descarregar()
+                        if erros_consecutivos >= 30:
+                            raise RuntimeError(
+                                f"Falha sistêmica persistente no loop: {str(exc)[:120]}") from exc
                         self.encerrar.wait(0.5)
-                        continue
-                    if self.selecao.vazia():
-                        self._aguardar_selecao()
-                        continue
-                    if self._aguardar_slot():
-                        continue
-                    if self.pausado or self.parado_risco or self.emergencia_ativa:
-                        continue
-                    self._ciclo()
             finally:
                 self._estado_set("ENCERRANDO", "Salvando carteira paper")
                 gerenciador.__exit__(None, None, None)
         except (RuntimeError, OSError, ValueError, TypeError, AttributeError) as exc:
             self.erro = str(exc) or "Falha controlada no MT5 ou banco local."
-            self.logger.erro("falha fatal do motor", detalhe=self.erro)
+            self.logger.erro("falha fatal do motor", detalhe=self.erro,
+                             traceback=traceback.format_exc()[-1200:])
             self.publicar("log", {"instante": _agora_iso(), "nivel": "erro", "mensagem": self.erro})
             self._estado_set("ERRO", self.erro)
         finally:
@@ -755,6 +803,20 @@ class Orquestrador:
                                        motivo="RUN_ID_MISMATCH", response_run_id=result_run_id)
                 else:
                     self._finalizar_decisao_jev(contexto, decisao, erro, latencia_ms)
+            except Exception:  # falha recuperável: nunca derruba o loop por um evento
+                self.logger.erro("falha ao finalizar decisão JEv", simbolo=contexto["simbolo"],
+                                 run_id=contexto["run_id"], request_id=request_id,
+                                 detalhe=str(sys.exc_info()[1])[:160],
+                                 traceback=traceback.format_exc()[-800:])
+                self._evento_funil("decision_apply_error", contexto["simbolo"],
+                                   candidate_id=contexto["padrao"], request_id=request_id,
+                                   candle_ref=contexto["candle_ref"], run_id=contexto["run_id"],
+                                   motivo="DECISION_APPLY_ERROR")
+                self.publicar("decisao", {**contexto["registro_base"], "instante": _agora_iso(),
+                                          "decisao": "ERRO_INTERNO", "estado_api": "ERROR_DECISION_APPLY",
+                                          "justificativa": "falha interna ao aplicar a resposta; "
+                                                           "nenhuma ordem paper foi enviada",
+                                          "risco": "-", "policy": "ERROR", "paper": "NOT_OPENED"})
             finally:
                 contexto["contadores"]["aguardando_decisao"] = max(
                     0, contexto["contadores"].get("aguardando_decisao", 0) - 1)
@@ -808,6 +870,12 @@ class Orquestrador:
                 self._publicar_motivo(simbolo, contexto["id"], "FILA_BLOQUEADA", code,
                                       candle_ref=contexto["candle_ref"],
                                       candidate_id=contexto["padrao"], run_id=contexto["run_id"])
+                self.publicar("decisao", {**base, "decisao": "ERRO_API",
+                                          "estado_api": "ERROR_QUEUE_TTL_EXPIRED",
+                                          "justificativa": "análise expirou na fila antes do envio; "
+                                                           "não é decisão do JEv",
+                                          "risco": "-", "policy": "ERROR", "paper": "NOT_OPENED",
+                                          "execucao": "nenhuma"})
                 return
             self.contadores_ciclo["ia_indisponivel"] = \
                 self.contadores_ciclo.get("ia_indisponivel", 0) + 1
@@ -820,6 +888,12 @@ class Orquestrador:
             self._publicar_motivo(simbolo, contexto["id"], "ERRO_API", code,
                                   candle_ref=contexto["candle_ref"],
                                   candidate_id=contexto["padrao"], run_id=contexto["run_id"])
+            self.publicar("decisao", {**base, "decisao": "ERRO_API",
+                                      "estado_api": f"ERROR_{code}",
+                                      "justificativa": f"JEv indisponível ({stage}); decisão ausente, "
+                                                       "nunca mascarada como HOLD",
+                                      "risco": "-", "policy": "ERROR", "paper": "NOT_OPENED",
+                                      "execucao": "nenhuma"})
             self.logger.aviso("JEv indisponível", simbolo=simbolo,
                               run_id=contexto["run_id"], request_id=contexto.get("request_id"),
                               error_code=code, error_stage=stage)
@@ -841,6 +915,12 @@ class Orquestrador:
             self.logger.info("resposta JEv descartada: candle vencido", simbolo=simbolo,
                              run_id=contexto["run_id"], candle_ref=contexto["candle_ref"])
             self.estados_ativos[simbolo] = "STALE"
+            self.publicar("decisao", {**base, "decisao": "STALE",
+                                      "estado_api": "DISCARDED_STALE",
+                                      "justificativa": "resposta recebida, mas o candle M1 mudou "
+                                                       "durante a espera; descartada com motivo",
+                                      "risco": "-", "policy": "STALE", "paper": "NOT_OPENED",
+                                      "execucao": "nenhuma"})
             return
 
         self.estados_ativos[simbolo] = "JEV_RESPONSE"
@@ -874,8 +954,8 @@ class Orquestrador:
             self.publicar("decisao", {**base, "decisao": "HOLD",
                                       "justificativa": f"JEv HOLD p={decisao.probability:.0%} "
                                                        f"c={decisao.confidence:.0%}; oportunidade adiada",
-                                      "risco": gate.reason or "aguardando", "policy": "PENDING",
-                                      "paper": "NOT_OPENED",
+                                      "risco": gate.reason or "aguardando", "policy": "HOLD",
+                                      "estado_api": "COMPLETED", "paper": "NOT_OPENED",
                                       "execucao": f"adiada por até {HOLD_TTL_S // 60}min, depois descartada",
                                       **metadata})
             return
@@ -892,7 +972,8 @@ class Orquestrador:
                                       "justificativa": f"JEv AVOID p={decisao.probability:.0%} "
                                                        f"c={decisao.confidence:.0%}; candidata descartada",
                                       "risco": gate.reason or "-", "execucao": "nenhuma",
-                                      "policy": "VETO", "paper": "NOT_OPENED", **metadata})
+                                      "policy": "VETO", "estado_api": "COMPLETED",
+                                      "paper": "NOT_OPENED", **metadata})
             return
         self.contadores_ciclo["jev_sim"] = self.contadores_ciclo.get("jev_sim", 0) + 1
         self._evento_funil("decision_buy" if acao == "BUY" else "decision_sell", simbolo,
@@ -900,7 +981,15 @@ class Orquestrador:
                            candle_ref=contexto["candle_ref"], run_id=contexto["run_id"])
         if gate.verdict == "EXECUTE":
             self.contadores_ciclo["executadas"] = self.contadores_ciclo.get("executadas", 0) + 1
-            self.book.execute(decisao, atualizado, gate)
+            payload = self.analises_memoria.get(simbolo) or {}
+            lado = (payload.get("buy") if acao == "BUY" else payload.get("sell")) or {}
+            self.book.execute(decisao, atualizado, gate, extra={
+                "candidate_id": contexto["padrao"], "candle_ref": contexto["candle_ref"],
+                "run_id": contexto["run_id"], "request_id": contexto.get("request_id"),
+                "spread_pct": payload.get("cost_spread_pct"),
+                "expected_net_pct": lado.get("expectancy_net_pct"),
+                "sample_size": lado.get("sample_size"), "oos_n": lado.get("oos_n"),
+                "fill_price": gate.entry, "fill_basis": "paper_bid_ask_mt5"})
             self._evento_funil("paper_opened", simbolo,
                                candidate_id=contexto["padrao"], request_id=contexto.get("request_id"),
                                candle_ref=contexto["candle_ref"], run_id=contexto["run_id"])
@@ -910,8 +999,8 @@ class Orquestrador:
             self.publicar("decisao", {**base, "decisao": "SIM", "direcao": acao,
                                       "justificativa": f"JEv SIM p={decisao.probability:.0%} "
                                                        f"c={decisao.confidence:.0%}; padrão validado",
-                                      "risco": f"autorizado; risco {gate.risk_amount:.2f} {self.book.currency}",
-                                      "policy": "ALLOW", "paper": "OPENED",
+                                      "risco": f"autorizado; risco {_fmt_num(gate.risk_amount, 2)} {self.book.currency}",
+                                      "policy": "ALLOW", "estado_api": "COMPLETED", "paper": "OPENED",
                                       "execucao": f"paper aberto: {gate.volume:g} lote(s) a {gate.entry:.8g}; stop {gate.stop:.8g}; alvo {gate.target:.8g}",
                                       **metadata})
             self.publicar("trades", list(reversed(self.book.trades[-500:])))
@@ -933,7 +1022,7 @@ class Orquestrador:
                                   "justificativa": f"JEv {acao} p={decisao.probability:.0%} "
                                                    f"c={decisao.confidence:.0%}; recusado pelo risco",
                                   "risco": f"não autorizado: {gate.reason}",
-                                  "policy": "VETO", "paper": "NOT_OPENED",
+                                  "policy": "VETO", "estado_api": "COMPLETED", "paper": "NOT_OPENED",
                                   "decisao_jev": acao,
                                   "execucao": "nenhuma", **metadata})
         self.logger.info("entrada recusada pelo gate de risco", simbolo=simbolo,
@@ -1240,6 +1329,11 @@ class Orquestrador:
             "motivos_rejeicao_top3": [
                 {"codigo": k, "quantidade": v}
                 for k, v in self.funil_rejeicoes.most_common(3)],
+            "sessao": dict(sorted(self.contadores_sessao.items())),
+            "motivos_nao_execucao_top3": [
+                {"codigo": k, "quantidade": qtd, "exemplo_simbolo": exemplo}
+                for k, (qtd, exemplo) in sorted(self.sessao_rejeicoes.items(),
+                                                key=lambda kv: -kv[1][0])[:3]],
             "motivos_codigo": {code: self.funil_rejeicoes.get(code, 0) for code in (
                 "SEM_SETUP", "SEM_DADOS", "SEM_ELEGIBILIDADE", "FILA_BLOQUEADA",
                 "IA_INDISPONIVEL", "SEM_DECISAO", "VETO_RISCO", "NO_MATHEMATICAL_EDGE",
@@ -1365,6 +1459,7 @@ class Orquestrador:
                             "pendentes": len(self.pendentes_ciclo),
                             "jev_pendentes": jev_pendentes,
                             "ativos": self.funil_por_run.get(run_id, {}),
+                            "sessao": dict(sorted(self.contadores_sessao.items())),
                             "motivos_rejeicao_top3": [
                                 {"codigo": k, "quantidade": v}
                                 for k, v in self.funil_rejeicoes_por_run.get(run_id, Counter()).most_common(3)],
@@ -1428,6 +1523,7 @@ class Orquestrador:
                                          "oportunidades": self.contadores_ciclo.get("enviados_jev", 0),
                                          "motivos": resumo or "sem candidatos monitorados",
                                          "funil": {**funil, "deepseek_calls": 0},
+                                         "sessao": dict(sorted(self.contadores_sessao.items())),
                                          "tempos": tempos,
                                          "pendentes": len(self.pendentes_ciclo),
                                          "duracao_s": duracao})
@@ -2171,12 +2267,14 @@ class Orquestrador:
                 self._publicar_motivo(simbolo, id_ciclo, codigo,
                                       retorno or "sem candidato elegível",
                                       candle_ref=dados.get("candle_ref"))
-            except (RuntimeError, ValueError, KeyError) as exc:
+            except Exception as exc:  # erro recuperável: registra e continua o ciclo
                 codigo_erro = ("COST_UNKNOWN" if "COST_UNKNOWN" in str(exc)
                                else "SEM_ELEGIBILIDADE")
+                self.estados_ativos[simbolo] = "ERROR"
                 self._publicar_motivo(simbolo, id_ciclo, codigo_erro, str(exc)[:160])
                 self.logger.erro("falha ao aplicar análise", simbolo=simbolo,
-                                 detalhe=str(exc)[:160])
+                                 detalhe=str(exc)[:160],
+                                 traceback=traceback.format_exc()[-800:])
             finally:
                 self.run_id_atual = run_id_salvo
                 self.processados_ciclo.add(simbolo)
@@ -2787,16 +2885,27 @@ class Orquestrador:
     # ------------------------------------------------------------- utilidades
     @staticmethod
     def _texto_hipotese(hipotese):
-        params = ", ".join(f"{k}={v:g}" for k, v in hipotese["parametros"].items())
+        params = ", ".join(f"{k}={v}" for k, v in hipotese["parametros"].items())
         return f"{hipotese['tipo_regra']}({params}) → {hipotese['direcao']} em {hipotese['horizonte_minutos']}min"
 
     @staticmethod
     def _texto_validacao(validacao):
+        def _pct(valor):
+            # `None` é dado ausente, não zero: exibe N/D em vez de fabricar número.
+            return f"{valor:.0%}" if isinstance(valor, (int, float)) else "N/D"
+
         total, oos = validacao["total"], validacao["oos"]
         if total["eventos"] == 0:
             return f"sem ocorrências | custo {validacao.get('custo_pct', 0)}%"
-        return (f"eventos {total['eventos']}, taxa {total['taxa']:.0%}, média {total['media_pct']}% | "
-                f"OOS {oos['eventos']}, taxa {oos['taxa']:.0%}, média {oos['media_pct']}% | "
+        if oos["eventos"] == 0:
+            return (f"eventos {total['eventos']}, taxa {_pct(total['taxa'])}, "
+                    f"média {_fmt_num(total['media_pct'])}% | "
+                    f"OOS sem eventos (amostra insuficiente) | "
+                    f"custo/spread {validacao.get('custo_pct', 0)}% | "
+                    f"motivo {validacao.get('reason_code', validacao.get('motivo', '-'))}")
+        return (f"eventos {total['eventos']}, taxa {_pct(total['taxa'])}, "
+                f"média {_fmt_num(total['media_pct'])}% | "
+                f"OOS {oos['eventos']}, taxa {_pct(oos['taxa'])}, média {_fmt_num(oos['media_pct'])}% | "
                 f"custo/spread {validacao.get('custo_pct', 0)}% | "
                 f"motivo {validacao.get('reason_code', validacao.get('motivo', '-'))}")
 

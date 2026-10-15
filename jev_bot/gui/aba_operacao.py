@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from datetime import datetime, timezone
 
 from PySide6.QtCore import Qt, QSettings
@@ -35,7 +36,21 @@ ESTADOS_CHIP = {
 
 
 def _fmt_moeda(valor, moeda=""):
+    if not isinstance(valor, (int, float)) or isinstance(valor, bool) \
+            or not math.isfinite(valor):
+        return f"N/D {moeda}".strip()
     return f"{valor:,.2f} {moeda}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def _num(valor, formato="g"):
+    """Formato numérico seguro: `None`/não numérico vira N/D (dado ausente)."""
+    if not isinstance(valor, (int, float)) or isinstance(valor, bool) \
+            or not math.isfinite(valor):
+        return "N/D"
+    try:
+        return f"{valor:{formato}}"
+    except (ValueError, TypeError):
+        return "N/D"
 
 
 def _fmt_horario(iso):
@@ -428,13 +443,32 @@ class AbaOperacao(QWidget):
             f"p50 {diag.get('pool_matematico', {}).get('duracao_p50_ms')} ms | "
             f"p95 {diag.get('pool_matematico', {}).get('duracao_p95_ms')} ms\n"
             "Custo da validação: spread observado; comissão/slippage não estimados")
+        sessao = diag.get("sessao") or {}
+        if sessao:
+            detalhe += (
+                "\nSessão atual: "
+                f"candidatos {sessao.get('candidate_generated', 0)} · "
+                f"elegíveis {sessao.get('quant_validated', 0)} · "
+                f"enviados {sessao.get('queue_enqueued', 0)} · "
+                f"respostas {sessao.get('response_accepted', 0)} · "
+                f"BUY {sessao.get('decision_buy', 0)} / "
+                f"SELL {sessao.get('decision_sell', 0)} / "
+                f"HOLD {sessao.get('decision_hold', 0)} · "
+                f"paper {sessao.get('paper_opened', 0)} · "
+                f"não abertas {sessao.get('paper_not_opened', 0)}")
+        nao_exec = diag.get("motivos_nao_execucao_top3") or []
+        if nao_exec:
+            detalhe += "\nNão execução (top 3): " + ", ".join(
+                f"{m.get('codigo')}={m.get('quantidade', 0)} ({m.get('exemplo_simbolo', '-')})"
+                for m in nao_exec)
         self.diagnostico_funil.setText(compacto)
         self.diagnostico_funil.setToolTip(detalhe)
         self._preencher_atividade(diag.get("atividade") or [])
         exposicao = m.get("exposicao", 0)
         self._definir("exposicao_txt", f"{_fmt_moeda(exposicao, moeda)} "
-                                       f"({m.get('exposicao_fracao', 0):.1%})")
-        self._definir("drawdown_txt", f"atual {m.get('drawdown', 0):.2%} | máx {m.get('drawdown_max', 0):.2%}")
+                                       f"({_num(m.get('exposicao_fracao'), '.1%')})")
+        self._definir("drawdown_txt", f"atual {_num(m.get('drawdown'), '.2%')} | "
+                                      f"máx {_num(m.get('drawdown_max'), '.2%')}")
         self._definir("posicoes", str(m.get("posicoes", 0)))
         limites = m.get("limites", {})
         if limites and not self.lim_trades.hasFocus() and not self.lim_total.hasFocus() and not self.lim_dd.hasFocus():
@@ -444,8 +478,10 @@ class AbaOperacao(QWidget):
         conta = m.get("conta")
         if conta:
             self.conta_real.setText(
-                f"CONTA REAL MT5 ({conta.get('currency', '')}): saldo {conta.get('balance', 0):,.2f} | "
-                f"equity {conta.get('equity', 0):,.2f} | P&L {conta.get('profit', 0):+,.2f}")
+                f"CONTA REAL MT5 ({conta.get('currency', '')}): "
+                f"saldo {_num(conta.get('balance'), ',.2f')} | "
+                f"equity {_num(conta.get('equity'), ',.2f')} | "
+                f"P&L {_num(conta.get('profit'), '+,.2f')}")
         if m.get("parado_risco"):
             self.mensagem.setText(f"PARADO POR RISCO: {m.get('motivo_risco', '')} "
                                   "Análises e entradas suspensas. Libere manualmente após revisão.")
@@ -475,7 +511,10 @@ class AbaOperacao(QWidget):
             return
         rotulo = self.valores[chave]
         rotulo.setText(_fmt_moeda(valor, moeda))
-        cor = VERDE if valor > 0 else VERMELHO if valor < 0 else "#e6edf7"
+        if not isinstance(valor, (int, float)) or isinstance(valor, bool):
+            cor = "#e6edf7"  # dado ausente: neutro, nunca cor de lucro/prejuízo
+        else:
+            cor = VERDE if valor > 0 else VERMELHO if valor < 0 else "#e6edf7"
         rotulo.setStyleSheet(f"color:{cor}; font-weight:600; font-size:11pt;")
 
     def receber_estado(self, registro):
@@ -533,12 +572,16 @@ class AbaOperacao(QWidget):
                 decisao = str(r.get("decisao") or "-")
                 cor = (VERDE if decisao == "SIM" else VERMELHO if decisao in ("NAO", "NÃO")
                        else AMBAR if decisao == "HOLD"
-                       else VERMELHO if decisao.startswith("JEV_") else CINZA)
-                if decisao not in ("SIM", "NAO", "NÃO", "HOLD") and not decisao.startswith("JEV_"):
+                       else VERMELHO if decisao.startswith("JEV_")
+                       else VERMELHO if decisao in ("ERRO_API", "ERRO_INTERNO")
+                       else AMBAR if decisao == "STALE" else CINZA)
+                if decisao not in ("SIM", "NAO", "NÃO", "HOLD", "STALE",
+                                   "ERRO_API", "ERRO_INTERNO") and not decisao.startswith("JEV_"):
                     continue  # nunca exibe estado pendente como decisão do JEv
+                estado_api = r.get("estado_api") or r.get("policy") or "-"
                 itens.append((
                     [r.get("simbolo") or "-", _fmt_horario(r.get("instante")), decisao,
-                     r.get("policy") or "-",
+                     estado_api,
                      r.get("justificativa") or "-",
                      (f"{r.get('latencia_ms')} ms" if r.get("latencia_ms") is not None
                       else f"det.{r.get('latencia_detecao_ms')} ms"
@@ -613,9 +656,10 @@ class AbaOperacao(QWidget):
             except (TypeError, ValueError):
                 horario = "-"
             valores = [horario, trade.get("symbol", ""),
-                       trade.get("action", ""), f"{trade.get('volume', 0):g}",
-                       f"{trade.get('entry', 0):.8g}", f"{saida:.8g}" if saida else "-",
-                       f"{lucro:+,.2f}", f"{percentual:+.1f}%", _fmt_duracao(trade),
+                       trade.get("action", ""), _num(trade.get("volume")),
+                       _num(trade.get("entry"), ".8g"), _num(saida, ".8g") if saida else "-",
+                       _num(lucro, "+,.2f"), (_num(percentual, "+.1f") + "%"),
+                       _fmt_duracao(trade),
                        trade.get("mode", "paper"),
                        trade.get("reason", "aberta") if not aberto else "-",
                        trade.get("status", "")]

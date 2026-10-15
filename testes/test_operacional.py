@@ -491,7 +491,10 @@ class TestCiclosMulti(unittest.TestCase):
                 orch._processar_resultados_jev()
             self.assertEqual(len(orch.book.fills), 0)
             self.assertEqual(orch.funil_total["response_discarded_stale"], 1)
-            self.assertFalse(any(c == "decisao" for c, _ in orch.eventos))
+            # A resposta tardia é publicada com estado explícito de descarte,
+            # nunca como decisão do JEv (SIM/NAO/HOLD) nem como ordem.
+            decisoes = [r.get("decisao") for c, r in orch.eventos if c == "decisao"]
+            self.assertEqual(decisoes, ["STALE"])
 
     def test_fila_jev_cheia_nao_inventa_decisao(self):
         """Backpressure bloqueia a oportunidade com motivo, sem fabricar HOLD."""
