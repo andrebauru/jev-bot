@@ -63,8 +63,8 @@ class AbaConfiguracao(QWidget):
         linha_modelo.addWidget(rotulo_modelo)
         linha_modelo.addWidget(self.campo_modelo, 1)
         layout_or.addLayout(linha_modelo)
-        endpoint = QLabel(f"Endpoint fixo: {configuracao.ENDPOINT_CHAT_PADRAO} | "
-                          "chave nunca aparece em logs")
+        endpoint = QLabel(f"Endpoint JEv (aprovação binária): "
+                          f"{configuracao.ENDPOINT_JEV_PADRAO} | chave nunca aparece em logs")
         endpoint.setStyleSheet("color:#8ea3c8;")
         layout_or.addWidget(endpoint)
         linha_botoes = QHBoxLayout()

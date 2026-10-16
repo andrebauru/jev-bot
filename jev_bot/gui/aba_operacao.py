@@ -399,8 +399,15 @@ class AbaOperacao(QWidget):
         self._cor_valor("aberto", m.get("aberto", 0), moeda)
         diag = m.get("diagnostico_funil") or {}
         totais = diag.get("totais") or {}
-        decisoes = sum(totais.get(k, 0) for k in
-                       ("decision_buy", "decision_sell", "decision_hold", "decision_no"))
+        # Contadores do fluxo binário atual (o JEv só aprova/reprova).
+        sim = totais.get("jev_yes", 0)
+        nao = totais.get("jev_no", 0)
+        erro = totais.get("jev_error", 0)
+        expirado = totais.get("jev_expired", 0)
+        pre_ok = totais.get("pre_risk_pass", 0)
+        pre_veto = totais.get("pre_risk_reject", 0)
+        sem_entrada = totais.get("sem_entrada_python", 0)
+        decisoes = sim + nao + erro
         motivos = diag.get("motivos_rejeicao_top3") or []
         top = ", ".join(f"{r.get('codigo')}:{r.get('quantidade', 0)}" for r in motivos) or "nenhum"
         codigos = diag.get("motivos_codigo") or {}
@@ -418,10 +425,12 @@ class AbaOperacao(QWidget):
         compacto = (f"Funil: sel {totais.get('symbol_selected', 0)} · "
                     f"dados {totais.get('symbol_available_mt5', 0)} · "
                     f"candidatos {totais.get('candidate_generated', 0)} · "
-                    f"env {totais.get('queue_enqueued', 0)} · "
+                    f"pré {pre_ok}ok/{pre_veto}veto · "
+                    f"env {totais.get('jev_enqueued', 0)} · "
                     f"JEv {totais.get('jev_request_started', 0)} · "
                     f"resp {totais.get('jev_response_received', 0)} · "
-                    f"decisões {decisoes} · paper {totais.get('paper_opened', 0)} · "
+                    f"SIM {sim}/NÃO {nao}/ERRO {erro} · exp {expirado} · "
+                    f"paper {totais.get('paper_opened', 0)} · "
                     f"calc {diag.get('analises_pendentes', 0)}/{diag.get('max_parallel_symbols', 0)} · "
                     f"pico {diag.get('pool_matematico', {}).get('pico_concorrencia', 0)}")
         detalhe = (
@@ -430,11 +439,14 @@ class AbaOperacao(QWidget):
             f"operáveis {totais.get('symbol_operable', 0)} → "
             f"dados válidos {totais.get('symbol_available_mt5', 0)} → "
             f"candidatos {totais.get('candidate_generated', 0)} → "
-            f"elegíveis {totais.get('quant_validated', 0)} → "
-            f"enfileirados {totais.get('queue_enqueued', 0)} → "
+            f"propostas direcionais {totais.get('side_proposed', 0)} "
+            f"(sem hipótese {sem_entrada}) → "
+            f"pré-risco ok {pre_ok} / veto {pre_veto} → "
+            f"enfileirados {totais.get('jev_enqueued', 0)} → "
             f"chamadas JEv {totais.get('jev_request_started', 0)} → "
             f"respostas {totais.get('jev_response_received', 0)} → "
-            f"decisões {decisoes} → paper {totais.get('paper_opened', 0)}\n"
+            f"SIM {sim} / NÃO {nao} / ERRO {erro} / EXPIRADO {expirado} → "
+            f"paper {totais.get('paper_opened', 0)}\n"
             f"Rejeições mais comuns: {top} | códigos: {categorias} | último envio: {envio_txt} | "
             f"idade da fila: {diag.get('idade_fila_s', 0):g}s | última resposta: {resposta_txt}\n"
             f"Pool matemático: {diag.get('max_parallel_symbols', 0)} workers | "

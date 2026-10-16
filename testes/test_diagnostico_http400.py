@@ -318,6 +318,26 @@ class TestBotaoOpenRouter(unittest.TestCase):
             self.assertFalse(dados["ok"])
             self.assertEqual(dados["http_status"], status)
 
+    def test_compacto_usa_contadores_do_fluxo_binario(self):
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+        QApplication.instance() or QApplication([])
+        from jev_bot.gui.aba_operacao import AbaOperacao
+        aba = AbaOperacao(acoes={k: (lambda: None) for k in
+                                 ("iniciar", "pausar", "retomar", "emergencia",
+                                  "liberar_risco", "aplicar_limites", "cancelar_ciclo")})
+        aba.receber_metricas({"estado": "AGUARDANDO", "diagnostico_funil": {
+            "totais": {"jev_enqueued": 79, "jev_request_started": 79,
+                       "jev_response_received": 79, "jev_yes": 1, "jev_no": 77,
+                       "jev_error": 1, "jev_expired": 3, "pre_risk_pass": 4,
+                       "pre_risk_reject": 2, "sem_entrada_python": 1, "paper_opened": 1},
+            "pool_matematico": {}, "analises_pendentes": 0, "max_parallel_symbols": 4}})
+        texto = aba.diagnostico_funil.text()
+        self.assertIn("env 79", texto)
+        self.assertIn("SIM 1/NÃO 77/ERRO 1", texto)
+        self.assertIn("exp 3", texto)
+        self.assertIn("pré 4ok/2veto", texto)
+
     def test_botao_isolado_do_motor(self):
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
         from PySide6.QtWidgets import QApplication
