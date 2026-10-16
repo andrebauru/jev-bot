@@ -141,3 +141,66 @@ def testar_mt5(caminho, timeout=60):
 def testar_openrouter(chave=None, modelo=None):
     """Retém a assinatura antiga sem chamar DeepSeek/OpenRouter."""
     return {"ok": False, "erro": "Teste DeepSeek desativado; nenhuma chamada de rede foi feita."}
+
+
+JID_DIAGNOSTICO = {
+    "symbol": "DIAGNOSTICO", "side_proposed": "BUY", "entry_reference": 1.0,
+    "stop_loss": 0.99, "take_profit": 1.01, "volume": 0.01, "risk_amount": 0.01,
+    "risk_pct": 0.01, "spread": 0.0001, "candidate_id": "diagnostico",
+    "request_id": "diagnostico", "run_id": "diagnostico", "candle_ref": 0,
+    "expires_at": 0, "evidencias": {"origem": "teste_local_de_conexao"},
+}
+
+
+def validar_openrouter_local():
+    """Diagnóstico local (sem rede): chave, endpoint, modelo e payload binário."""
+    import os
+    from urllib.parse import urlparse
+    from .. import jev as _jev
+    etapas = [("provider", os.environ.get("AI_PROVIDER", "openrouter").strip().lower())]
+    etapas.append(("chave", "presente" if os.environ.get("OPENROUTER_API_KEY", "").strip()
+                   else "ausente"))
+    try:
+        _chave, endpoint = _jev.configuracao()
+        host = urlparse(endpoint).hostname or "?"
+        etapas.append(("endpoint", host))
+        modelo = os.environ.get("OPENROUTER_MODEL", "typesafe/jev-1.13").strip()
+        etapas.append(("modelo", modelo))
+        _jev.validar_proposta(dict(JID_DIAGNOSTICO))
+        etapas.append(("payload_binario", "ok"))
+        return {"ok": True, "status": "PRONTO", "remoto": False, "etapas": etapas,
+                "endpoint_host": host, "modelo": modelo}
+    except RuntimeError as exc:
+        return {"ok": False, "status": "FALHA", "remoto": False, "etapas": etapas,
+                "erro": str(exc)[:200]}
+    except _jev.JevError as exc:
+        return {"ok": False, "status": "FALHA", "remoto": False, "etapas": etapas,
+                "erro": exc.resumo()[:200]}
+
+
+def testar_openrouter_remoto(timeout=20):
+    """Teste remoto OPT-IN da aprovação binária. Pode consumir créditos.
+
+    Nunca é chamado automaticamente; o usuário confirma na interface. Não cria
+    ordens, não enfileira candidatos e não altera contadores do motor.
+    """
+    from .. import jev as _jev
+    local = validar_openrouter_local()
+    if not local["ok"]:
+        return local
+    try:
+        resultado = _jev.avaliar_entrada(dict(JID_DIAGNOSTICO))
+    except _jev.JevError as exc:
+        return {"ok": False, "status": "FALHA", "remoto": True, "etapas": local["etapas"],
+                "endpoint_host": local["endpoint_host"], "modelo": local["modelo"],
+                "http_status": exc.http_status, "codigo": exc.code,
+                "erro_tipo": exc.error_type, "erro_mensagem": exc.error_message,
+                "erro": exc.resumo()[:300]}
+    except Exception as exc:  # nunca derruba a GUI por erro inesperado
+        return {"ok": False, "status": "FALHA", "remoto": True, "etapas": local["etapas"],
+                "endpoint_host": local["endpoint_host"], "modelo": local["modelo"],
+                "erro": f"{type(exc).__name__}: {str(exc)[:200]}"}
+    return {"ok": True, "status": "OK", "remoto": True, "etapas": local["etapas"],
+            "endpoint_host": local["endpoint_host"], "modelo": local["modelo"],
+            "latencia_ms": resultado.get("latencia_ms"),
+            "resposta": {"approved": resultado["approved"], "reason": resultado["reason"]}}

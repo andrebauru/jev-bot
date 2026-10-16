@@ -118,6 +118,21 @@ def _fmt_num(valor, nd=4):
     return str(valor)
 
 
+def _resumo_erro_jev(erro):
+    """Resumo sanitizado de um erro de transporte JEv (arquivo/estágio/mensagem)."""
+    partes = [str(erro.get("code") or "JEV_CLIENT_ERROR")]
+    status = erro.get("http_status")
+    if status:
+        partes.append(f"HTTP {status}")
+    if erro.get("error_type"):
+        partes.append(f"type={erro['error_type']}")
+    if erro.get("error_code"):
+        partes.append(f"code={erro['error_code']}")
+    if erro.get("error_message"):
+        partes.append(str(erro["error_message"]))
+    return " | ".join(partes)[:400]
+
+
 class Coalescedor:
     """Agrupa publicações: listas com teto por canal e registros únicos.
 
@@ -751,7 +766,11 @@ class Orquestrador:
                 resposta = None
                 erro = {"code": getattr(exc, "code", "JEV_CLIENT_ERROR"),
                         "stage": getattr(exc, "stage", "http_error"),
-                        "http_success": bool(getattr(exc, "http_success", False))}
+                        "http_success": bool(getattr(exc, "http_success", False)),
+                        "http_status": getattr(exc, "http_status", None),
+                        "error_type": getattr(exc, "error_type", None),
+                        "error_code": getattr(exc, "error_code", None),
+                        "error_message": getattr(exc, "error_message", None)}
                 etapa = ("jev_timeout" if erro["stage"] == "timeout" else
                          "jev_parse_error" if erro["stage"] == "parse_error" else
                          "jev_http_error")
@@ -867,13 +886,15 @@ class Orquestrador:
         self.publicar("resumo", dict(resumo))
 
     def _publicar_aprovacao(self, base, side, decisao, estado_api, motivo,
-                            latencia_ms=None, risco=None, paper="NOT_OPENED", execucao="nenhuma"):
+                            latencia_ms=None, risco=None, paper="NOT_OPENED", execucao="nenhuma",
+                            detalhes=None):
         """Publica a linha de aprovação JEv (nunca PENDING como decisão final)."""
         self.publicar("decisao", {**base, "direcao": side, "side_proposed": side,
                                   "decisao": decisao, "estado_api": estado_api,
                                   "justificativa": motivo or "-",
                                   "risco": risco or "-", "policy": decisao,
                                   "paper": paper, "execucao": execucao,
+                                  "detalhes": detalhes or {},
                                   "latencia_ms": latencia_ms})
 
     def _finalizar_decisao_jev(self, contexto, resposta, erro, latencia_ms):
@@ -900,22 +921,36 @@ class Orquestrador:
                                          "análise expirou na fila antes do envio", latencia_ms)
                 return
             self.proxima_tentativa_jev = self.relogio() + TENTATIVA_JEV_S
+            detalhe_erro = _resumo_erro_jev(erro)
             self._evento_funil("jev_error", simbolo, candidate_id=candidato,
                                request_id=contexto.get("request_id"),
                                candle_ref=contexto["candle_ref"], run_id=contexto["run_id"],
-                               motivo=code, error_stage=stage)
+                               motivo=code, error_stage=stage,
+                               estagio_terminal="JEV_REQUEST_ERROR",
+                               error_type=erro.get("error_type"),
+                               error_message=erro.get("error_message"))
+            if erro.get("http_status") == 400:
+                self._evento_funil("jev_http_400", simbolo, candidate_id=candidato,
+                                   request_id=contexto.get("request_id"),
+                                   candle_ref=contexto["candle_ref"], run_id=contexto["run_id"],
+                                   motivo="HTTP_400")
             self._evento_funil("paper_not_opened", simbolo, candidate_id=candidato,
                                request_id=contexto.get("request_id"),
                                candle_ref=contexto["candle_ref"], run_id=contexto["run_id"],
-                               motivo="JEV_ERROR")
-            self._publicar_motivo(simbolo, contexto["id"], "JEV_ERROR", code,
+                               motivo="JEV_REQUEST_ERROR")
+            self._publicar_motivo(simbolo, contexto["id"], "JEV_REQUEST_ERROR", detalhe_erro,
                                   candle_ref=contexto["candle_ref"],
                                   candidate_id=candidato, run_id=contexto["run_id"])
             self._publicar_aprovacao(base, side, "ERRO", f"ERROR_{code}",
-                                     f"JEv indisponível ({stage}); nenhuma ordem", latencia_ms)
+                                     f"JEv indisponível ({stage}); nenhuma ordem. {detalhe_erro}",
+                                     latencia_ms, detalhes={"error_type": erro.get("error_type"),
+                                                            "error_code": erro.get("error_code"),
+                                                            "error_message": erro.get("error_message")})
             self.logger.aviso("JEv indisponível", simbolo=simbolo,
                               run_id=contexto["run_id"], request_id=contexto.get("request_id"),
-                              error_code=code, error_stage=stage)
+                              error_code=code, error_stage=stage,
+                              error_type=erro.get("error_type"),
+                              error_message=erro.get("error_message"))
             return
 
         atualizado = self.fonte.revalidar(contexto["estado"])
@@ -1031,6 +1066,25 @@ class Orquestrador:
         self.logger.info("entrada paper aberta", simbolo=simbolo, side=side,
                          volume=gate.volume, entrada=round(gate.entry, 8),
                          analysis_id=contexto["id"], run_id=contexto["run_id"])
+
+    def _detalhe_veto_risco(self, gate):
+        """Texto compacto do veto com valores medidos, unidades e limite aplicado."""
+        detalhes = gate.details or {}
+        partes = [str(gate.reason_code or "RISK_REJECTED_PRE_JEV"), str(gate.reason or "")]
+
+        def unidade(chave, sufixo=""):
+            valor = detalhes.get(chave)
+            return f"{chave}={_fmt_num(valor)}{sufixo}" if valor is not None else None
+
+        campos = [unidade("bid"), unidade("ask"), unidade("last"),
+                  unidade("spread_abs"), unidade("spread_pontos", "pt"),
+                  unidade("spread_pct"), unidade("spread_fracao_stop", "x_stop"),
+                  unidade("stop_distance"), unidade("volume_calculado"),
+                  unidade("volume_min"), unidade("risco_orcado"), unidade("loss_per_lot"),
+                  unidade("limite_spread_preco_pct"), unidade("limite_spread_stop_pct"),
+                  unidade("idade_s", "s")]
+        partes.extend(c for c in campos if c)
+        return " | ".join(p for p in partes if p)[:400]
 
     def _propor_entrada(self, simbolo, dados, analise):
         """Direção determinística do Python a partir das hipóteses quantitativas."""
@@ -1506,7 +1560,8 @@ class Orquestrador:
                                           "hold_aguardando", "hold_expirado", "erros",
                                           "quant_candidates", "pre_risk_pass", "pre_risk_reject",
                                           "jev_enqueued", "jev_yes", "jev_no", "jev_error",
-                                          "post_risk_reject", "sem_entrada_python", "jev_expired")
+                                          "post_risk_reject", "sem_entrada_python", "jev_expired",
+                                          "side_proposed", "jev_error", "jev_http_400")
                                           if self.contadores_ciclo.get(e)},
                                          "deepseek_calls": 0},
                                       "tempos": {chave: (round(self.relogio() - valor, 1) if valor else None)
@@ -1567,7 +1622,8 @@ class Orquestrador:
                      "erros", "sem_padrao", "somente_monitorar",
                      "quant_candidates", "pre_risk_pass", "pre_risk_reject",
                      "jev_enqueued", "jev_yes", "jev_no", "jev_error",
-                     "post_risk_reject", "sem_entrada_python", "jev_expired")
+                     "post_risk_reject", "sem_entrada_python", "jev_expired",
+                     "side_proposed", "jev_error", "jev_http_400")
             funil = {etapa: self.contadores_ciclo[etapa] for etapa in FUNIL
                      if self.contadores_ciclo.get(etapa)}
             tempos = {chave: (round(self.relogio() - valor, 1) if valor else None)
@@ -1734,7 +1790,7 @@ class Orquestrador:
         ativo, estado matemático e motivo — inclusive rejeições.
         """
         if codigo not in ("DECISION_PENDING", "DECISION_HOLD", "DECISION_NO",
-                          "PAPER_EXECUTED", "SEM_DECISAO", "ERRO_API"):
+                          "PAPER_EXECUTED", "SEM_DECISAO", "ERRO_API", "JEV_REQUEST_ERROR"):
             self._evento_funil("ineligible_for_jev", simbolo,
                                candidate_id=candidate_id, candle_ref=candle_ref,
                                motivo=codigo, detalhe=detalhe, run_id=run_id)
@@ -2271,16 +2327,22 @@ class Orquestrador:
                                   candle_ref=candle_ref)
             return "backoff"
         side = proposta["side_proposed"]
+        self._evento_funil("side_proposed", simbolo, candle_ref=candle_ref, side=side,
+                           candidate_id=proposta["candidate_id"], motivo=side)
         gate = risk.pre_check(side, self.book, self.book.limits, estado)
         if gate.verdict != "EXECUTE":
             self.contadores_ciclo["risco_bloqueado"] = \
                 self.contadores_ciclo.get("risco_bloqueado", 0) + 1
+            detalhe = self._detalhe_veto_risco(gate)
             self._evento_funil("pre_risk_reject", simbolo, candle_ref=candle_ref,
-                               side=side, motivo=gate.reason or "RISK_REJECTED_PRE_JEV")
+                               side=side, motivo=gate.reason_code or "RISK_REJECTED_PRE_JEV",
+                               detalhe=detalhe)
             self._evento_funil("paper_not_opened", simbolo, candle_ref=candle_ref,
                                motivo="RISK_REJECTED_PRE_JEV")
             self._publicar_motivo(simbolo, id_analise, "RISK_REJECTED_PRE_JEV",
-                                  gate.reason or "veto de risco pré-JEv", candle_ref=candle_ref)
+                                  detalhe, candle_ref=candle_ref)
+            self.logger.info("veto de risco pre-JEv", simbolo=simbolo, side=side,
+                             reason_code=gate.reason_code, detalhe=detalhe)
             self.estados_ativos[simbolo] = "REJECTED"
             return "pre_risk_reject"
         self._evento_funil("pre_risk_pass", simbolo, candle_ref=candle_ref, side=side,

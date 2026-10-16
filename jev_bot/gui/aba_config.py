@@ -11,7 +11,7 @@ import threading
 
 from PySide6.QtCore import QObject, Signal
 from PySide6.QtWidgets import (QButtonGroup, QFileDialog, QGroupBox, QHBoxLayout,
-                               QLabel, QLineEdit, QPushButton,
+                               QLabel, QLineEdit, QMessageBox, QPushButton,
                                QRadioButton, QVBoxLayout, QWidget)
 
 from .. import configuracao
@@ -68,14 +68,20 @@ class AbaConfiguracao(QWidget):
         endpoint.setStyleSheet("color:#8ea3c8;")
         layout_or.addWidget(endpoint)
         linha_botoes = QHBoxLayout()
-        self.btn_testar_or = QPushButton("TESTAR CONEXÃO")
+        self.btn_testar_or = QPushButton("TESTAR OPENROUTER")
+        self.btn_testar_or.setToolTip("Valida a configuração local (chave, endpoint, modelo e "
+                                      "payload binário) sem rede; o teste remoto é opcional e "
+                                      "requer confirmação.")
         self.btn_testar_or.clicked.connect(self._testar_openrouter)
-        self.btn_testar_or.setEnabled(False)
-        self.btn_testar_or.setToolTip("Teste DeepSeek desativado: o bot não consulta esse serviço.")
+        self.btn_testar_jev = QPushButton("TESTAR REQUISIÇÃO JEV (PODE CONSUMIR CRÉDITOS)")
+        self.btn_testar_jev.setToolTip("Envia um payload binário mínimo ao JEv para diagnosticar "
+                                       "erros como HTTP 400. Não abre posições nem altera o motor.")
+        self.btn_testar_jev.clicked.connect(self._testar_jev)
         self.btn_salvar_or = QPushButton("SALVAR")
         self.btn_salvar_or.setObjectName("btnAplicar")
         self.btn_salvar_or.clicked.connect(self._salvar_openrouter)
         linha_botoes.addWidget(self.btn_testar_or)
+        linha_botoes.addWidget(self.btn_testar_jev)
         linha_botoes.addWidget(self.btn_salvar_or)
         linha_botoes.addStretch(1)
         layout_or.addLayout(linha_botoes)
@@ -184,16 +190,73 @@ class AbaConfiguracao(QWidget):
 
     # ------------------------------------------------------------- OpenRouter
     def _testar_openrouter(self):
-        self.status_or.setText("Consulta DeepSeek desativada; nenhuma chamada de rede foi feita.")
+        """Diagnóstico local imediato; teste remoto só com confirmação explícita."""
+        local = cfg_gui.validar_openrouter_local()
+        self._mostrar_openrouter(local, remoto=False)
+        if not local.get("ok"):
+            return
+        if QMessageBox.question(
+                self, "Testar OpenRouter",
+                "Configuração local OK.\n\nExecutar um teste remoto? Uma chamada de inferência "
+                "ao JEv pode consumir créditos. Se confirmar, uma requisição binária mínima será "
+                "enviada (nenhuma ordem ou posição é criada).",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+            self.status_or.setText("Diagnóstico local OK. Teste remoto não executado.")
+            return
+        self._executar_teste_or("or")
+
+    def _testar_jev(self):
+        """Ação separada e explícita: testa a requisição binária real (pode custar)."""
+        local = cfg_gui.validar_openrouter_local()
+        self._mostrar_openrouter(local, remoto=False)
+        if not local.get("ok"):
+            return
+        if QMessageBox.question(
+                self, "Testar requisição JEv",
+                "Este teste envia a requisição de aprovação binária ao JEv e PODE CONSUMIR "
+                "CRÉDITOS. Nenhuma operação Paper ou real é criada. Confirmar?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+            self.status_or.setText("Teste de requisição JEv cancelado pelo operador.")
+            return
+        self._executar_teste_or("jev")
+
+    def _executar_teste_or(self, tipo):
+        for botao in (self.btn_testar_or, self.btn_testar_jev):
+            botao.setEnabled(False)
+        self.status_or.setStyleSheet("color:#8ea3c8;")
+        self.status_or.setText("Testando requisição... (aguarde)")
+        threading.Thread(
+            target=lambda: self.testes.resultado_openrouter.emit(
+                {**cfg_gui.testar_openrouter_remoto(), "tipo": tipo}),
+            daemon=True).start()
+
+    def _mostrar_openrouter(self, dados, remoto=False):
+        etapas = ", ".join(f"{nome}={valor}" for nome, valor in (dados.get("etapas") or []))
+        detalhe = f"endpoint={dados.get('endpoint_host', '?')} | modelo={dados.get('modelo', '?')}"
+        if dados.get("ok"):
+            if not remoto:
+                self.status_or.setStyleSheet("color:#22c55e;")
+                self.status_or.setText(f"Configuração local OK. {detalhe}")
+            else:
+                self.status_or.setStyleSheet("color:#22c55e;")
+                self.status_or.setText(
+                    f"OpenRouter OK ({dados.get('latencia_ms', '?')} ms). {detalhe}")
+        else:
+            self.status_or.setStyleSheet("color:#ef4444;")
+            partes = [f"FALHA: {dados.get('erro', 'sem detalhes')}"]
+            if dados.get("http_status"):
+                partes.append(f"HTTP {dados['http_status']}")
+            if dados.get("erro_tipo"):
+                partes.append(f"tipo={dados['erro_tipo']}")
+            self.status_or.setText(" | ".join(partes))
+        self.status_or.setToolTip(f"{detalhe}\n{etapas}")
 
     def _res_openrouter(self, dados):
         self.btn_testar_or.setEnabled(True)
-        if dados.get("ok"):
-            self.status_or.setStyleSheet("color:#22c55e;")
-            self.status_or.setText(f"Conexão OK. Modelo '{dados.get('modelo')}' disponível.")
-        else:
-            self.status_or.setStyleSheet("color:#ef4444;")
-            self.status_or.setText(f"Falha: {dados.get('erro', 'sem detalhes')}")
+        self.btn_testar_jev.setEnabled(True)
+        self._mostrar_openrouter(dados, remoto=bool(dados.get("remoto")))
 
     def _salvar_openrouter(self):
         chave = self.campo_chave.text().strip()

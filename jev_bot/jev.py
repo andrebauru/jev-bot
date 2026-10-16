@@ -3,6 +3,7 @@
 import json
 import math
 import os
+import re
 import socket
 import time
 from dataclasses import asdict
@@ -18,11 +19,75 @@ from .risk import Limits
 class JevError(RuntimeError):
     """Erro externo tipado, sem credenciais ou corpo de resposta sensível."""
 
-    def __init__(self, code, stage, http_success=False):
+    def __init__(self, code, stage, http_success=False, http_status=None,
+                 error_type=None, error_code=None, error_message=None):
         self.code = code
         self.stage = stage
         self.http_success = http_success
+        self.http_status = http_status
+        self.error_type = error_type
+        self.error_code = error_code
+        self.error_message = error_message
         super().__init__(code)
+
+    def resumo(self):
+        """Descrição sanitizada e curta para logs/interface."""
+        partes = [self.code]
+        if self.error_type:
+            partes.append(f"type={self.error_type}")
+        if self.error_code:
+            partes.append(f"code={self.error_code}")
+        if self.error_message:
+            partes.append(self.error_message)
+        return " | ".join(partes)
+
+
+_PADROES_SEGREDO = (
+    (re.compile(r"(?i)bearer\s+\S+"), "Bearer ***"),
+    (re.compile(r"sk-or-[A-Za-z0-9_-]{8,}"), "sk-or-***"),
+    (re.compile(r"(?i)(api[_-]?key|authorization|token)\W*\S+"), r"\1=***"),
+)
+
+
+def sanitizar_texto(texto, limite=300):
+    """Remove segredos e limita o comprimento de mensagens externas."""
+    if texto is None:
+        return None
+    resultado = str(texto)
+    for padrao, substituicao in _PADROES_SEGREDO:
+        resultado = padrao.sub(substituicao, resultado)
+    resultado = " ".join(resultado.split())
+    return resultado[:limite] if resultado else None
+
+
+CAMPOS_PROPOSTA_OBRIGATORIOS = ("symbol", "side_proposed", "entry_reference", "stop_loss",
+                                "take_profit", "volume", "risk_amount", "risk_pct",
+                                "candle_ref", "request_id", "run_id")
+
+
+def validar_proposta(proposta):
+    """Validação local antes do POST: nada inválido sai para a rede.
+
+    Rejeita campo essencial ausente/None, direção fora de BUY/SELL e valores
+    não serializáveis (NaN/Infinity/objetos). Nunca converte None em zero.
+    """
+    if not isinstance(proposta, dict):
+        raise JevError("JEv_PAYLOAD_INVALID", "payload",
+                       error_message="payload não é um objeto")
+    for campo in CAMPOS_PROPOSTA_OBRIGATORIOS:
+        if campo not in proposta or proposta[campo] is None:
+            raise JevError("JEv_PAYLOAD_INVALID", "payload",
+                           error_message=f"campo essencial ausente: {campo}")
+    if proposta["side_proposed"] not in ("BUY", "SELL"):
+        raise JevError("JEv_PAYLOAD_INVALID", "payload",
+                       error_message="side_proposed inválido")
+    try:
+        json.dumps(proposta, allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise JevError("JEv_PAYLOAD_INVALID", "payload",
+                       error_message=f"não serializável: {type(exc).__name__}") from None
+    return proposta
+
 
 
 def configuracao():
@@ -45,29 +110,63 @@ def configuracao():
     return chave, endpoint
 
 
+def _erro_http(exc, http_success=False):
+    """Extrai status e mensagem do erro sanitizados, sem expor segredos."""
+    status = getattr(exc, "code", None)
+    corpo = ""
+    try:
+        corpo = exc.read(4000)
+        if isinstance(corpo, bytes):
+            corpo = corpo.decode("utf-8", errors="replace")
+    except Exception:
+        corpo = ""
+    try:
+        exc.close()
+    except Exception:
+        pass
+    tipo = codigo = mensagem = None
+    try:
+        dados = json.loads(corpo) if corpo else {}
+        erro = dados.get("error") if isinstance(dados, dict) else None
+        if isinstance(erro, dict):
+            tipo = sanitizar_texto(erro.get("type"), 80)
+            codigo = erro.get("code")
+            mensagem = sanitizar_texto(erro.get("message"), 300)
+        elif isinstance(dados, dict) and dados.get("message"):
+            mensagem = sanitizar_texto(dados.get("message"), 300)
+    except (ValueError, TypeError):
+        mensagem = sanitizar_texto(corpo, 200)
+    return JevError(f"HTTP_{status}", "http_error", http_success=http_success,
+                    http_status=status, error_type=tipo, error_code=codigo,
+                    error_message=mensagem)
+
+
 def avaliar_entrada(proposta, engine="jev") -> dict:
     """Aprovação binária de uma entrada já decidida e pré-aprovada pelo Python.
 
-    O JEv responde estritamente `{"approved": bool, "reason": str}` e não pode
-    propor direção oposta nem alterar lote, stop, alvo ou risco. Qualquer
-    resposta ambígua, legado BUY/SELL/HOLD, JSON inválido, timeout ou HTTP de
-    erro vira `JevError` (nunca aprovação implícita).
+    O Python mantém a direção fixa (BUY/SELL) e todos os parâmetros; o JEv só
+    aprova ou reprova. A resposta é normalizada para `{"approved": bool,
+    "reason": str}`. O envelope da requisição segue o contrato documentado do
+    endpoint (`questions.action`, `type: "choice"`, critérios YES/NO). Resposta
+    ambígua, legado BUY/SELL/HOLD, JSON inválido, timeout ou HTTP de erro viram
+    `JevError` — nunca aprovação implícita.
     """
     if engine != "jev":
         raise ValueError("Somente o motor JEV é permitido.")
+    validar_proposta(proposta)
     inicio = time.monotonic()
     modelo = os.environ.get("OPENROUTER_MODEL", "typesafe/jev-1.13").strip()
     chave, endpoint = configuracao()
+    side = proposta["side_proposed"]
     body = json.dumps({"model": modelo,
                        "state": proposta,
-                       "questions": {"approval": {
-        "type": "approval",
+                       "questions": {"action": {
+        "type": "choice",
         "instructions": "Avalie exclusivamente se esta entrada proposta merece aprovação. "
-                        "A direção é fixa (BUY/SELL) e definida pelo sistema; você NÃO pode propor "
+                        f"A direção é fixa ({side}) e definida pelo sistema; você NÃO pode propor "
                         "a direção oposta nem alterar direção, lote, stop, take-profit ou risco. "
-                        "Responda estritamente com JSON {\"approved\":true|false,\"reason\":\"...\"}. "
-                        "Se faltar informação suficiente, responda false. "
-                        "HOLD, BUY, SELL ou qualquer escolha de ação são respostas inválidas.",
+                        "Responda YES para aprovar ou NO para reprovar. "
+                        "Se faltar informação suficiente, responda NO.",
         "criteria": {
             "YES": "A evidência quantitativa fornecida apoia a entrada proposta.",
             "NO": "A evidência é insuficiente, contraditória ou não apoia a entrada proposta.",
@@ -81,18 +180,9 @@ def avaliar_entrada(proposta, engine="jev") -> dict:
         with urlopen(req, timeout=15) as resposta:
             corpo = resposta.read(1_000_000).decode()
         http_success = True
-        data = json.loads(corpo)
-        ans = data["answers"]["approval"]
-        aprovado = ans["approved"]
-        motivo = ans["reason"]
-        if not isinstance(aprovado, bool):
-            raise ValueError("aprovação não booleana")
-        if not isinstance(motivo, str) or not motivo.strip():
-            raise ValueError("motivo ausente")
+        aprovado, motivo = _interpretar_resposta(json.loads(corpo))
     except HTTPError as exc:
-        code = exc.code
-        exc.close()
-        raise JevError(f"HTTP_{code}", "http_error") from None
+        raise _erro_http(exc) from None
     except (TimeoutError, socket.timeout):
         raise JevError("JEv_TIMEOUT", "timeout") from None
     except URLError as exc:
@@ -101,8 +191,33 @@ def avaliar_entrada(proposta, engine="jev") -> dict:
         raise JevError("JEv_NETWORK_ERROR", "http_error") from None
     except (ValueError, KeyError, TypeError, AttributeError):
         raise JevError("JEv_PARSE_ERROR", "parse_error", http_success=http_success) from None
-    return {"approved": aprovado, "reason": motivo.strip()[:400],
+    return {"approved": bool(aprovado), "reason": motivo[:400],
             "modelo": modelo, "latencia_ms": round((time.monotonic() - inicio) * 1000)}
+
+
+def _interpretar_resposta(dados):
+    """Aceita apenas aprovação binária; devolve (approved, reason)."""
+    if not isinstance(dados, dict):
+        raise ValueError("resposta não é objeto")
+    answers = dados.get("answers")
+    if not isinstance(answers, dict):
+        raise ValueError("respostas ausentes")
+    if "action" in answers and isinstance(answers["action"], dict):
+        ans = answers["action"]
+        escolha = ans.get("choice")
+        if ans.get("type") == "choice" and escolha in ("YES", "NO"):
+            aprovado = escolha == "YES"
+            motivo = ans.get("reason") or ans.get("rationale")
+            if not (isinstance(motivo, str) and motivo.strip()):
+                motivo = "aprovado pelo JEv" if aprovado else "rejeitado pelo JEv"
+            return aprovado, str(motivo).strip()
+    if "approval" in answers and isinstance(answers["approval"], dict):
+        ans = answers["approval"]
+        aprovado = ans.get("approved")
+        motivo = ans.get("reason")
+        if isinstance(aprovado, bool) and isinstance(motivo, str) and motivo.strip():
+            return aprovado, motivo.strip()
+    raise ValueError("resposta não binária")
 
 
 def decide(state: MarketState, engine="jev", limites=None) -> Decision:

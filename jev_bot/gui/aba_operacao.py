@@ -493,12 +493,16 @@ class AbaOperacao(QWidget):
         for linha in atividade[:12]:
             item = self.tabela_atividade.rowCount()
             self.tabela_atividade.insertRow(item)
+            motivo = str(linha.get("motivo") or "-")
             for coluna, valor in enumerate(
                     [linha.get("simbolo") or "-", linha.get("estado") or "-",
                      _fmt_horario(linha.get("candle_ref")),
                      f"BUY {linha.get('buy', 0)} / SELL {linha.get('sell', 0)}",
-                     "-", linha.get("motivo") or "-"]):
-                self.tabela_atividade.setItem(item, coluna, QTableWidgetItem(str(valor)))
+                     "-", motivo]):
+                celula = QTableWidgetItem(str(valor))
+                if motivo != "-":
+                    celula.setToolTip(motivo)  # texto completo mesmo se truncado
+                self.tabela_atividade.setItem(item, coluna, celula)
 
     def _definir(self, chave, texto):
         if chave in self.valores:

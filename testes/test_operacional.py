@@ -561,10 +561,12 @@ class TestCiclosMulti(unittest.TestCase):
             orch.encerrar.set()
             if orch.worker_jev:
                 orch.worker_jev.join(1)
-            self.assertEqual(resultados[0][3], {"code": "HTTP_401", "stage": "http_error",
-                                                "http_success": False})
-            self.assertEqual(resultados[1][3], {"code": "JEv_PARSE_ERROR", "stage": "parse_error",
-                                                "http_success": True})
+            self.assertEqual(resultados[0][3]["code"], "HTTP_401")
+            self.assertEqual(resultados[0][3]["stage"], "http_error")
+            self.assertFalse(resultados[0][3]["http_success"])
+            self.assertEqual(resultados[1][3]["code"], "JEv_PARSE_ERROR")
+            self.assertEqual(resultados[1][3]["stage"], "parse_error")
+            self.assertTrue(resultados[1][3]["http_success"])
             self.assertTrue(resultados[2][2]["approved"])
             stages = []
             while not orch.eventos_worker_jev.empty():
