@@ -2938,7 +2938,7 @@ class Orquestrador:
                                           "justificativa": f"JEv HOLD p={decisao.probability:.0%} "
                                                            f"c={decisao.confidence:.0%}; oportunidade adiada",
                                           "risco": gate.reason or "aguardando",
-                                           "policy": "PENDING", "paper": "NOT_OPENED",
+                                          "policy": "HOLD", "estado_api": "COMPLETED", "paper": "NOT_OPENED",
                                            "execucao": f"adiada por até {HOLD_TTL_S // 60}min, depois descartada",
                                            "run_id": contrato["run_id"],
                                            "python_validated_at": contrato["python_validated_at"],

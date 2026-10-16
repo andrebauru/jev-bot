@@ -8,6 +8,7 @@ sempre distinguíveis. Botão direito copia o gráfico visível como imagem.
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import math
 
 from PySide6.QtWidgets import (QComboBox, QGridLayout, QGroupBox, QHBoxLayout,
                                QLabel, QSplitter, QVBoxLayout, QWidget)
@@ -19,7 +20,13 @@ PERIODOS = (("Últimas 24 horas", 1), ("Últimos 7 dias", 7),
 
 
 def _fmt_moeda(valor, moeda=""):
+    if not isinstance(valor, (int, float)) or isinstance(valor, bool) or not math.isfinite(valor):
+        return f"N/D {moeda}".strip()
     return f"{valor:,.2f} {moeda}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def _pct(valor, formato="+.2%"):
+    return f"{valor:{formato}}" if isinstance(valor, (int, float)) and not isinstance(valor, bool) and math.isfinite(valor) else "N/D"
 
 
 class AbaResumo(QWidget):
@@ -101,11 +108,13 @@ class AbaResumo(QWidget):
                       cor="#22c55e" if m.get("realizado", 0) > 0 else "#ef4444" if m.get("realizado", 0) < 0 else None)
         self._definir("aberto", _fmt_moeda(m.get("aberto", 0), moeda),
                       cor="#22c55e" if m.get("aberto", 0) > 0 else "#ef4444" if m.get("aberto", 0) < 0 else None)
-        self._definir("growth", f"{m.get('growth', 0):+.2%}",
-                      cor="#22c55e" if m.get("growth", 0) > 0 else "#ef4444" if m.get("growth", 0) < 0 else None)
-        self._definir("daily_return", f"{m.get('daily_return', 0):+.2%}",
-                      cor="#22c55e" if m.get("daily_return", 0) > 0 else "#ef4444" if m.get("daily_return", 0) < 0 else None)
-        self._definir("drawdown_txt", f"{m.get('drawdown', 0):.2%} / {m.get('drawdown_max', 0):.2%}")
+        growth = m.get("growth")
+        daily = m.get("daily_return")
+        self._definir("growth", _pct(growth),
+                      cor="#22c55e" if isinstance(growth, (int, float)) and growth > 0 else "#ef4444" if isinstance(growth, (int, float)) and growth < 0 else None)
+        self._definir("daily_return", _pct(daily),
+                      cor="#22c55e" if isinstance(daily, (int, float)) and daily > 0 else "#ef4444" if isinstance(daily, (int, float)) and daily < 0 else None)
+        self._definir("drawdown_txt", f"{_pct(m.get('drawdown'), '.2%')} / {_pct(m.get('drawdown_max'), '.2%')}")
         taxa = m.get("win_rate")
         self._definir("win_rate_txt", f"{taxa:.1%}" if taxa is not None else "sem fechamentos")
         self._definir("trades_txt", f"{m.get('fechados', 0)} ({m.get('wins', 0)}G/{m.get('losses', 0)}L)")

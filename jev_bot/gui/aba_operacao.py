@@ -588,9 +588,9 @@ class AbaOperacao(QWidget):
                               else None))
             elif canal == "decisao":
                 decisao = str(r.get("decisao") or "-")
-                cor = (VERDE if decisao == "SIM" else AMBAR if decisao == "EXPIRADO"
+                cor = (VERDE if decisao == "SIM" else AMBAR if decisao in ("EXPIRADO", "HOLD")
                        else VERMELHO if decisao in ("NAO", "NÃO", "ERRO") else CINZA)
-                if decisao not in ("SIM", "NAO", "NÃO", "ERRO", "EXPIRADO"):
+                if decisao not in ("SIM", "NAO", "NÃO", "ERRO", "EXPIRADO", "HOLD"):
                     continue  # PENDING/estado transitório nunca é decisão final
                 estado_api = r.get("estado_api") or "-"
                 direcao = r.get("side_proposed") or r.get("direcao") or "-"

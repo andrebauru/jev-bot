@@ -352,6 +352,26 @@ class TestBotaoOpenRouter(unittest.TestCase):
             aba._testar_openrouter()  # local apenas; remoto recusado
         self.assertIn("local", aba.status_or.text().lower())
 
+    def test_gui_none_e_hold_completed(self):
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+        QApplication.instance() or QApplication([])
+        from jev_bot.gui.aba_operacao import AbaOperacao
+        aba = AbaOperacao(acoes={k: (lambda: None) for k in
+                                 ("iniciar", "pausar", "retomar", "emergencia",
+                                  "liberar_risco", "aplicar_limites", "cancelar_ciclo")})
+        aba.receber_metricas({"estado": "PRONTO", "equity": None, "saldo": None,
+                              "aberto": None, "exposicao": None, "exposicao_fracao": None,
+                              "drawdown": None, "drawdown_max": None, "posicoes": 0,
+                              "limites": {}, "diagnostico_funil": {}})
+        self.assertIn("N/D", aba.valores["equity"].text())
+        aba.receber_lote("decisao", [{"simbolo": "X", "instante": None,
+                                      "decisao": "HOLD", "estado_api": "COMPLETED",
+                                      "side_proposed": "BUY", "justificativa": "sem suporte"}])
+        self.assertEqual(aba.lista_decisao.topLevelItemCount(), 1)
+        self.assertEqual(aba.lista_decisao.topLevelItem(0).text(2), "HOLD")
+        self.assertEqual(aba.lista_decisao.topLevelItem(0).text(3), "COMPLETED")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
