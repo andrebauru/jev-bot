@@ -119,6 +119,29 @@ class CacheM1:
         except OSError:
             pass
 
+    def limpar_expirados(self, ttl_dias=None):
+        """Remove somente caches M1 gerenciados por esta instância.
+
+        Arquivos temporários de escrita e JSONs fora do diretório não são
+        tocados; o retorno permite auditoria de arquivos/bytes liberados.
+        """
+        ttl_dias = self.max_dias if ttl_dias is None else max(1, int(ttl_dias))
+        corte = self.relogio() - ttl_dias * 86400
+        removidos = 0
+        bytes_liberados = 0
+        for caminho in self.pasta.glob("*.m1.json"):
+            try:
+                dados = json.loads(caminho.read_text(encoding="utf-8"))
+                atualizado = float(dados.get("atualizado_em", caminho.stat().st_mtime))
+                if atualizado < corte:
+                    tamanho = caminho.stat().st_size
+                    caminho.unlink()
+                    removidos += 1
+                    bytes_liberados += tamanho
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                continue
+        return {"arquivos": removidos, "bytes": bytes_liberados}
+
     def anexar(self, simbolo, novos):
         """Anexa candles novos ao cache com verificação de continuidade.
 
@@ -154,3 +177,13 @@ class CacheM1:
         self.salvar(simbolo, combinados)
         return combinados, {"fonte": "cache", "anexados": len(anexados),
                             "lacunas": lacunas, "recarregar": False}
+
+
+class CacheM15(CacheM1):
+    """Cache separado para M15; nunca compartilha arquivos com M1."""
+
+    def __init__(self, pasta, max_dias=7, relogio=time.time):
+        super().__init__(pasta, max_dias=max_dias, relogio=relogio)
+
+    def caminho(self, simbolo):
+        return self.pasta / f"{str(simbolo).upper()}.m15.json"

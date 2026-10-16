@@ -193,7 +193,8 @@ class AbaOperacao(QWidget):
         raiz.addWidget(grupo_controles)
 
         # --- limites editáveis
-        grupo_limites = QGroupBox("Limites de risco (% do patrimônio paper)")
+        self.grupo_limites = QGroupBox("Limites técnicos PAPER (drawdown)")
+        grupo_limites = self.grupo_limites
         linha_limites = QHBoxLayout(grupo_limites)
         self.lim_trades = self._spin(linha_limites, "Risco por trade")
         self.lim_total = self._spin(linha_limites, "Exposição máxima")
@@ -203,7 +204,10 @@ class AbaOperacao(QWidget):
         self.btn_aplicar.clicked.connect(self._aplicar_limites)
         linha_limites.addWidget(self.btn_aplicar)
         linha_limites.addStretch(1)
-        raiz.addWidget(grupo_limites)
+        # A política experimental PAPER não usa risco por trade/exposição para
+        # bloquear entradas. Mantemos os widgets internamente por compatibilidade
+        # de sinais antigos, mas não os exibimos nem os sincronizamos.
+        grupo_limites.setVisible(False)
 
         # --- métricas do momento
         grupo_metricas = QGroupBox("Estado do robô e carteira paper")
@@ -483,9 +487,7 @@ class AbaOperacao(QWidget):
                                       f"máx {_num(m.get('drawdown_max'), '.2%')}")
         self._definir("posicoes", str(m.get("posicoes", 0)))
         limites = m.get("limites", {})
-        if limites and not self.lim_trades.hasFocus() and not self.lim_total.hasFocus() and not self.lim_dd.hasFocus():
-            self.lim_trades.setValue(limites.get("risk_per_trade", 0.02) * 100)
-            self.lim_total.setValue(limites.get("max_total_risk", 0.15) * 100)
+        if limites and not self.lim_dd.hasFocus():
             self.lim_dd.setValue(limites.get("max_drawdown", 0.10) * 100)
         conta = m.get("conta")
         if conta:
@@ -592,6 +594,8 @@ class AbaOperacao(QWidget):
                     continue  # PENDING/estado transitório nunca é decisão final
                 estado_api = r.get("estado_api") or "-"
                 direcao = r.get("side_proposed") or r.get("direcao") or "-"
+                timeframe = r.get("timeframe") or "M1"
+                direcao = f"{direcao} · {timeframe}"
                 itens.append((
                     [r.get("simbolo") or "-", _fmt_horario(r.get("instante")), decisao,
                      estado_api, direcao,

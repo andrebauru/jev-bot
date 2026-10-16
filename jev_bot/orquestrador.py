@@ -249,6 +249,12 @@ class Orquestrador:
         self.cache_m1 = cache_m1.CacheM1(self.pasta_dados.parent / "cache_m1",
                                          max_dias=configuracao.dias_historico(),
                                          relogio=relogio)
+        self.cache_limpeza = self.cache_m1.limpar_expirados()
+        self.logger.info("limpeza de cache M1 concluída", **self.cache_limpeza)
+        self.cache_m15 = cache_m1.CacheM15(self.pasta_dados.parent / "cache_m15",
+                                           relogio=relogio)
+        self.cache_limpeza_m15 = self.cache_m15.limpar_expirados()
+        self.logger.info("limpeza de cache M15 concluída", **self.cache_limpeza_m15)
         self.dias_historico = configuracao.dias_historico()
         self.prazo_ciclo = None
         self.prazo_scan = None
@@ -904,6 +910,7 @@ class Orquestrador:
         side = proposta["side_proposed"]
         base = {**contexto["registro_base"], "instante": _agora_iso(),
                 "direcao": side, "side_proposed": side,
+                "timeframe": proposta.get("timeframe", "M1"),
                 "run_id": contexto.get("run_id"), "request_id": contexto.get("request_id"),
                 "candle_ref": contexto.get("candle_ref"),
                 "python_validated_at": contexto.get("python_validated_at"),
@@ -1106,6 +1113,7 @@ class Orquestrador:
         if direcao not in ("BUY", "SELL"):
             return None
         return {"side_proposed": direcao,
+                "timeframe": regra.get("timeframe", "M1"),
                 "strategy_id": regra.get("strategy_id", regra.get("tipo_regra")),
                 "candidate_id": regra.get("strategy_id", regra.get("tipo_regra")),
                 "status": validacao.get("status"),
@@ -1118,7 +1126,9 @@ class Orquestrador:
     def _montar_proposta(self, simbolo, proposta, estado, gate, analise,
                          candle_ref, run_id, request_id):
         """Payload imutável enviado ao JEv: entrada já decidida e pré-aprovada."""
+        timeframe = getattr(estado, "timeframe", None) or proposta.get("timeframe", "M1")
         return {"symbol": simbolo, "side_proposed": proposta["side_proposed"],
+                "timeframe": timeframe,
                 "entry_reference": gate.entry, "stop_loss": gate.stop,
                 "take_profit": gate.target, "volume": gate.volume,
                 "risk_amount": gate.risk_amount, "risk_pct": self.book.limits.risk_per_trade,
@@ -1334,15 +1344,17 @@ class Orquestrador:
             raise RuntimeError("Carteira ainda não carregada.")
         atual = self.book.limits
         try:
-            novo = replace(atual, risk_per_trade=float(dados["risk_per_trade"]),
-                           max_total_risk=float(dados["max_total_risk"]),
-                           max_drawdown=float(dados["max_drawdown"]))
+            # PAPER experimental: somente drawdown continua sendo um bloqueio
+            # de novas entradas. Valores legados de risco/exposição são
+            # preservados no arquivo para migração, mas não são efetivos.
+            novo = replace(atual, max_drawdown=float(dados["max_drawdown"]),
+                           max_positions=5)
         except (TypeError, ValueError):
             raise RuntimeError("Limites inválidos: use frações entre 0 e 1.") from None
         self.book.limits = novo
         self._persistir()
-        mensagem = (f"Limites aplicados: {novo.risk_per_trade:.2%}/operação, "
-                    f"{novo.max_total_risk:.2%} total, drawdown {novo.max_drawdown:.2%}")
+        mensagem = (f"PAPER: somente drawdown efetivo ({novo.max_drawdown:.2%}); "
+                    "lote mínimo por ativo; risco/exposição percentuais não bloqueiam entradas")
         self.publicar("log", {"instante": _agora_iso(), "nivel": "info", "mensagem": mensagem})
         self.logger.info("limites de risco alterados pelo operador",
                          por_operacao=round(novo.risk_per_trade, 4),
@@ -1393,8 +1405,8 @@ class Orquestrador:
             motivos.append("Bloqueio de drawdown registrado na carteira")
         if book.daily_blocked:
             motivos.append("Bloqueio de perda diária")
-        if m["risk_fraction"] > limites.max_total_risk:
-            motivos.append(f"Exposição {m['risk_fraction']:.1%} acima de {limites.max_total_risk:.1%}")
+        # Risco percentual/exposição não bloqueiam entradas na política PAPER
+        # experimental; continuam disponíveis nas métricas para avaliação.
         if motivos:
             if not self.parado_risco:
                 self.parado_risco = True
@@ -2123,6 +2135,7 @@ class Orquestrador:
                 familias_testadas=max(1, len(regras)))
             avaliacoes.append((regra, validacao))
         return {"stats": stats, "custo_pct": custo_pct, "dias_janela": dias_janela,
+                "timeframe": janela.get("timeframe", "M1"),
                 "candle_ref": janela["candles"][-1]["time"], "evento": evento,
                 "revalidacoes": revalidacoes, "candidatos": avaliacoes,
                 "erro_geracao": erro_geracao, "regras_total": len(regras),
@@ -2269,7 +2282,8 @@ class Orquestrador:
                     "estado": v.get("status")}
 
         ev = dados.get("evento") or {}
-        return {"symbol": simbolo, "candle_time": dados["candle_ref"], "timeframe": "M1",
+        return {"symbol": simbolo, "candle_time": dados["candle_ref"],
+                "timeframe": dados.get("timeframe", "M1"),
                 "history": {"days": dados["dias_janela"],
                             "bars_available": ev.get("bars_available"),
                             "bars_used": ev.get("bars_used"),

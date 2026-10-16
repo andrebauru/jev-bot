@@ -1,7 +1,7 @@
 """Limites conservadores, dimensionamento por stop e bloqueios de carteira."""
 
 from dataclasses import dataclass, field
-from decimal import Decimal, ROUND_FLOOR
+from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 import math
 import time
 
@@ -12,7 +12,7 @@ from .types import Decision, MarketState
 class Limits:
     min_confidence: float = 0.75
     min_probability: float = 0.65
-    max_positions: int | None = None
+    max_positions: int | None = 5
     risk_per_trade: float = 0.02
     max_total_risk: float = 0.15
     max_currency_risk: float = 0.15
@@ -121,16 +121,13 @@ def pre_check(side: str, book, limits: Limits, state: MarketState, agora=None) -
     if not book.prices_valid:
         return recusar("Posições sem cotação recente ou P&L válido", "PRICES_INVALID")
     equity = book.equity()
-    if equity <= 0 or equity <= book.day_start * (1 - limits.max_daily_loss):
-        return recusar("Limite de perda diária atingido", "DAILY_LOSS_LIMIT",
-                       {"equity": equity, "day_start": book.day_start,
-                        "limite_perda_diaria": limits.max_daily_loss})
+    if equity <= 0:
+        return recusar("Patrimônio paper inválido", "INVALID_EQUITY",
+                       {"equity": equity})
     if book.drawdown_blocked or equity <= book.high_water * (1 - limits.max_drawdown):
         return recusar("Limite de drawdown atingido", "DRAWDOWN_LIMIT",
                        {"equity": equity, "high_water": book.high_water,
                         "limite_drawdown": limits.max_drawdown})
-    if book.daily_blocked:
-        return recusar("Bloqueio diário permanece até o próximo dia UTC", "DAILY_BLOCKED")
     if limits.max_positions is not None and len(book.fills) >= limits.max_positions:
         return recusar("Limite de posições atingido", "MAX_POSITIONS",
                        {"posicoes": len(book.fills), "limite": limits.max_positions})
@@ -162,37 +159,18 @@ def pre_check(side: str, book, limits: Limits, state: MarketState, agora=None) -
         return recusar("Spread inválido (ask menor que bid)", "SPREAD_INVALID", detalhes_spread)
     if state.price <= 0 or state.stop_distance <= 0:
         return recusar("Preço ou distância de stop inválidos", "INVALID_STOP", detalhes_spread)
-    if spread / state.price > limits.max_spread_fraction:
-        return recusar("Spread acima do limite percentual do preço", "SPREAD_TOO_HIGH", detalhes_spread)
-    if spread / state.stop_distance > limits.max_spread_stop:
-        return recusar("Spread acima do limite da distância de stop", "SPREAD_TOO_HIGH_STOP",
-                       detalhes_spread)
-    risco = equity * limits.risk_per_trade
+    # Política experimental PAPER: spread e custo são medidos/publicados, mas
+    # não vetam por percentual ou razão spread/stop. Só dados/stop técnicos
+    # inválidos impedem a entrada.
     passo = Decimal(str(state.volume_step))
-    volume = float((Decimal(str(min(risco / state.loss_per_lot, state.volume_max))) / passo)
-                   .to_integral_value(rounding=ROUND_FLOOR) * passo)
-    if volume < state.volume_min or volume <= 0:
-        return recusar("Lote mínimo excede o orçamento de risco", "MIN_LOT_EXCEEDS_RISK",
-                       {"volume_calculado": volume, "volume_min": state.volume_min,
-                        "risco_orcado": round(risco, 6), "loss_per_lot": state.loss_per_lot})
+    volume = float((Decimal(str(state.volume_min)) / passo)
+                   .to_integral_value(rounding=ROUND_CEILING) * passo)
+    if volume <= 0 or volume > state.volume_max:
+        return recusar("Lote mínimo/step incompatível com volume máximo", "INVALID_VOLUME_SPEC",
+                       {"volume_min": state.volume_min, "volume_step": state.volume_step,
+                        "volume_max": state.volume_max, "volume_calculado": volume})
     risco_real = volume * state.loss_per_lot
-    if sum(p.risk_amount for p in book.fills) + risco_real > equity * limits.max_total_risk:
-        return recusar("Limite de risco agregado atingido", "AGGREGATE_RISK_LIMIT",
-                       {"risco_real": round(risco_real, 6),
-                        "risco_aberto": round(sum(p.risk_amount for p in book.fills), 6),
-                        "limite_total": limits.max_total_risk})
-    for moeda in state.currencies:
-        exposicao = sum(p.risk_amount for p in book.fills if moeda in p.currencies)
-        if exposicao + risco_real > equity * limits.max_currency_risk:
-            return recusar(f"Exposição compartilhada em {moeda} atingiu o limite",
-                           "CURRENCY_EXPOSURE_LIMIT",
-                           {"moeda": moeda, "exposicao": round(exposicao, 6),
-                            "risco_real": round(risco_real, 6),
-                            "limite_moeda": limits.max_currency_risk})
     margem = volume * state.margin_per_lot
-    if sum(p.margin for p in book.fills) + margem > equity * limits.max_margin:
-        return recusar("Margem paper excede o teto do patrimônio", "MARGIN_LIMIT",
-                       {"margem": round(margem, 6), "limite_margem": limits.max_margin})
     entrada = state.ask if side == "BUY" else state.bid
     direcao = 1 if side == "BUY" else -1
     stop = entrada - direcao * state.stop_distance

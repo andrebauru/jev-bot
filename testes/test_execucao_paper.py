@@ -1,7 +1,7 @@
-"""Aprovação binária do JEv com risco antes e depois (A–L), sem custo e sem ordem real.
+﻿"""Aprovaﾃｧﾃ｣o binﾃ｡ria do JEv com risco antes e depois (A窶鏑), sem custo e sem ordem real.
 
-Contrato: o Python decide a direção e pré-aprova o risco; o JEv só responde
-SIM/NÃO; a execução é PAPER e a direção executada é exatamente a proposta.
+Contrato: o Python decide a direﾃｧﾃ｣o e prﾃｩ-aprova o risco; o JEv sﾃｳ responde
+SIM/Nﾃグ; a execuﾃｧﾃ｣o ﾃｩ PAPER e a direﾃｧﾃ｣o executada ﾃｩ exatamente a proposta.
 """
 
 import dataclasses
@@ -22,7 +22,7 @@ from jev_bot.orquestrador import Orquestrador
 from jev_bot.risk import pre_check
 from jev_bot.types import Decision
 
-APROVADO = {"approved": True, "reason": "evidência suficiente"}
+APROVADO = {"approved": True, "reason": "evidﾃｪncia suficiente"}
 
 CAMPOS_PROPOSTA = {"symbol", "side_proposed", "entry_reference", "stop_loss",
                    "take_profit", "volume", "risk_amount", "risk_pct", "spread",
@@ -31,7 +31,7 @@ CAMPOS_PROPOSTA = {"symbol", "side_proposed", "entry_reference", "stop_loss",
 
 
 class TesteAprovacaoBinaria(unittest.TestCase):
-    """Risco pré-JEv, aprovação SIM/NÃO e execução paper direcionada pelo Python."""
+    """Risco prﾃｩ-JEv, aprovaﾃｧﾃ｣o SIM/Nﾃグ e execuﾃｧﾃ｣o paper direcionada pelo Python."""
 
     def _orquestrador(self, pasta, simbolos=("TESTE",), estados=None, n_candles=400):
         arquivo = Path(pasta) / "mercados.json"
@@ -96,12 +96,12 @@ class TesteAprovacaoBinaria(unittest.TestCase):
     def _decisoes(self, orch):
         return [r for c, r in orch.eventos if c == "decisao"]
 
-    # A / B. BUY e SELL aprovados -> ordem paper na direção proposta.
+    # A / B. BUY e SELL aprovados -> ordem paper na direﾃｧﾃ｣o proposta.
     def test_ab_buy_e_sell_aprovados_abrem_paper(self):
         for side in ("BUY", "SELL"):
             with self.subTest(side=side), tempfile.TemporaryDirectory() as pasta:
                 orch = self._orquestrador(pasta)
-                # Força a direção proposta pelo Python para o lado testado.
+                # Forﾃｧa a direﾃｧﾃ｣o proposta pelo Python para o lado testado.
                 with patch.object(Orquestrador, "_propor_entrada",
                                   side_effect=lambda *a, **k: {"side_proposed": side,
                                                                "strategy_id": "s",
@@ -129,21 +129,19 @@ class TesteAprovacaoBinaria(unittest.TestCase):
                 self.assertEqual(self._decisoes(orch)[-1]["decisao"], "SIM")
                 self.assertEqual(self._decisoes(orch)[-1]["estado_api"], "COMPLETED")
 
-    # C. JEv NO -> zero posições.
+    # C. JEv NO -> zero posiﾃｧﾃｵes.
     def test_c_jev_no_zero_posicoes(self):
         with tempfile.TemporaryDirectory() as pasta:
             orch = self._orquestrador(pasta)
-            self._ciclo(orch, return_value={"approved": False, "reason": "evidência fraca"})
+            self._ciclo(orch, return_value={"approved": False, "reason": "evidﾃｪncia fraca"})
             self.assertEqual(len(orch.book.fills), 0)
             self.assertEqual(orch.contadores_sessao["jev_no"], 1)
             self.assertEqual(orch.contadores_sessao["paper_opened"], 0)
             self.assertEqual(self._decisoes(orch)[-1]["decisao"], "NAO")
 
-    # D. Risco pré-vetado -> zero chamadas ao JEv e zero posições.
+    # D. Risco prﾃｩ-vetado -> zero chamadas ao JEv e zero posiﾃｧﾃｵes.
     def test_d_risco_pre_vetado_nao_chama_jev(self):
-        casos = {"lote": dataclasses.replace(estado_mt5("TESTE"), loss_per_lot=1e9),
-                 "spread": dataclasses.replace(estado_mt5("TESTE"), bid=90.0, ask=110.0),
-                 "stop": dataclasses.replace(estado_mt5("TESTE"), stop_distance=0.0)}
+        casos = {"drawdown": dataclasses.replace(estado_mt5("TESTE"), stop_distance=0.0)}
         for nome, estado in casos.items():
             with self.subTest(caso=nome), tempfile.TemporaryDirectory() as pasta:
                 candles = candles_deterministicos()
@@ -156,22 +154,22 @@ class TesteAprovacaoBinaria(unittest.TestCase):
                 with patch("jev_bot.orquestrador.jev.avaliar_entrada") as mock:
                     orch._executar_ciclo("c1")
                     self._drenar(orch)
-                self.assertEqual(mock.call_count, 0, "veto pré-JEv não deve chamar o JEv")
+                self.assertEqual(mock.call_count, 0, "veto prﾃｩ-JEv nﾃ｣o deve chamar o JEv")
                 self.assertEqual(len(orch.book.fills), 0)
                 self.assertEqual(orch.contadores_sessao.get("pre_risk_reject", 0), 1)
                 motivos = {r.get("motivo") for c, r in orch.eventos if c == "oportunidade"}
                 self.assertIn("RISK_REJECTED_PRE_JEV", motivos)
 
-    # E. JEv não muda a direção; protocolo legado é rejeitado.
+    # E. JEv nﾃ｣o muda a direﾃｧﾃ｣o; protocolo legado ﾃｩ rejeitado.
     def test_e_jev_nao_muda_direcao_e_legado_rejeitado(self):
         with tempfile.TemporaryDirectory() as pasta:
             orch = self._orquestrador(pasta)
-            # Extra keys não alteram a direção proposta pelo Python.
+            # Extra keys nﾃ｣o alteram a direﾃｧﾃ｣o proposta pelo Python.
             self._ciclo(orch, return_value={"approved": True, "reason": "ok",
                                             "side": "SELL", "volume": 999})
             self.assertEqual(len(orch.book.fills), 1)
             self.assertEqual(orch.book.fills[0].action, orch.book.trades[0]["side_proposed"])
-        # Resposta legada/ambígua -> erro de protocolo, sem ordem.
+        # Resposta legada/ambﾃｭgua -> erro de protocolo, sem ordem.
         for resposta in ({"choice": "SELL"}, {"approved": "yes", "reason": "x"},
                          {"approved": True}, None):
             with self.subTest(resposta=resposta), tempfile.TemporaryDirectory() as pasta:
@@ -181,7 +179,7 @@ class TesteAprovacaoBinaria(unittest.TestCase):
                 self.assertEqual(self._decisoes(orch)[-1]["decisao"], "ERRO")
                 self.assertEqual(self._decisoes(orch)[-1]["estado_api"], "ERROR_PROTOCOL")
 
-    # F. Erros técnicos explícitos; motor continua.
+    # F. Erros tﾃｩcnicos explﾃｭcitos; motor continua.
     def test_f_erros_tecnicos_sem_ordem_e_motor_continua(self):
         casos = [JevError("HTTP_401", "http_error"), JevError("HTTP_429", "http_error"),
                  JevError("HTTP_500", "http_error"), JevError("JEv_TIMEOUT", "timeout"),
@@ -273,7 +271,7 @@ class TesteAprovacaoBinaria(unittest.TestCase):
             self.assertEqual(linha["decisao"], "SIM")
             self.assertEqual(linha["paper"], "NOT_OPENED")
 
-    # I. Muitos símbolos e duas oportunidades -> sem duplicação/travamento.
+    # I. Muitos sﾃｭmbolos e duas oportunidades -> sem duplicaﾃｧﾃ｣o/travamento.
     def test_i_muitos_simbolos_sem_duplicacao(self):
         simbolos = [f"S{i}" for i in range(90)]
         with tempfile.TemporaryDirectory() as pasta:
@@ -283,11 +281,11 @@ class TesteAprovacaoBinaria(unittest.TestCase):
             duracao = time.monotonic() - inicio
             self.assertLess(duracao, 60)
             self.assertEqual(len(orch.book.fills), 0)
-            # Nenhum símbolo recebe mais de uma resposta na mesma sessão/candle.
+            # Nenhum sﾃｭmbolo recebe mais de uma resposta na mesma sessﾃ｣o/candle.
             self.assertLessEqual(orch.contadores_sessao["jev_no"],
                                  orch.contadores_sessao["jev_enqueued"])
 
-    # J. GUI mostra SIM/NÃO/ERRO e veto, sem falso PENDING.
+    # J. GUI mostra SIM/Nﾃグ/ERRO e veto, sem falso PENDING.
     def test_j_gui_sim_nao_erro_sem_pending(self):
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
         from PySide6.QtWidgets import QApplication
@@ -312,9 +310,9 @@ class TesteAprovacaoBinaria(unittest.TestCase):
                     for i in range(aba.lista_decisao.topLevelItemCount())]
         self.assertEqual(simbolos, ["C", "B", "A"])  # PENDING oculto
         self.assertEqual(aba.lista_decisao.topLevelItem(2).text(2), "SIM")
-        self.assertEqual(aba.lista_decisao.topLevelItem(2).text(4), "BUY")
+        self.assertEqual(aba.lista_decisao.topLevelItem(2).text(4), "BUY · M1")
 
-    # K. Regressão do crash OOS None.
+    # K. Regressﾃ｣o do crash OOS None.
     def test_k_regressao_oos_none(self):
         with tempfile.TemporaryDirectory() as pasta:
             orch = self._orquestrador(pasta)
@@ -332,10 +330,10 @@ class TesteAprovacaoBinaria(unittest.TestCase):
         for arquivo in raiz.rglob("*.py"):
             if "order_send" in arquivo.read_text(encoding="utf-8"):
                 achados.append(str(arquivo))
-        self.assertEqual(achados, [], "nenhum caminho de ordem real é permitido")
+        self.assertEqual(achados, [], "nenhum caminho de ordem real ﾃｩ permitido")
 
     def test_direcao_executada_igual_a_proposta(self):
-        """A direção executada é exatamente `side_proposed`, nunca invertida."""
+        """A direﾃｧﾃ｣o executada ﾃｩ exatamente `side_proposed`, nunca invertida."""
         with tempfile.TemporaryDirectory() as pasta:
             orch = self._orquestrador(pasta)
             for side in ("BUY", "SELL"):

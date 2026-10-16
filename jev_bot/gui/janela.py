@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import subprocess
 
 from PySide6.QtCore import Qt, QThread
 from PySide6.QtWidgets import (QApplication, QLabel, QMainWindow, QMessageBox,
@@ -11,6 +12,7 @@ from PySide6.QtWidgets import (QApplication, QLabel, QMainWindow, QMessageBox,
 from .aba_config import AbaConfiguracao
 from .aba_operacao import AbaOperacao
 from .aba_resumo import AbaResumo
+from .aba_monitoramento import AbaMonitoramento
 from .motor import MotorTrabalhador
 from . import tema
 
@@ -40,10 +42,12 @@ class JanelaPrincipal(QMainWindow):
             "cancelar_ciclo": self.orquestrador.cancelar_ciclo,
         })
         self.aba_resumo = AbaResumo()
+        self.aba_monitoramento = AbaMonitoramento(self.aba_operacao)
         self.aba_config = AbaConfiguracao(config_alterada=self.orquestrador.recarregar_config,
                                           pedir_catalogo=self.orquestrador.pedir_catalogo,
                                           selecao_salva=self.orquestrador.recarregar_selecao)
         self.abas.addTab(self.aba_operacao, "Operação e fluxo")
+        self.abas.addTab(self.aba_monitoramento, "Monitoramento e tabelas")
         self.abas.addTab(self.aba_resumo, "Resumo e gráficos")
         self.abas.addTab(self.aba_config, "Configurações")
         self.setCentralWidget(self.abas)
@@ -51,8 +55,11 @@ class JanelaPrincipal(QMainWindow):
         barra = QStatusBar()
         self.label_jev = QLabel("JEv: verificando")
         barra.addWidget(self.label_jev)
-        barra.addWidget(QLabel("Python Quantitativo: local | DeepSeek: desativado (0 chamadas)"))
-        barra.addPermanentWidget(QLabel("modo PAPER TRADING — sem ordens reais"))
+        self.label_mt5 = QLabel("MT5: verificando")
+        self.label_operacao = QLabel("Modo: PAPER | Timeframes: M1 ativo / M15 aguardando coleta | Posições: 0/5")
+        barra.addWidget(self.label_mt5)
+        barra.addWidget(self.label_operacao)
+        barra.addPermanentWidget(QLabel("PAPER — sem ordens reais"))
         self.setStatusBar(barra)
 
         self.motor.sinal_pacote.connect(self._receber_pacote)
@@ -90,6 +97,10 @@ class JanelaPrincipal(QMainWindow):
             self.aba_operacao.receber_metricas(m)
             self.aba_resumo.receber_metricas(m)
             self.label_jev.setText(f"JEv: {'ok' if m.get('jev_ok') else 'não configurado'}")
+            self.label_mt5.setText("MT5: conectado" if m.get("precos_validos") else "MT5: sem cotação")
+            self.label_operacao.setText(
+                f"Modo: PAPER | Timeframes: M1 ativo / M15 aguardando coleta | Posições: {m.get('posicoes', 0)}/5 | "
+                f"Drawdown: {m.get('drawdown', 0):.1%}/{m.get('limites', {}).get('max_drawdown', .1):.1%}")
         if "estado" in pacote:
             self.aba_operacao.receber_estado(pacote["estado"])
         if "trades" in pacote:
@@ -103,7 +114,19 @@ class JanelaPrincipal(QMainWindow):
 
     def _motor_terminou(self):
         if self.orquestrador.erro:
-            QMessageBox.critical(self, "Motor encerrado", f"Falha do motor:\n{self.orquestrador.erro}")
+            resposta = QMessageBox.question(
+                self, "MetaTrader 5 indisponível",
+                "MetaTrader 5 não está disponível. Deseja abrir o terminal agora?\n\n"
+                f"Detalhe: {self.orquestrador.erro}",
+                QMessageBox.StandardButton.Open | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if resposta == QMessageBox.StandardButton.Open:
+                try:
+                    caminho = self.orquestrador.terminal
+                    if caminho:
+                        subprocess.Popen([str(caminho)])
+                except (OSError, TypeError) as exc:
+                    QMessageBox.warning(self, "MetaTrader 5", f"Não foi possível abrir o terminal: {exc}")
 
 
 def executar(terminal=None, offset_horas=None, banco=None, caminho_selecao=None):

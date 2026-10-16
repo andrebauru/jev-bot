@@ -69,13 +69,16 @@ class Book:
             dados = json.loads(caminho.read_text(encoding="utf-8"))
             if dados.get("risk_profile_version", 1) < 2:
                 dados["limits"].update(risk_per_trade=.02, max_total_risk=.15,
-                                       max_drawdown=.10, max_positions=None, max_currency_risk=.15)
+                                       max_drawdown=.10, max_positions=5, max_currency_risk=.15)
                 dados["risk_profile_version"] = 2
             # Migra o nome do limite antigo sem zerar capital, perdas ou posições.
             limite_antigo = "max_spread_atr"
             if limite_antigo in dados["limits"]:
                 anterior = dados["limits"].pop(limite_antigo)
                 dados["limits"].setdefault("max_spread_stop", anterior / 2)
+            # Migração da política PAPER: cinco posições globais e somente
+            # drawdown efetivo; percentuais legados não são gates de entrada.
+            dados["limits"]["max_positions"] = 5
             dados["limits"] = Limits(**dados["limits"])
             dados["fills"] = [Fill(**p) for p in dados["fills"]]
             book = cls(**dados)

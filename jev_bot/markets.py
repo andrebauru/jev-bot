@@ -196,6 +196,52 @@ class FonteMT5:
                 "lacunas": len(lacunas), "minutos_lacuna": sum(lacunas),
                 "maior_lacuna": max(lacunas) if lacunas else 0}
 
+    def janela_timeframe(self, simbolo, timeframe="M1", dias=1, lote=4320,
+                         cancelado=None, progresso=None):
+        """Coleta candles fechados do timeframe solicitado (M1 ou M15).
+
+        Mantém a mesma validação/sem look-ahead da coleta M1; M15 usa a
+        constante nativa do terminal e sua própria cadência de 900 segundos.
+        """
+        if timeframe == "M1":
+            return self.janela_m1(simbolo, dias, lote, cancelado, progresso)
+        if timeframe != "M15":
+            raise ValueError("timeframe deve ser M1 ou M15")
+        tf = self.api.TIMEFRAME_M15
+        solicitado = max(1, int(dias * 96))
+        coletados = []
+        inicio_lote = 1
+        while len(coletados) < solicitado:
+            if cancelado and cancelado():
+                return None
+            quantidade = min(lote, solicitado - len(coletados))
+            barras = self.api.copy_rates_from_pos(simbolo, tf, inicio_lote, quantidade)
+            if barras is None or len(barras) == 0:
+                break
+            validado = self._validar_barras(barras)
+            if validado is None:
+                return None
+            coletados = validado + coletados
+            if progresso:
+                progresso(min(len(coletados), solicitado), solicitado)
+            if len(barras) < quantidade:
+                break
+            inicio_lote += len(barras)
+        coletados.sort(key=lambda c: c["time"])
+        coletados = [c for i, c in enumerate(coletados)
+                     if i == 0 or c["time"] > coletados[i - 1]["time"]]
+        coletados = [c for c in coletados if c["time"] + 900 <= self.relogio()]
+        if len(coletados) < 2:
+            return None
+        gaps = [int((b["time"] - a["time"]) / 900 - 1)
+                for a, b in zip(coletados, coletados[1:])]
+        gaps = [g for g in gaps if g > 0]
+        return {"simbolo": simbolo, "timeframe": "M15", "candles": coletados,
+                "inicio": coletados[0]["time"], "fim": coletados[-1]["time"],
+                "solicitados": solicitado, "recebidos": len(coletados),
+                "lacunas": len(gaps), "minutos_lacuna": sum(gaps) * 15,
+                "maior_lacuna": max(gaps) * 15 if gaps else 0}
+
     def catalogo_por_categoria(self):
         """Agrupa o catálogo do terminal por categoria (primeiro nível do path).
 

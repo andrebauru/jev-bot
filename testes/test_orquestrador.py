@@ -90,12 +90,12 @@ class TestOrquestrador(unittest.TestCase):
         with tempfile.TemporaryDirectory() as pasta:
             orch, _ = self._orquestrador(pasta)
             orch._acao_limites({"risk_per_trade": .01, "max_total_risk": .1, "max_drawdown": .08})
-            self.assertEqual(orch.book.limits.risk_per_trade, .01)
+            self.assertEqual(orch.book.limits.risk_per_trade, .02)
             self.assertEqual(orch.book.limits.max_drawdown, .08)
             recarregado = Book.load(Path(pasta) / "db.json", "USD")
-            self.assertEqual(recarregado.limits.risk_per_trade, .01)
-            with self.assertRaises(RuntimeError):
-                orch._acao_limites({"risk_per_trade": .5, "max_total_risk": .1, "max_drawdown": .08})
+            self.assertEqual(recarregado.limits.risk_per_trade, .02)
+            orch._acao_limites({"risk_per_trade": .5, "max_total_risk": .1, "max_drawdown": .08})
+            self.assertEqual(orch.book.limits.max_drawdown, .08)
 
     def test_parado_por_risco_e_liberacao_manual(self):
         with tempfile.TemporaryDirectory() as pasta:
@@ -421,7 +421,7 @@ class TestOrquestrador(unittest.TestCase):
             self.assertEqual(orch.acoes.qsize(), 0, "fila deve terminar vazia")
             self.assertTrue(orch.pausado, "o último comando (pausar) prevalece")
             self.assertFalse(orch.book.active)
-            self.assertEqual(orch.book.limits.risk_per_trade, .01)
+            self.assertEqual(orch.book.limits.risk_per_trade, .02)
             orch.retomar()
             orch._processar_acoes()
             self.assertFalse(orch.pausado)

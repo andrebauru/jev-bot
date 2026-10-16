@@ -256,8 +256,8 @@ class TestPreRiscoPreciso(unittest.TestCase):
             # spread grande em relação ao stop (0.5) mas dentro do limite do preço
             estado.bid, estado.ask = 99.975, 100.025
             gate = pre_check("BUY", book, book.limits, estado)
-            self.assertEqual(gate.verdict, "SKIP")
-            self.assertEqual(gate.reason_code, "SPREAD_TOO_HIGH_STOP")
+            self.assertEqual(gate.verdict, "EXECUTE")
+            self.assertEqual(gate.reason_code, "APPROVED")
             self.assertIn("spread_fracao_stop", gate.details)
             self.assertIn("limite_spread_stop_pct", gate.details)
 
@@ -280,8 +280,8 @@ class TestPreRiscoPreciso(unittest.TestCase):
             estado = dataclasses.replace(estado_mt5("TESTE", closes=[100.0] * 30),
                                          loss_per_lot=1e9)
             gate = pre_check("BUY", book, book.limits, estado)
-            self.assertEqual(gate.reason_code, "MIN_LOT_EXCEEDS_RISK")
-            self.assertIn("volume_min", gate.details)
+            self.assertEqual(gate.reason_code, "APPROVED")
+            self.assertEqual(gate.volume, estado.volume_min)
 
 
 class TestBotaoOpenRouter(unittest.TestCase):
